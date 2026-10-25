@@ -64,6 +64,16 @@ export function Topbar() {
   const kernel = snapshot?.kernel ?? status?.kernel;
   const pending = workspace?.routes.filter((route) => route.pending).length ?? 0;
   const connected = Boolean(kernel?.connected);
+  const liveDirty = liveStatus?.mode === 'live' && liveStatus.dirty;
+  const workspaceRevision = workspace?.revision ?? 0;
+
+  useEffect(() => {
+    if (!isDesktopRuntime() || liveStatus?.mode !== 'live') return;
+    const timer = window.setTimeout(() => {
+      if (!useApplyMode.getState().busy) void refreshLive();
+    }, 1200);
+    return () => window.clearTimeout(timer);
+  }, [workspaceRevision, liveStatus?.mode, refreshLive]);
 
   const retrySave = async () => {
     await saveNow();
@@ -247,7 +257,7 @@ export function Topbar() {
                   ? liveStatus.error ?? '实时模式不可用'
                   : liveStatus.mode === 'live'
                     ? liveStatus.currentMatches
-                      ? `实时模式（手动应用） · ${liveStatus.liveProfile?.name ?? '本地 profile'}`
+                      ? `实时模式（手动应用） · ${liveStatus.liveProfile?.name ?? '本地 profile'}${liveDirty ? ' · 有未应用更改' : ''}`
                       : liveStatus.error ?? 'Verge 当前 profile 已被切换'
                     : '切换到实时模式'
               }
@@ -269,12 +279,14 @@ export function Topbar() {
                   title={
                     !connected
                       ? '内核未连接，无法重载实时配置'
-                      : '写入 Clash RuleVis 本地 profile 并重载内核'
+                      : liveDirty
+                        ? '有未应用更改 · 写入 Clash RuleVis 本地 profile 并重载内核'
+                        : '写入 Clash RuleVis 本地 profile 并重载内核'
                   }
                 >
                   <Upload size={13} />
                   {liveBusy === 'apply' ? '应用中…' : '应用到 Clash Verge'}
-                  {pending > 0 ? <span className="apply-count">{pending}</span> : null}
+                  {pending > 0 ? <span className="apply-count">{pending}</span> : liveDirty ? <span className="apply-dirty-dot" /> : null}
                 </button>
               ) : (
                 <button

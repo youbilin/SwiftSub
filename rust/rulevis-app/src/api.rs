@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -35,6 +36,7 @@ pub struct AppState {
     kernel: Arc<Mutex<Kernel>>,
     live: Arc<Mutex<LiveAggregator>>,
     share: Mutex<ShareServer>,
+    window_active: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -47,24 +49,32 @@ impl AppState {
             kernel: Arc::new(Mutex::new(kernel)),
             live: Arc::new(Mutex::new(live)),
             share: Mutex::new(ShareServer::new()),
+            window_active: Arc::new(AtomicBool::new(true)),
         })
+    }
+
+    pub fn set_window_active(&self, active: bool) {
+        self.window_active.store(active, Ordering::Relaxed);
     }
 
     pub fn start_background(&self) {
         let store = self.store.clone();
         let kernel = self.kernel.clone();
         let live = self.live.clone();
+        let window_active = self.window_active.clone();
         let _ = std::thread::Builder::new()
             .name("rulevis-live".to_string())
             .spawn(move || loop {
-                let retention = store
-                    .lock()
-                    .map(|store| store.workspace().settings.retention_minutes)
-                    .unwrap_or(5);
-                if let Ok(mut kernel) = kernel.lock() {
-                    kernel.ensure_connected();
-                    if let Ok(mut live) = live.lock() {
-                        live.poll(&mut kernel, retention);
+                if window_active.load(Ordering::Relaxed) {
+                    let retention = store
+                        .lock()
+                        .map(|store| store.workspace().settings.retention_minutes)
+                        .unwrap_or(5);
+                    if let Ok(mut kernel) = kernel.lock() {
+                        kernel.ensure_connected();
+                        if let Ok(mut live) = live.lock() {
+                            live.poll(&mut kernel, retention);
+                        }
                     }
                 }
                 std::thread::sleep(Duration::from_secs(1));

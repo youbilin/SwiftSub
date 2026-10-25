@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.0 — 2026-10-24
+
+### Added
+
+- Desktop single-instance behavior: launching Clash RuleVis again now focuses
+  and restores the existing window instead of starting another tray process.
+- Live mode now fingerprints the routing-relevant workspace state and reports
+  whether there are unapplied changes. The apply button shows a subtle indicator
+  after node, exit, rule, source or base-setting edits, and clears it after a
+  successful apply.
+
+### Changed
+
+- Background live polling pauses while the main window is hidden or minimized
+  and resumes within one second after the window returns, reducing idle kernel
+  requests and CPU use for tray-only operation.
+
 ## 0.5.0 — 2026-10-24
 
 ### Changed

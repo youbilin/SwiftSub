@@ -91,6 +91,7 @@ rules:
     let view = verge_live::enable(&store).expect("enable live mode");
     assert_eq!(view.mode, "live");
     assert!(view.current_matches);
+    assert!(view.dirty, "live mode starts with an unapplied workspace");
     let live = view.live_profile.clone().expect("live profile ref");
     let original = view.original_profile.clone().expect("original ref");
     assert_eq!(original.name, "机场订阅");
@@ -157,6 +158,22 @@ rules:
     .expect("state json");
     assert_eq!(state["mode"], "live");
     assert_eq!(state["lastAppliedHash"], plan.new_hash);
+    assert!(state.get("lastAppliedWorkspaceHash").is_some());
+    assert!(
+        !verge_live::status(&store).dirty,
+        "apply clears the dirty state"
+    );
+
+    store
+        .mutate(|workspace| {
+            workspace.settings.test_url = "https://example.com/generate_204".to_string();
+            Ok(())
+        })
+        .expect("change workspace");
+    assert!(
+        verge_live::status(&store).dirty,
+        "workspace changes should require another apply"
+    );
 
     let (seed_backup, restored) = verge_live::prepare_disable(&store).expect("prepare disable");
     assert_eq!(restored.uid, original.uid);

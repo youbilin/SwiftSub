@@ -60,6 +60,7 @@ export const useApplyMode = create<ApplyModeState>((set, get) => ({
               ...live,
               lastAppliedAt: result.appliedAt,
               lastBackup: result.backupPath,
+              dirty: false,
               error: undefined,
             }
           : live,

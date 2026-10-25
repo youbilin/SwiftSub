@@ -385,6 +385,7 @@ export interface VergeLiveStatus {
   liveProfile?: LiveProfileRef;
   originalProfile?: LiveProfileRef;
   currentMatches: boolean;
+  dirty: boolean;
   lastAppliedAt?: string;
   lastBackup?: string;
   error?: string;

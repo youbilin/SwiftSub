@@ -133,8 +133,8 @@ The desktop app keeps the same React UI and uses Rust for the local API. It does
 - Full YAML preview, diff, real `verge-mihomo -t` validation, safe export and history restore.
 - One-click Clash Verge import: serves the current export on a temporary loopback URL and opens `clash://install-config`; the URL can also be copied manually.
 - Read-only Verge profile discovery for base port/DNS/TUN settings.
-- Live mode: creates and switches to a dedicated local profile, applies the workspace on demand, backs up before writing, reloads the kernel, and restores the original profile on exit.
-- System tray: closing the window asks whether to minimize to the tray or quit; the tray menu can reopen the window or exit, and background live tasks keep running while minimized.
+- Live mode: creates and switches to a dedicated local profile, applies the workspace on demand, backs up before writing, reloads the kernel, and restores the original profile on exit. The topbar indicates when the workspace has unapplied changes.
+- System tray and single instance: closing the window asks whether to minimize to the tray or quit; launching again focuses the existing window. Background live polling pauses while minimized and resumes when the window returns; the tray menu can reopen or exit.
 
 <p align="center">
   <img src="docs/assets/live-mode.png" width="80%" alt="Desktop live mode and Apply to Clash Verge" />
@@ -204,9 +204,9 @@ See [SECURITY.md](SECURITY.md) for private vulnerability reporting.
 ## Roadmap
 
 - **v0.3**: Tauri 2 + Rust desktop app with subscription/YAML import, TCP/named-pipe controller, live connections, latency tests, rulesets, mihomo validation and an NSIS installer.
-- **v0.5.0 (current)**: full monochrome pass. Green, amber and red accents are removed; active navigation and primary actions use solid black, while online, warning and danger states rely on filled dots, hollow rings, dashed lines and inverted fills. Page motion and layered elevation remain.
-- **Rust foundation**: `rulevis-core` + `rulevis-app` ship 33 automated tests covering fixture parity, desktop API, live-profile merge/restore and the reload request, plus an optional real-controller smoke test.
-- **Next**: code signing, auto-update, tray, multi-hop chains and Proxy Provider support.
+- **v0.6.0 (current)**: desktop single-instance, unapplied-change indicator in live mode, and paused background polling while minimized, on top of the 0.5.0 monochrome system.
+- **Rust foundation**: `rulevis-core` + `rulevis-app` ship 33 automated tests covering fixture parity, desktop API, live-profile merge/restore, workspace fingerprints and the reload request, plus an optional real-controller smoke test.
+- **Next**: code signing, auto-update, multi-hop chains and Proxy Provider support.
 - **Platform**: Windows x64 installer today; the web build runs on any Node.js 22+ host. The installer is unsigned, and live features require Clash Verge Rev / mihomo.
 - A pure Rust UI rewrite is not a goal unless the WebView is proven to be the bottleneck.
 

@@ -20,7 +20,8 @@ fn api_request(
 }
 
 #[tauri::command]
-fn hide_main_window(app: tauri::AppHandle) {
+fn hide_main_window(app: tauri::AppHandle, state: tauri::State<'_, AppState>) {
+    state.set_window_active(false);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
@@ -32,6 +33,9 @@ fn quit_app(app: tauri::AppHandle) {
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        state.set_window_active(true);
+    }
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -74,6 +78,9 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
         .setup(|app| {
             let data_dir = match std::env::var_os("CRS_DATA_DIR") {
                 Some(directory) => PathBuf::from(directory),
@@ -86,6 +93,19 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            match event {
+                WindowEvent::Focused(true) => {
+                    if let Some(state) = window.try_state::<AppState>() {
+                        state.set_window_active(true);
+                    }
+                }
+                WindowEvent::Resized(_) => {
+                    if let Some(state) = window.try_state::<AppState>() {
+                        state.set_window_active(!window.is_minimized().unwrap_or(false));
+                    }
+                }
+                _ => {}
+            }
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.emit("close-requested", ());

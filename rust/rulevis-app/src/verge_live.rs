@@ -11,7 +11,7 @@ use crate::storage::{now_iso, NewHistory, Store};
 use crate::types::KernelValidation;
 use crate::validation::validate_config;
 use crate::verge;
-use rulevis_core::model::{ExportCounts, IssueSeverity};
+use rulevis_core::model::{ExportCounts, IssueSeverity, Workspace};
 
 const LIVE_PROFILE_NAME: &str = "Clash RuleVis 实时";
 const LIVE_PROFILE_DESC: &str = "由 Clash RuleVis 创建，请勿删除";
@@ -87,6 +87,8 @@ pub struct LiveModeState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_applied_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_applied_workspace_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_backup: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -106,6 +108,7 @@ impl Default for LiveModeState {
             seed_backup: None,
             last_applied_at: None,
             last_applied_hash: None,
+            last_applied_workspace_hash: None,
             last_backup: None,
             last_error: None,
         }
@@ -122,6 +125,7 @@ pub struct LiveModeView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub original_profile: Option<LiveProfileRef>,
     pub current_matches: bool,
+    pub dirty: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_applied_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -224,6 +228,7 @@ pub fn status(store: &Store) -> LiveModeView {
         live_profile: state.live.clone(),
         original_profile: state.original.clone(),
         current_matches: false,
+        dirty: false,
         last_applied_at: state.last_applied_at.clone(),
         last_backup: state.last_backup.clone(),
         error: state.last_error.clone(),
@@ -238,6 +243,9 @@ pub fn status(store: &Store) -> LiveModeView {
     };
     view.available = true;
     if state.mode == "live" {
+        let workspace_hash = workspace_fingerprint(store.workspace());
+        view.dirty = state.last_applied_at.is_none()
+            || state.last_applied_workspace_hash.as_deref() != Some(workspace_hash.as_str());
         if let Some(live) = state.live.as_ref() {
             let exists = live_ready(&doc, live);
             if let Some(item) = doc.item(&live.uid) {
@@ -307,7 +315,9 @@ pub fn enable(store: &Store) -> Result<LiveModeView, String> {
     state.original = Some(original);
     state.profiles_backup = Some(profiles_backup.clone());
     state.seed_backup = Some(seed_backup);
+    state.last_applied_at = None;
     state.last_applied_hash = Some(seed_hash);
+    state.last_applied_workspace_hash = None;
     state.last_error = None;
     if let Err(error) = save_state(store, &state) {
         let _ = fs::copy(&profiles_backup, &doc.path);
@@ -447,6 +457,7 @@ pub fn finish_apply(store: &mut Store, plan: &LiveApplyPlan) -> Result<Value, St
             Ok(())
         })
         .map_err(|error| format!("无法保存工作区：{:?}", error))?;
+    let applied_workspace_hash = workspace_fingerprint(&workspace);
     let entry = store
         .add_history(
             NewHistory {
@@ -467,6 +478,7 @@ pub fn finish_apply(store: &mut Store, plan: &LiveApplyPlan) -> Result<Value, St
     let mut state = load_state(store);
     state.last_applied_at = Some(at.clone());
     state.last_applied_hash = Some(plan.new_hash.clone());
+    state.last_applied_workspace_hash = Some(applied_workspace_hash);
     state.last_backup = Some(plan.backup_path.clone());
     state.last_error = None;
     save_state(store, &state)?;
@@ -517,6 +529,7 @@ pub fn prepare_disable(store: &Store) -> Result<(String, LiveProfileRef), String
 pub fn finish_disable(store: &Store) -> Result<LiveModeView, String> {
     let mut state = load_state(store);
     state.mode = "safe".to_string();
+    state.last_applied_workspace_hash = None;
     state.last_error = None;
     save_state(store, &state)?;
     Ok(status(store))
@@ -675,6 +688,30 @@ fn prune_backups(dir: &Path) {
             let _ = fs::remove_file(path);
         }
     }
+}
+
+fn workspace_fingerprint(workspace: &Workspace) -> String {
+    let routes: Vec<Value> = workspace
+        .routes
+        .iter()
+        .map(|route| {
+            let mut value = serde_json::to_value(route).unwrap_or(Value::Null);
+            if let Some(object) = value.as_object_mut() {
+                object.remove("pending");
+                object.remove("appliedAt");
+            }
+            value
+        })
+        .collect();
+    let payload = json!({
+        "nodes": &workspace.nodes,
+        "exits": &workspace.exits,
+        "routes": routes,
+        "sources": &workspace.sources,
+        "includeBaseTemplate": workspace.settings.include_base_template,
+        "testUrl": &workspace.settings.test_url,
+    });
+    sha256(&serde_json::to_vec(&payload).unwrap_or_default())
 }
 
 fn sha256(bytes: &[u8]) -> String {
