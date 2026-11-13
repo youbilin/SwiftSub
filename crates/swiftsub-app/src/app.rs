@@ -43,6 +43,7 @@ pub enum TemplateTab {
     PolicyGroups,
     RuleSets,
     CustomRules,
+    Tools,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -300,6 +301,7 @@ pub struct SwiftSubApp {
     pub server_error: Option<String>,
     pub preview: String,
     pub preview_open: bool,
+    pub nodes_panel_open: bool,
     pub node_rename_key: Option<String>,
     pub node_rename_sub_id: Option<i64>,
     pub node_rename_input: Entity<InputState>,
@@ -558,6 +560,7 @@ impl SwiftSubApp {
             server_error: None,
             preview: String::new(),
             preview_open: false,
+            nodes_panel_open: true,
             node_rename_key: None,
             node_rename_sub_id: None,
             node_rename_input,
@@ -2027,6 +2030,9 @@ impl SwiftSubApp {
     }
 
     pub fn open_template_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.template_dialog_open {
+            return;
+        }
         self.template_dialog_open = true;
         self.template_error = None;
         self.template_tab = TemplateTab::PolicyGroups;

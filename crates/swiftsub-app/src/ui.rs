@@ -1,6 +1,7 @@
 use gpui_kit::base::InteractiveElementExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, Textarea};
+use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Sizable as _, StyledExt as _, TitleBar, h_flex, v_flex};
@@ -110,9 +111,10 @@ impl Render for SwiftSubApp {
             .when(self.node_rename_key.is_some(), |this| {
                 this.child(self.node_rename_dialog(cx))
             })
-            .when(self.template_dialog_open, |this| {
-                this.child(self.template_dialog(cx))
-            })
+            .when(
+                self.template_dialog_open && self.page != Page::Generator,
+                |this| this.child(self.template_dialog(cx)),
+            )
             .when_some(self.toast.clone(), |this, toast| {
                 this.child(
                     div()
@@ -1604,12 +1606,14 @@ impl SwiftSubApp {
                 format!("已选 {selected_count} / {total_count} 条 · {selected_sources} 个来源")
             }
             TemplateTab::CustomRules => format!("{custom_rule_count} 条自定义规则"),
+            TemplateTab::Tools => "筛选代理组与链式代理".into(),
         };
 
         let tab_content = if let Some(id) = &self.template_target_picker {
             self.template_target_picker_panel(id, cx)
         } else {
             match self.template_tab {
+            TemplateTab::Tools => div().id("workspace-tools").flex_1().min_h_0().overflow_y_scrollbar().child(v_flex().gap_4().child(self.custom_groups_section(cx)).child(self.chains_section(cx))).into_any_element(),
             TemplateTab::PolicyGroups => self.template_policy_groups_panel(cx),
             TemplateTab::RuleSets => v_flex()
                 .flex_1()
@@ -1689,9 +1693,10 @@ impl SwiftSubApp {
         }
         };
 
+        let embedded = self.page == Page::Generator;
         let panel = v_flex()
-            .w(px(660.))
-            .h(px(620.))
+            .when(embedded, |this| this.size_full().min_w_0().min_h_0())
+            .when(!embedded, |this| this.w(px(660.)).h(px(620.)))
             .p(px(22.))
             .gap_3()
             .rounded(px(14.))
@@ -1721,7 +1726,8 @@ impl SwiftSubApp {
                     .gap_1()
                     .child(self.template_tab_pill("策略组", TemplateTab::PolicyGroups, cx))
                     .child(self.template_tab_pill("规则集", TemplateTab::RuleSets, cx))
-                    .child(self.template_tab_pill("自定义规则", TemplateTab::CustomRules, cx)),
+                    .child(self.template_tab_pill("自定义规则", TemplateTab::CustomRules, cx))
+                    .child(self.template_tab_pill("筛选与链式", TemplateTab::Tools, cx)),
             )
             .child(tab_content)
             .when_some(self.template_error.clone(), |this, error| {
@@ -1735,6 +1741,7 @@ impl SwiftSubApp {
             .child(
                 h_flex()
                     .gap_2()
+                    .flex_wrap()
                     .justify_end()
                     .child(
                         Button::new("template-cancel")
@@ -1764,7 +1771,11 @@ impl SwiftSubApp {
                     ),
             );
 
-        modal(panel).into_any_element()
+        if embedded {
+            panel.into_any_element()
+        } else {
+            modal(panel).into_any_element()
+        }
     }
 
     fn batch_rename_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2190,15 +2201,90 @@ impl SwiftSubApp {
     }
 
     fn generator_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        h_flex()
+        let mut panels = h_resizable("configuration-workspace");
+        if self.nodes_panel_open {
+            panels = panels.child(
+                resizable_panel()
+                    .size(px(300.))
+                    .size_range(px(220.)..px(500.))
+                    .child(self.generator_nodes_panel(cx)),
+            );
+        }
+        let editor = if self.template_dialog_open {
+            self.template_dialog(cx)
+        } else {
+            self.generator_config_panel(cx)
+        };
+        panels = panels.child(resizable_panel().child(editor));
+        if self.preview_open {
+            panels = panels.child(
+                resizable_panel()
+                    .size(px(380.))
+                    .size_range(px(260.)..px(1000.))
+                    .child(self.generator_preview(cx)),
+            );
+        }
+        v_flex()
             .size_full()
             .min_h_0()
-            .child(self.generator_nodes_panel(cx))
-            .child(if self.preview_open {
-                self.generator_preview(cx)
-            } else {
-                self.generator_config_panel(cx)
-            })
+            .child(
+                h_flex()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .flex_wrap()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        Button::new("workspace-nodes")
+                            .ghost()
+                            .label(if self.nodes_panel_open {
+                                "收起节点"
+                            } else {
+                                "显示节点"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.nodes_panel_open = !this.nodes_panel_open;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(12.))
+                            .text_color(rgb(MUTED))
+                            .child(if self.template_dialog_open {
+                                "正在编辑草稿 · 应用后更新订阅输出"
+                            } else {
+                                "当前配置 · 拖动分隔线调整面板宽度"
+                            }),
+                    )
+                    .child(
+                        Button::new("workspace-edit")
+                            .ghost()
+                            .label("编辑分流")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_template_dialog(window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("workspace-preview")
+                            .ghost()
+                            .label(if self.preview_open {
+                                "收起预览"
+                            } else {
+                                "显示预览"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_preview(cx))),
+                    )
+                    .child(
+                        Button::new("workspace-export")
+                            .ghost()
+                            .label("导出")
+                            .on_click(cx.listener(|this, _, _, cx| this.export_preview(cx))),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().child(panels))
             .into_any_element()
     }
 
@@ -2259,7 +2345,7 @@ impl SwiftSubApp {
         }
 
         v_flex()
-            .w(px(420.))
+            .w_full()
             .h_full()
             .min_h_0()
             .border_r_1()
@@ -2389,9 +2475,9 @@ impl SwiftSubApp {
 
         h_flex()
             .id(format!("node-row-{key}"))
-            .h(px(44.))
+            .min_h(px(58.))
             .px_3()
-            .gap_2()
+            .gap_1()
             .border_b_1()
             .border_color(rgb(BORDER))
             .child(
@@ -2422,38 +2508,47 @@ impl SwiftSubApp {
             )
             .child(switch)
             .child(
-                div()
-                    .id(format!("node-name-{key}"))
+                v_flex()
                     .flex_1()
                     .min_w_0()
-                    .text_size(px(12.5))
-                    .truncate()
-                    .cursor_pointer()
-                    .child(name.clone())
-                    .on_double_click(cx.listener({
-                        let key = key.clone();
-                        let name = name.clone();
-                        let source_id = source_id.clone();
-                        let yaml = yaml.clone();
-                        move |this, _, window, cx| {
-                            this.open_node_rename(
-                                key.clone(),
-                                source_id.clone(),
-                                name.clone(),
-                                yaml.clone(),
-                                window,
-                                cx,
-                            )
-                        }
-                    })),
-            )
-            .child(tag(node.region.label(), MUTED))
-            .child(
-                div()
-                    .w(px(64.))
-                    .text_size(px(11.5))
-                    .text_color(rgb(MUTED))
-                    .child(node.proxy.kind().to_uppercase()),
+                    .gap_1()
+                    .child(
+                        div()
+                            .id(format!("node-name-{key}"))
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(12.5))
+                            .truncate()
+                            .cursor_pointer()
+                            .child(name.clone())
+                            .on_double_click(cx.listener({
+                                let key = key.clone();
+                                let name = name.clone();
+                                let source_id = source_id.clone();
+                                let yaml = yaml.clone();
+                                move |this, _, window, cx| {
+                                    this.open_node_rename(
+                                        key.clone(),
+                                        source_id.clone(),
+                                        name.clone(),
+                                        yaml.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                }
+                            })),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(tag(node.region.label(), MUTED))
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(MUTED))
+                                    .child(node.proxy.kind().to_uppercase()),
+                            ),
+                    ),
             )
             .child(icon_action(
                 format!("rename-node-{key}"),
@@ -3152,6 +3247,7 @@ impl SwiftSubApp {
 
     fn generator_preview(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let mut header = h_flex()
+            .flex_wrap()
             .min_w_0()
             .px(px(16.))
             .py(px(12.))
@@ -3164,6 +3260,7 @@ impl SwiftSubApp {
                     .min_w_0()
                     .text_size(px(16.))
                     .font_weight(FontWeight::SEMIBOLD)
+                    .whitespace_nowrap()
                     .child("预览"),
             )
             .child(div().flex_1().min_w_0())
@@ -3479,7 +3576,7 @@ impl SwiftSubApp {
             .min_h_0()
             .p(px(24.))
             .gap_4()
-            .child(self.page_title("规则集模板", div()))
+            .child(self.page_title("分流配置模板", div()))
             .child(
                 div()
                     .id("templates-scroll")
