@@ -44,6 +44,7 @@ pub enum TemplateTab {
     RuleSets,
     CustomRules,
     RuleOrder,
+    Changes,
     Tools,
 }
 
@@ -96,6 +97,31 @@ impl TemplateSnapshot {
             options.rule_provider_base_url = self.rule_provider_base_url.clone();
         }
         Ok(options)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TemplateFile {
+    format: String,
+    version: u32,
+    name: String,
+    config: TemplateSnapshot,
+}
+
+impl TemplateFile {
+    fn decode(text: &str) -> Result<Self, String> {
+        let file: Self = serde_json::from_str(text).map_err(|e| format!("模板文件无效：{e}"))?;
+        if file.format != "swiftsub-routing-template" || file.version != 1 {
+            return Err(format!(
+                "不支持的模板格式 / 版本：{} v{}",
+                file.format, file.version
+            ));
+        }
+        if file.name.trim().is_empty() {
+            return Err("模板名称不能为空".into());
+        }
+        Ok(file)
     }
 }
 
@@ -261,6 +287,10 @@ pub struct SwiftSubApp {
     pub template_name: Entity<InputState>,
     pub template_error: Option<String>,
     pub template_dialog_open: bool,
+    pub template_edit_id: Option<i64>,
+    pub template_discard_armed: bool,
+    template_baseline: Option<TemplateSnapshot>,
+    template_base_options: Option<GenerateOptions>,
     pub batch_rename_open: bool,
     pub rename_template: Entity<InputState>,
     pub rename_error: Option<String>,
@@ -535,6 +565,10 @@ impl SwiftSubApp {
             template_name,
             template_error: None,
             template_dialog_open: false,
+            template_edit_id: None,
+            template_discard_armed: false,
+            template_baseline: None,
+            template_base_options: None,
             batch_rename_open: false,
             rename_template,
             rename_error: None,
@@ -666,6 +700,21 @@ impl SwiftSubApp {
             .find_map(|arg| arg.strip_prefix("--dialog=").map(str::to_string));
 
         app.load_custom_config();
+        let recovered = app
+            .store
+            .lock()
+            .expect("store mutex poisoned")
+            .get_setting("routing_snapshot")
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_str::<TemplateSnapshot>(&v).ok());
+        if let Some(snapshot) = recovered {
+            // Existing individual settings remain authoritative for legacy UI actions.
+            app.options.test_url = snapshot.test_url;
+            app.options.test_interval = snapshot.test_interval;
+            app.options.mixed_port = snapshot.mixed_port;
+            app.options.allow_lan = snapshot.allow_lan;
+        }
         app.load_module_config();
         app.load_templates();
         app.reload_subscriptions(cx);
@@ -839,6 +888,10 @@ impl SwiftSubApp {
     }
 
     pub fn set_page(&mut self, page: Page, cx: &mut Context<Self>) {
+        if self.template_dialog_open && page != Page::Generator {
+            self.show_toast("请先应用或取消当前分流草稿".into(), cx);
+            return;
+        }
         if page != self.page {
             match page {
                 Page::Generator => self.preview_scroll.set_offset(point(px(0.0), px(0.0))),
@@ -1219,6 +1272,9 @@ impl SwiftSubApp {
     }
 
     fn save_custom_config(&self) {
+        if self.template_dialog_open {
+            return;
+        }
         let store = self.store.lock().expect("store mutex poisoned");
         if let Ok(value) = serde_json::to_string(&self.custom_groups) {
             let _ = store.set_setting("custom_groups", &value);
@@ -1639,8 +1695,16 @@ impl SwiftSubApp {
         options.enabled_modules = Some(self.enabled_modules.iter().cloned().collect());
         options.disabled_rule_sets = self.disabled_rule_sets.iter().cloned().collect();
         options.custom_rule_sets = self.normalize_rule_set_bindings(&self.custom_rule_sets);
-        options.custom_groups = self.custom_groups.clone();
-        options.chains = self.chains.clone();
+        options.custom_groups = self
+            .template_baseline
+            .as_ref()
+            .map(|b| b.custom_groups.clone())
+            .unwrap_or_else(|| self.custom_groups.clone());
+        options.chains = self
+            .template_baseline
+            .as_ref()
+            .map(|b| b.chains.clone())
+            .unwrap_or_else(|| self.chains.clone());
 
         let preview_was_empty = self.preview.is_empty();
         match generate_profile(&self.nodes, &options) {
@@ -2069,6 +2133,10 @@ impl SwiftSubApp {
         if self.template_dialog_open {
             return;
         }
+        self.template_base_options = Some(self.options.clone());
+        self.template_baseline = Some(self.active_template_snapshot());
+        self.template_edit_id = None;
+        self.template_discard_armed = false;
         self.template_dialog_open = true;
         self.template_error = None;
         self.template_tab = TemplateTab::PolicyGroups;
@@ -2101,6 +2169,13 @@ impl SwiftSubApp {
     }
 
     pub fn close_template_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(baseline) = self.template_baseline.take() {
+            self.custom_groups = baseline.custom_groups;
+            self.chains = baseline.chains;
+        }
+        self.template_base_options = None;
+        self.template_edit_id = None;
+        self.template_discard_armed = false;
         self.template_dialog_open = false;
         self.template_error = None;
         self.template_tab = TemplateTab::PolicyGroups;
@@ -2395,7 +2470,10 @@ impl SwiftSubApp {
     }
 
     pub fn draft_generate_options(&self, cx: &Context<Self>) -> Result<GenerateOptions, String> {
-        let mut options = self.options.clone();
+        let mut options = self
+            .template_base_options
+            .clone()
+            .unwrap_or_else(|| self.options.clone());
         options.enabled_modules = Some(self.template_enabled_modules.iter().cloned().collect());
         options.disabled_rule_sets = self.template_disabled_rule_sets.iter().cloned().collect();
         options.custom_rule_sets = self.template_custom_rule_sets.clone();
@@ -2404,6 +2482,8 @@ impl SwiftSubApp {
         options.policy_groups = self.template_policy_groups.clone();
         options.rule_set_targets = self.template_rule_set_targets.clone();
         options.rule_order = self.template_rule_order.clone();
+        options.custom_groups = self.custom_groups.clone();
+        options.chains = self.chains.clone();
         Ok(options)
     }
 
@@ -2673,6 +2753,7 @@ impl SwiftSubApp {
     }
 
     fn draft_template_snapshot(&self, cx: &Context<Self>) -> Result<TemplateSnapshot, String> {
+        let base = self.template_base_options.as_ref().unwrap_or(&self.options);
         let rules = parse_custom_rule_lines(&self.template_custom_rules.read(cx).value())?;
         let mut enabled_modules: Vec<String> =
             self.template_enabled_modules.iter().cloned().collect();
@@ -2686,21 +2767,21 @@ impl SwiftSubApp {
             self.template_disabled_rule_sets.iter().cloned().collect();
         disabled_rule_sets.sort();
         let snapshot = TemplateSnapshot {
-            preset: self.options.preset,
+            preset: base.preset,
             enabled_modules,
             disabled_rule_sets,
-            custom_rule_sets: self.normalize_rule_set_bindings(&self.template_custom_rule_sets),
+            custom_rule_sets: self.template_custom_rule_sets.clone(),
             custom_rule_lines: rules.iter().map(Rule::to_line).collect(),
             policy_groups: self.template_policy_groups.clone(),
             rule_order: self.template_rule_order.clone(),
             rule_set_targets: self.template_rule_set_targets.clone(),
-            rule_provider_base_url: self.options.rule_provider_base_url.clone(),
+            rule_provider_base_url: base.rule_provider_base_url.clone(),
             custom_groups: self.custom_groups.clone(),
             chains: self.chains.clone(),
-            test_url: self.options.test_url.clone(),
-            test_interval: self.options.test_interval,
-            mixed_port: self.options.mixed_port,
-            allow_lan: self.options.allow_lan,
+            test_url: base.test_url.clone(),
+            test_interval: base.test_interval,
+            mixed_port: base.mixed_port,
+            allow_lan: base.allow_lan,
         };
         self.validate_template_snapshot(&snapshot)?;
         Ok(snapshot)
@@ -2787,130 +2868,346 @@ impl SwiftSubApp {
         Ok(())
     }
 
-    fn commit_template_snapshot(
+    fn active_template_snapshot(&self) -> TemplateSnapshot {
+        let mut enabled_modules: Vec<_> = self.enabled_modules.iter().cloned().collect();
+        enabled_modules.sort();
+        let mut disabled_rule_sets: Vec<_> = self.disabled_rule_sets.iter().cloned().collect();
+        disabled_rule_sets.sort();
+        TemplateSnapshot {
+            preset: self.options.preset,
+            enabled_modules,
+            disabled_rule_sets,
+            custom_rule_sets: self.custom_rule_sets.clone(),
+            custom_rule_lines: self
+                .options
+                .custom_rules
+                .iter()
+                .map(Rule::to_line)
+                .collect(),
+            rule_provider_base_url: self.options.rule_provider_base_url.clone(),
+            policy_groups: self.options.policy_groups.clone(),
+            rule_set_targets: self.options.rule_set_targets.clone(),
+            rule_order: self.options.rule_order.clone(),
+            custom_groups: self.custom_groups.clone(),
+            chains: self.chains.clone(),
+            test_url: self.options.test_url.clone(),
+            test_interval: self.options.test_interval,
+            mixed_port: self.options.mixed_port,
+            allow_lan: self.options.allow_lan,
+        }
+    }
+
+    pub fn template_change_summary(&self, cx: &Context<Self>) -> String {
+        match self.draft_generate_options(cx).and_then(|o| {
+            self.template_baseline
+                .as_ref()
+                .unwrap_or(&self.active_template_snapshot())
+                .generate_options(&self.options)
+                .map(|b| (o, b))
+        }) {
+            Ok((draft, base)) => {
+                let mut changes = Vec::new();
+                if draft
+                    .enabled_modules
+                    .as_ref()
+                    .map(|v| v.iter().collect::<HashSet<_>>())
+                    != base
+                        .enabled_modules
+                        .as_ref()
+                        .map(|v| v.iter().collect::<HashSet<_>>())
+                {
+                    changes.push("模块");
+                }
+                if draft.disabled_rule_sets != base.disabled_rule_sets
+                    || draft.custom_rule_sets != base.custom_rule_sets
+                {
+                    changes.push("规则集");
+                }
+                if draft.policy_groups != base.policy_groups {
+                    changes.push("策略组");
+                }
+                if draft.rule_set_targets != base.rule_set_targets {
+                    changes.push("规则目标");
+                }
+                if draft.custom_rules != base.custom_rules {
+                    changes.push("自定义规则");
+                }
+                if draft.rule_order != base.rule_order {
+                    changes.push("规则顺序");
+                }
+                if serde_json::to_string(&draft.custom_groups).ok()
+                    != serde_json::to_string(&base.custom_groups).ok()
+                {
+                    changes.push("筛选组");
+                }
+                if serde_json::to_string(&draft.chains).ok()
+                    != serde_json::to_string(&base.chains).ok()
+                {
+                    changes.push("链式代理");
+                }
+                if changes.is_empty() {
+                    "配置与当前输出一致；名称及未更新的组详情不计入比较".into()
+                } else {
+                    format!("待应用变更：{}", changes.join("、"))
+                }
+            }
+            Err(e) => e,
+        }
+    }
+
+    pub fn request_close_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.template_discard_armed {
+            self.template_discard_armed = true;
+            self.template_error =
+                Some("再点「放弃草稿」将丢弃本次编辑，也可继续编辑或应用。".into());
+            cx.notify();
+            return;
+        }
+        self.close_template_dialog(window, cx);
+    }
+
+    fn persist_and_commit_template(
         &mut self,
         snapshot: TemplateSnapshot,
+        save: Option<(Option<i64>, String)>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        self.options.preset = snapshot.preset;
+    ) -> Result<(), String> {
+        self.validate_template_snapshot(&snapshot)?;
+        let options = snapshot.generate_options(&self.options)?;
+        let json = serde_json::to_string(&snapshot).map_err(|e| e.to_string())?;
+        let value = serde_json::to_value(&snapshot).map_err(|e| e.to_string())?;
+        let mut settings = HashMap::new();
+        for (key, value) in value.as_object().expect("snapshot is object") {
+            settings.insert(
+                key.clone(),
+                if key == "rule_provider_base_url" || key == "test_url" {
+                    value.as_str().unwrap_or_default().to_string()
+                } else {
+                    value.to_string()
+                },
+            );
+        }
+        // Keep the whole snapshot for deterministic startup recovery as fields evolve.
+        settings.insert("routing_snapshot".into(), json.clone());
+        self.store
+            .lock()
+            .expect("store mutex poisoned")
+            .save_routing_snapshot(
+                &settings,
+                save.as_ref()
+                    .map(|(id, name)| (*id, name.as_str(), json.as_str())),
+            )
+            .map_err(|e| format!("保存失败，配置未应用：{e}"))?;
+        self.options = options;
         self.enabled_modules = snapshot.enabled_modules.into_iter().collect();
         self.disabled_rule_sets = snapshot.disabled_rule_sets.into_iter().collect();
-        if !snapshot.rule_provider_base_url.is_empty() {
-            self.options.rule_provider_base_url = snapshot.rule_provider_base_url.clone();
-            let store = self.store.lock().expect("store mutex poisoned");
-            let _ = store.set_setting("rule_provider_base_url", &snapshot.rule_provider_base_url);
-            drop(store);
-            self.rule_provider_input.update(cx, |state, cx| {
-                state.set_value(snapshot.rule_provider_base_url, window, cx)
-            });
-        }
+        self.custom_rule_sets = snapshot.custom_rule_sets;
         self.custom_groups = snapshot.custom_groups;
         self.chains = snapshot.chains;
-        self.options.policy_groups = snapshot.policy_groups;
-        self.options.rule_order = snapshot.rule_order;
-        self.options.rule_set_targets = snapshot.rule_set_targets;
-        self.custom_rule_sets = self.normalize_rule_set_bindings(&snapshot.custom_rule_sets);
-        self.options.custom_rules = parse_custom_rule_lines(&snapshot.custom_rule_lines.join("\n"))
-            .expect("validated template rules");
-        self.options.test_url = snapshot.test_url;
-        self.options.test_interval = snapshot.test_interval;
-        self.options.mixed_port = snapshot.mixed_port;
-        self.options.allow_lan = snapshot.allow_lan;
-        self.save_module_config();
-        self.save_rule_set_config();
-        self.save_custom_config();
+        self.template_baseline = None;
+        self.rule_provider_input.update(cx, |s, cx| {
+            s.set_value(self.options.rule_provider_base_url.clone(), window, cx)
+        });
         self.regenerate(cx);
+        Ok(())
+    }
+
+    fn finish_policy_details(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if let Some(index) = self.template_policy_edit {
+            self.save_policy_details(index, window, cx);
+            self.template_error.is_none()
+        } else {
+            true
+        }
     }
 
     pub fn apply_template_rule_sets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.draft_template_snapshot(cx) {
-            Ok(snapshot) => {
-                self.commit_template_snapshot(snapshot, window, cx);
+        if !self.finish_policy_details(window, cx) {
+            return;
+        }
+        let result = self
+            .draft_template_snapshot(cx)
+            .and_then(|snapshot| self.persist_and_commit_template(snapshot, None, window, cx));
+        match result {
+            Ok(()) => {
                 self.close_template_dialog(window, cx);
-                self.show_toast("分流模板的策略组与规则已应用".into(), cx);
+                self.show_toast("分流配置已应用".into(), cx);
             }
-            Err(error) => {
-                self.template_error = Some(error);
+            Err(e) => {
+                self.template_error = Some(e);
                 cx.notify();
             }
         }
     }
 
     pub fn save_current_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.finish_policy_details(window, cx) {
+            return;
+        }
         let name = self.template_name.read(cx).value().trim().to_string();
         if name.is_empty()
             || self
                 .custom_templates
                 .iter()
-                .any(|template| template.name == name)
+                .any(|t| t.name == name && Some(t.id) != self.template_edit_id)
         {
-            self.template_error = Some("请输入未使用的模板名称".into());
+            self.template_error = Some("请输入未被其他模板使用的名称".into());
             cx.notify();
             return;
         }
-        let snapshot = match self.draft_template_snapshot(cx) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                self.template_error = Some(error);
-                cx.notify();
-                return;
-            }
-        };
-        let result = serde_json::to_string(&snapshot)
-            .map_err(|error| error.to_string())
-            .and_then(|json| {
-                self.store
-                    .lock()
-                    .expect("store mutex poisoned")
-                    .add_custom_template(&name, &json)
-                    .map_err(|error| error.to_string())
-            });
+        let save = Some((self.template_edit_id, name));
+        let result = self
+            .draft_template_snapshot(cx)
+            .and_then(|snapshot| self.persist_and_commit_template(snapshot, save, window, cx));
         match result {
-            Ok(_) => {
-                self.commit_template_snapshot(snapshot, window, cx);
+            Ok(()) => {
                 self.close_template_dialog(window, cx);
                 self.load_templates();
-                self.show_toast("分流模板已保存并应用".into(), cx);
+                self.show_toast("模板已保存并应用".into(), cx);
             }
-            Err(error) => {
-                self.template_error = Some(format!("保存模板失败：{error}"));
+            Err(e) => {
+                self.template_error = Some(e);
                 cx.notify();
             }
         }
+    }
+
+    fn load_template_draft(
+        &mut self,
+        snapshot: TemplateSnapshot,
+        name: String,
+        id: Option<i64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_template_dialog(window, cx);
+        self.template_base_options = snapshot.generate_options(&self.options).ok();
+        self.template_edit_id = id;
+        self.template_enabled_modules = snapshot.enabled_modules.into_iter().collect();
+        self.template_disabled_rule_sets = snapshot.disabled_rule_sets.into_iter().collect();
+        self.template_custom_rule_sets = snapshot.custom_rule_sets;
+        self.template_policy_groups = snapshot.policy_groups;
+        self.template_rule_set_targets = snapshot.rule_set_targets;
+        self.template_rule_order = snapshot.rule_order;
+        self.custom_groups = snapshot.custom_groups;
+        self.chains = snapshot.chains;
+        self.template_name
+            .update(cx, |s, cx| s.set_value(name, window, cx));
+        self.template_custom_rules.update(cx, |s, cx| {
+            s.set_value(snapshot.custom_rule_lines.join("\n"), window, cx)
+        });
+        self.page = Page::Generator;
+        cx.notify();
     }
 
     pub fn apply_custom_template(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(template) = self
-            .custom_templates
-            .iter()
-            .find(|template| template.id == id)
-            .cloned()
-        else {
+        if self.template_dialog_open {
+            self.show_toast("请先处理当前草稿".into(), cx);
+            return;
+        }
+        if let Some(t) = self.custom_templates.iter().find(|t| t.id == id).cloned() {
+            match serde_json::from_str(&t.config_json)
+                .map_err(|e| e.to_string())
+                .and_then(|s| self.validate_template_snapshot(&s).map(|_| s))
+            {
+                Ok(s) => self.load_template_draft(s, t.name, Some(id), window, cx),
+                Err(e) => self.show_toast(format!("模板无效：{e}"), cx),
+            }
+        }
+    }
+
+    pub fn copy_custom_template(&mut self, id: i64, cx: &mut Context<Self>) {
+        if let Some(t) = self.custom_templates.iter().find(|t| t.id == id).cloned() {
+            let mut name = format!("{} 副本", t.name);
+            let mut i = 2;
+            while self.custom_templates.iter().any(|t| t.name == name) {
+                name = format!("{} 副本 {i}", t.name);
+                i += 1;
+            }
+            let result = self
+                .store
+                .lock()
+                .expect("store mutex poisoned")
+                .add_custom_template(&name, &t.config_json);
+            match result {
+                Ok(_) => {
+                    self.load_templates();
+                    self.show_toast("模板已复制".into(), cx)
+                }
+                Err(e) => self.show_toast(format!("复制失败：{e}"), cx),
+            }
+        }
+    }
+
+    pub fn export_custom_template(&mut self, id: i64, cx: &mut Context<Self>) {
+        let Some(t) = self.custom_templates.iter().find(|t| t.id == id).cloned() else {
             return;
         };
-        let snapshot = match serde_json::from_str::<TemplateSnapshot>(&template.config_json)
-            .map_err(|error| error.to_string())
-            .and_then(|snapshot| self.validate_template_snapshot(&snapshot).map(|_| snapshot))
-        {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                self.show_toast(format!("模板无效，未应用：{error}"), cx);
+        let result = serde_json::from_str(&t.config_json)
+            .map_err(|e| e.to_string())
+            .and_then(|config| {
+                serde_json::to_string_pretty(&TemplateFile {
+                    format: "swiftsub-routing-template".into(),
+                    version: 1,
+                    name: t.name,
+                    config,
+                })
+                .map_err(|e| e.to_string())
+            });
+        let text = match result {
+            Ok(s) => s,
+            Err(e) => {
+                self.show_toast(e, cx);
                 return;
             }
         };
-        self.commit_template_snapshot(snapshot, window, cx);
-        self.page = Page::Generator;
-        self.show_toast(format!("已应用模板「{}」", template.name), cx);
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("SwiftSub 模板", &["json"])
+            .set_file_name("routing-template.json")
+            .save_file()
+        {
+            match std::fs::write(path, text) {
+                Ok(()) => self.show_toast("模板已导出".into(), cx),
+                Err(e) => self.show_toast(format!("导出失败：{e}"), cx),
+            }
+        }
+    }
+
+    pub fn import_custom_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.template_dialog_open {
+            self.show_toast("请先处理当前草稿".into(), cx);
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("SwiftSub 模板", &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+        let result = std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|s| TemplateFile::decode(&s))
+            .and_then(|file| self.validate_template_snapshot(&file.config).map(|_| file));
+        match result {
+            Ok(file) => self.load_template_draft(file.config, file.name, None, window, cx),
+            Err(e) => self.show_toast(format!("导入失败：{e}"), cx),
+        }
     }
 
     pub fn delete_custom_template(&mut self, id: i64, cx: &mut Context<Self>) {
-        {
-            let store = self.store.lock().expect("store mutex poisoned");
-            let _ = store.delete_custom_template(id);
+        let result = self
+            .store
+            .lock()
+            .expect("store mutex poisoned")
+            .delete_custom_template(id);
+        match result {
+            Ok(()) => {
+                self.load_templates();
+                self.show_toast("模板已删除".into(), cx)
+            }
+            Err(e) => self.show_toast(format!("删除失败：{e}"), cx),
         }
-        self.load_templates();
-        self.show_toast("模板已删除".to_string(), cx);
     }
 
     pub fn apply_builtin_template(&mut self, preset: Preset, cx: &mut Context<Self>) {
@@ -3548,5 +3845,26 @@ mod routing_template_tests {
         assert!(error.to_string().contains("已删除策略组"));
         assert!(base.rule_set_targets.is_empty());
         assert!(base.policy_groups.is_empty());
+    }
+    #[test]
+    fn template_file_roundtrip_and_version_rejection() {
+        let config: TemplateSnapshot = serde_json::from_value(legacy_snapshot()).unwrap();
+        let file = TemplateFile {
+            format: "swiftsub-routing-template".into(),
+            version: 1,
+            name: "测试模板".into(),
+            config,
+        };
+        let text = serde_json::to_string(&file).unwrap();
+        let restored = TemplateFile::decode(&text).unwrap();
+        assert_eq!(restored.name, "测试模板");
+        assert_eq!(restored.config.test_interval, 123);
+        let mut invalid: serde_json::Value = serde_json::from_str(&text).unwrap();
+        invalid["version"] = json!(2);
+        assert!(TemplateFile::decode(&invalid.to_string()).is_err());
+        invalid["version"] = json!(1);
+        invalid["format"] = json!("other");
+        assert!(TemplateFile::decode(&invalid.to_string()).is_err());
+        assert!(TemplateFile::decode("{}").is_err());
     }
 }

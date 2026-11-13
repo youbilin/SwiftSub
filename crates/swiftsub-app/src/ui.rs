@@ -1766,6 +1766,7 @@ impl SwiftSubApp {
             TemplateTab::RuleSets => {
                 format!("已选 {selected_count} / {total_count} 条 · {selected_sources} 个来源")
             }
+            TemplateTab::Changes => "应用前配置差异".into(),
             TemplateTab::RuleOrder => "最终规则排序与检查".into(),
             TemplateTab::CustomRules => format!("{custom_rule_count} 条自定义规则"),
             TemplateTab::Tools => "筛选代理组与链式代理".into(),
@@ -1775,6 +1776,22 @@ impl SwiftSubApp {
             self.template_target_picker_panel(id, cx)
         } else {
             match self.template_tab {
+            TemplateTab::Changes => {
+                let mut rows=v_flex().gap_2();
+                match self.draft_generated(cx) {
+                    Ok(profile)=> {
+                        for warning in profile.warnings { rows=rows.child(div().text_color(rgb(WARNING)).text_size(px(11.)).child(warning)); }
+                        let old:std::collections::HashSet<_>=self.preview.lines().collect();
+                        let new:std::collections::HashSet<_>=profile.yaml.lines().collect();
+                        rows=rows.child(field_label("移除的配置行（最多 100 行）"));
+                        for line in self.preview.lines().filter(|line|!new.contains(line)).take(100) {rows=rows.child(div().font_family("Consolas").text_size(px(11.)).text_color(rgb(DANGER)).child(format!("− {line}")));}
+                        rows=rows.child(field_label("新增的配置行（最多 100 行）"));
+                        for line in profile.yaml.lines().filter(|line|!old.contains(line)).take(100) {rows=rows.child(div().font_family("Consolas").text_size(px(11.)).text_color(rgb(SUCCESS)).child(format!("+ {line}")));}
+                        rows=rows.child(div().text_size(px(11.)).text_color(rgb(MUTED)).child("此处按配置行比较；顺序变更请在最终规则顺序页检查。"));
+                    }, Err(error)=>{rows=rows.child(div().text_color(rgb(DANGER)).child(error));}
+                }
+                div().id("template-changes").flex_1().min_h_0().overflow_y_scrollbar().child(rows).into_any_element()
+            },
             TemplateTab::RuleOrder => self.template_rule_order_panel(cx),
             TemplateTab::Tools => div().id("workspace-tools").flex_1().min_h_0().overflow_y_scrollbar().child(v_flex().gap_4().child(self.custom_groups_section(cx)).child(self.chains_section(cx))).into_any_element(),
             TemplateTab::PolicyGroups => self.template_policy_groups_panel(cx),
@@ -1888,11 +1905,18 @@ impl SwiftSubApp {
                 h_flex()
                     .gap_1()
                     .flex_wrap()
+                    .child(self.template_tab_pill("变更预览", TemplateTab::Changes, cx))
                     .child(self.template_tab_pill("规则顺序", TemplateTab::RuleOrder, cx))
                     .child(self.template_tab_pill("策略组", TemplateTab::PolicyGroups, cx))
                     .child(self.template_tab_pill("规则集", TemplateTab::RuleSets, cx))
                     .child(self.template_tab_pill("自定义规则", TemplateTab::CustomRules, cx))
                     .child(self.template_tab_pill("筛选与链式", TemplateTab::Tools, cx)),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child(self.template_change_summary(cx)),
             )
             .child(tab_content)
             .when_some(self.template_error.clone(), |this, error| {
@@ -1911,9 +1935,13 @@ impl SwiftSubApp {
                     .child(
                         Button::new("template-cancel")
                             .ghost()
-                            .label("取消")
+                            .label(if self.template_discard_armed {
+                                "放弃草稿"
+                            } else {
+                                "取消"
+                            })
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.close_template_dialog(window, cx)
+                                this.request_close_template(window, cx)
                             })),
                     )
                     .when(self.page == Page::Generator, |this| {
@@ -1929,7 +1957,11 @@ impl SwiftSubApp {
                     .child(
                         Button::new("template-save")
                             .primary()
-                            .label("保存并应用")
+                            .label(if self.template_edit_id.is_some() {
+                                "更新并应用"
+                            } else {
+                                "保存并应用"
+                            })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.save_current_template(window, cx)
                             })),
@@ -3622,7 +3654,8 @@ impl SwiftSubApp {
                 template_summary_counts(&template.config_json);
             custom_rows = custom_rows.child(
                 h_flex()
-                    .h(px(54.))
+                    .min_h(px(72.))
+                    .flex_wrap()
                     .px_4()
                     .gap_3()
                     .rounded(px(8.))
@@ -3658,12 +3691,30 @@ impl SwiftSubApp {
                     .child(
                         Button::new(format!("apply-template-{}", template.id))
                             .ghost()
-                            .label("应用")
+                            .label("编辑 / 预览")
                             .on_click(cx.listener({
                                 let id = template.id;
                                 move |this, _, window, cx| {
                                     this.apply_custom_template(id, window, cx)
                                 }
+                            })),
+                    )
+                    .child(
+                        Button::new(format!("copy-template-{}", template.id))
+                            .ghost()
+                            .label("复制")
+                            .on_click(cx.listener({
+                                let id = template.id;
+                                move |this, _, _, cx| this.copy_custom_template(id, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new(format!("export-template-{}", template.id))
+                            .ghost()
+                            .label("导出")
+                            .on_click(cx.listener({
+                                let id = template.id;
+                                move |this, _, _, cx| this.export_custom_template(id, cx)
                             })),
                     )
                     .child(icon_action(
@@ -3684,6 +3735,7 @@ impl SwiftSubApp {
             .child(
                 h_flex()
                     .justify_between()
+                    .flex_wrap()
                     .child(section_label("我的分流模板"))
                     .child(
                         h_flex()
@@ -3693,6 +3745,14 @@ impl SwiftSubApp {
                                     .text_size(px(11.5))
                                     .text_color(rgb(MUTED))
                                     .child(format!("{} 个", self.custom_templates.len())),
+                            )
+                            .child(
+                                Button::new("import-template")
+                                    .ghost()
+                                    .label("导入 JSON")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.import_custom_template(window, cx)
+                                    })),
                             )
                             .child(
                                 Button::new("new-template")

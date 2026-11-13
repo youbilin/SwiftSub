@@ -597,6 +597,35 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Persist a routing snapshot and an optional template in one SQLite transaction.
+    pub fn save_routing_snapshot(
+        &self,
+        settings: &HashMap<String, String>,
+        template: Option<(Option<i64>, &str, &str)>,
+    ) -> Result<Option<i64>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let template_id = if let Some((id, name, json)) = template {
+            let now = now_ts();
+            if let Some(id) = id {
+                let changed = tx.execute("UPDATE templates SET name=?1, config_json=?2, updated_at=?3 WHERE id=?4 AND builtin=0", params![name,json,now,id])?;
+                if changed != 1 {
+                    return Err(rusqlite::Error::QueryReturnedNoRows.into());
+                }
+                Some(id)
+            } else {
+                tx.execute("INSERT INTO templates (name,builtin,config_json,created_at,updated_at) VALUES (?1,0,?2,?3,?3)",params![name,json,now])?;
+                Some(tx.last_insert_rowid())
+            }
+        } else {
+            None
+        };
+        for (key, value) in settings {
+            tx.execute("INSERT INTO settings (key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value])?;
+        }
+        tx.commit()?;
+        Ok(template_id)
+    }
+
     pub fn delete_custom_template(&self, id: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM templates WHERE id = ?1 AND builtin = 0", [id])?;
@@ -882,5 +911,50 @@ mod tests {
         let logs = store.recent_refresh_logs(10).unwrap();
         assert_eq!(logs.len(), 1);
         assert!(logs[0].ok);
+    }
+}
+
+#[cfg(test)]
+mod routing_transaction_tests {
+    use super::*;
+    #[test]
+    fn template_update_and_settings_commit_or_rollback_together() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.add_custom_template("original", "{}").unwrap();
+        store.set_setting("existing", "old").unwrap();
+        store.conn.execute_batch("CREATE TRIGGER reject_routing BEFORE INSERT ON settings WHEN NEW.key='blocked' BEGIN SELECT RAISE(FAIL,'injected write failure'); END;").unwrap();
+        let settings = HashMap::from([
+            ("existing".into(), "new".into()),
+            ("blocked".into(), "value".into()),
+        ]);
+        assert!(
+            store
+                .save_routing_snapshot(&settings, Some((Some(id), "renamed", "{\"new\":true}")))
+                .is_err()
+        );
+        assert_eq!(
+            store.get_setting("existing").unwrap().as_deref(),
+            Some("old")
+        );
+        assert_eq!(store.list_custom_templates().unwrap()[0].name, "original");
+        assert!(store.get_setting("blocked").unwrap().is_none());
+        store
+            .conn
+            .execute_batch("DROP TRIGGER reject_routing;")
+            .unwrap();
+        store
+            .save_routing_snapshot(&settings, Some((Some(id), "renamed", "{\"new\":true}")))
+            .unwrap();
+        assert_eq!(store.list_custom_templates().unwrap()[0].id, id);
+        assert_eq!(store.list_custom_templates().unwrap()[0].name, "renamed");
+        assert_eq!(
+            store.get_setting("existing").unwrap().as_deref(),
+            Some("new")
+        );
+        assert!(
+            store
+                .save_routing_snapshot(&settings, Some((Some(id + 999), "missing", "{}")))
+                .is_err()
+        );
     }
 }
