@@ -260,6 +260,10 @@ pub struct SwiftSubApp {
     pub nodes: Vec<Node>,
     pub node_order: Vec<String>,
     pub parse_warnings: Vec<String>,
+    pub import_report: Vec<swiftsub_core::parser::ImportReportItem>,
+    pub source_import_report: Vec<(String, swiftsub_core::parser::ImportReportItem)>,
+    pub diagnostics_open: bool,
+    pub generation_report: String,
     pub search: Entity<InputState>,
     pub add_open: bool,
     pub add_mode: AddMode,
@@ -538,6 +542,10 @@ impl SwiftSubApp {
             nodes: Vec::new(),
             node_order,
             parse_warnings: Vec::new(),
+            import_report: Vec::new(),
+            source_import_report: Vec::new(),
+            diagnostics_open: false,
+            generation_report: String::new(),
             search,
             add_open: false,
             add_mode: AddMode::Subscription,
@@ -1020,8 +1028,12 @@ impl SwiftSubApp {
         }
 
         let parsed = match parse_content(&input) {
-            Ok(parsed) if !parsed.proxies.is_empty() => parsed,
-            Ok(_) => {
+            Ok(parsed) if !parsed.proxies.is_empty() => {
+                self.import_report = parsed.report.clone();
+                parsed
+            }
+            Ok(parsed) => {
+                self.import_report = parsed.report;
                 self.batch_error = Some("没有识别到可用节点".to_string());
                 cx.notify();
                 return;
@@ -1365,7 +1377,10 @@ impl SwiftSubApp {
         cx: &mut Context<Self>,
     ) {
         let parsed = match parse_content(&input) {
-            Ok(parsed) if !parsed.proxies.is_empty() => parsed,
+            Ok(parsed) if !parsed.proxies.is_empty() => {
+                self.import_report = parsed.report.clone();
+                parsed
+            }
             Ok(_) => {
                 self.add_error = Some("没有从链接中解析出节点".to_string());
                 cx.notify();
@@ -1476,6 +1491,7 @@ impl SwiftSubApp {
 
         match parse_content(&text) {
             Ok(parsed) if !parsed.proxies.is_empty() => {
+                self.import_report = parsed.report.clone();
                 let imported = parsed.proxies.len();
                 match self.append_manual_proxies(parsed.proxies) {
                     Ok(total) => {
@@ -1565,6 +1581,27 @@ impl SwiftSubApp {
         }
     }
 
+    pub fn export_diagnostics(&mut self, cx: &mut Context<Self>) {
+        let report = serde_json::json!({"format":"swiftsub-diagnostics","version":1,
+            "last_import":self.import_report,"subscriptions":self.source_import_report,
+            "generation":serde_json::from_str::<serde_json::Value>(&self.generation_report).ok(),
+            "warnings":self.gen_warnings});
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("诊断 JSON", &["json"])
+            .set_file_name("swiftsub-report.json")
+            .save_file()
+        else {
+            return;
+        };
+        let result = serde_json::to_string_pretty(&report)
+            .map_err(|e| e.to_string())
+            .and_then(|text| std::fs::write(path, text).map_err(|e| e.to_string()));
+        match result {
+            Ok(()) => self.show_toast("诊断报告已导出".into(), cx),
+            Err(e) => self.show_toast(format!("导出失败：{e}"), cx),
+        }
+    }
+
     pub fn export_preview(&mut self, cx: &mut Context<Self>) {
         if self.preview.is_empty() {
             self.show_toast("暂无可导出的配置".to_string(), cx);
@@ -1602,6 +1639,7 @@ impl SwiftSubApp {
     }
 
     fn rebuild_nodes(&mut self, cx: &mut Context<Self>) {
+        let mut reports = Vec::new();
         let mut all_nodes = Vec::new();
         let mut seen = HashSet::new();
         let mut warnings = Vec::new();
@@ -1618,6 +1656,13 @@ impl SwiftSubApp {
                 };
                 match parse_content(payload) {
                     Ok(parsed) => {
+                        reports.extend(
+                            parsed
+                                .report
+                                .iter()
+                                .cloned()
+                                .map(|item| (subscription.name.clone(), item)),
+                        );
                         for warning in parsed.warnings {
                             warnings.push(format!("{} · {}", subscription.name, warning.message));
                         }
@@ -1675,6 +1720,7 @@ impl SwiftSubApp {
         }
 
         self.nodes = all_nodes;
+        self.source_import_report = reports;
         self.parse_warnings = warnings;
         self.regenerate(cx);
     }
@@ -1709,6 +1755,8 @@ impl SwiftSubApp {
         let preview_was_empty = self.preview.is_empty();
         match generate_profile(&self.nodes, &options) {
             Ok(profile) => {
+                self.generation_report =
+                    serde_json::to_string_pretty(&profile.trace).unwrap_or_default();
                 self.preview = profile.yaml;
                 if preview_was_empty {
                     self.preview_scroll.set_offset(point(px(0.0), px(0.0)));
@@ -1844,12 +1892,20 @@ impl SwiftSubApp {
             let (outcome, node_count) = cx
                 .background_executor()
                 .spawn(async move {
-                    let outcome = fetch_subscription(&url, &options, &cache);
-                    let node_count = match &outcome {
-                        Ok(FetchOutcome::Fetched(result)) => parse_content(&result.content)
-                            .map(|parsed| parsed.proxies.len())
-                            .unwrap_or_default(),
-                        _ => 0,
+                    let outcome =
+                        fetch_subscription(&url, &options, &cache).map_err(|e| e.to_string());
+                    let (outcome, node_count) = match outcome {
+                        Ok(FetchOutcome::Fetched(result)) => match parse_content(&result.content) {
+                            Ok(parsed)
+                                if parsed.proxies.iter().any(|p| p.fatal_issue().is_none()) =>
+                            {
+                                let count = parsed.proxies.len();
+                                (Ok(FetchOutcome::Fetched(result)), count)
+                            }
+                            Ok(_) => (Err("订阅没有可用节点，保留上次成功内容".to_string()), 0),
+                            Err(e) => (Err(format!("订阅解析失败，保留上次成功内容：{e}")), 0),
+                        },
+                        other => (other, 0),
                     };
                     (outcome, node_count)
                 })
@@ -1871,14 +1927,17 @@ impl SwiftSubApp {
                         };
                         {
                             let store = store.lock().expect("store mutex poisoned");
-                            let _ = store.save_fetch_success(
+                            if let Err(error) = store.save_fetch_success(
                                 id,
                                 &result.content,
                                 result.etag.as_deref(),
                                 result.last_modified.as_deref(),
                                 &traffic,
                                 node_count,
-                            );
+                            ) {
+                                this.show_toast(format!("订阅保存失败，保留上次内容：{error}"), cx);
+                                return;
+                            }
                             if let Some(hours) = result.update_interval_hours {
                                 let minutes = hours.saturating_mul(60).clamp(15, 10_080);
                                 let _ = store.set_subscription_refresh_minutes(id, minutes);
@@ -2944,6 +3003,15 @@ impl SwiftSubApp {
                     != serde_json::to_string(&base.chains).ok()
                 {
                     changes.push("链式代理");
+                }
+                if draft.test_url != base.test_url || draft.test_interval != base.test_interval {
+                    changes.push("全局测速");
+                }
+                if draft.mixed_port != base.mixed_port || draft.allow_lan != base.allow_lan {
+                    changes.push("监听设置");
+                }
+                if draft.rule_provider_base_url != base.rule_provider_base_url {
+                    changes.push("规则镜像");
                 }
                 if changes.is_empty() {
                     "配置与当前输出一致；名称及未更新的组详情不计入比较".into()

@@ -115,6 +115,9 @@ impl Render for SwiftSubApp {
                 self.template_dialog_open && self.page != Page::Generator,
                 |this| this.child(self.template_dialog(cx)),
             )
+            .when(self.diagnostics_open, |this| {
+                this.child(self.diagnostics_dialog(cx))
+            })
             .when_some(self.toast.clone(), |this, toast| {
                 this.child(
                     div()
@@ -2036,6 +2039,78 @@ impl SwiftSubApp {
         modal(panel).into_any_element()
     }
 
+    fn diagnostics_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+        use swiftsub_core::parser::ImportStatus;
+        let mut rows = v_flex().gap_2().child(field_label("最近一次手动导入"));
+        let mut displayed = 0;
+        for (source, items) in [("最近导入".to_string(), self.import_report.clone())]
+            .into_iter()
+            .chain(
+                self.source_import_report
+                    .iter()
+                    .map(|(source, item)| (source.clone(), vec![item.clone()])),
+            )
+        {
+            for item in items {
+                if displayed >= 500 {
+                    break;
+                }
+                displayed += 1;
+                let label = match item.status {
+                    ImportStatus::Accepted => "成功",
+                    ImportStatus::Warning => "需检查",
+                    ImportStatus::Rejected => "失败 / 跳过",
+                };
+                let color = match item.status {
+                    ImportStatus::Accepted => SUCCESS,
+                    ImportStatus::Warning => WARNING,
+                    ImportStatus::Rejected => DANGER,
+                };
+                rows = rows.child(
+                    v_flex()
+                        .gap_1()
+                        .p_2()
+                        .border_b_1()
+                        .border_color(rgb(BORDER))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(color))
+                                .child(format!(
+                                    "{source} · #{} · {label} · {} · {}",
+                                    item.index,
+                                    item.name.unwrap_or_default(),
+                                    item.protocol.unwrap_or_default()
+                                )),
+                        )
+                        .child(div().text_size(px(11.)).child(item.messages.join("；"))),
+                );
+            }
+        }
+        rows = rows.child(
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(MUTED))
+                .child("界面最多显示 500 项，导出包含全部记录。"),
+        );
+        for warning in &self.gen_warnings {
+            rows = rows.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(WARNING))
+                    .child(warning.clone()),
+            );
+        }
+        modal(v_flex().w(px(740.)).h(px(600.)).p_4().gap_3().rounded(px(12.)).bg(rgb(SURFACE))
+            .child(field_label("导入诊断与配置追溯"))
+            .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child("链接报告的序号为原行号，YAML 为 proxies 项序号。成功表示解析成功；连接能力需另行测试。JSON 包含完整报告和生成配置摘要。"))
+            .child(div().id("diagnostics-scroll").flex_1().min_h_0().overflow_y_scrollbar().child(rows))
+            .child(h_flex().justify_end().gap_2()
+                .child(Button::new("export-diagnostics").primary().label("导出完整报告").on_click(cx.listener(|this,_,_,cx|this.export_diagnostics(cx))))
+                .child(Button::new("close-diagnostics").ghost().label("关闭").on_click(cx.listener(|this,_,_,cx|{this.diagnostics_open=false;cx.notify();})))))
+            .into_any_element()
+    }
+
     fn batch_import_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
         let panel = v_flex()
             .w(px(720.))
@@ -2473,6 +2548,15 @@ impl SwiftSubApp {
                                 "显示预览"
                             })
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_preview(cx))),
+                    )
+                    .child(
+                        Button::new("workspace-diagnostics")
+                            .ghost()
+                            .label("诊断")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.diagnostics_open = true;
+                                cx.notify();
+                            })),
                     )
                     .child(
                         Button::new("workspace-export")

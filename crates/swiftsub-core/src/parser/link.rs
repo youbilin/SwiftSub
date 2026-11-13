@@ -6,17 +6,19 @@ use url::Url;
 use crate::error::{Error, Result};
 use crate::model::Proxy;
 
-use super::ParseWarning;
 use super::base64_utils::decode_base64_text;
+use super::{ImportReportItem, ImportStatus, ParseWarning};
 
 pub struct LinkOutput {
     pub proxies: Vec<Proxy>,
     pub warnings: Vec<ParseWarning>,
+    pub report: Vec<ImportReportItem>,
 }
 
 pub fn parse_links(input: &str) -> LinkOutput {
     let mut proxies = Vec::new();
     let mut warnings = Vec::new();
+    let mut report = Vec::new();
 
     for (index, raw_line) in input.lines().enumerate() {
         let line = raw_line.trim();
@@ -24,6 +26,13 @@ pub fn parse_links(input: &str) -> LinkOutput {
             continue;
         }
         if !line.contains("://") {
+            report.push(ImportReportItem {
+                index: index + 1,
+                name: None,
+                protocol: None,
+                status: ImportStatus::Rejected,
+                messages: vec!["无法识别的节点链接".into()],
+            });
             warnings.push(ParseWarning::new(
                 Some(index + 1),
                 format!("无法识别的节点链接: {}", truncate(line, 80)),
@@ -33,19 +42,42 @@ pub fn parse_links(input: &str) -> LinkOutput {
 
         match parse_link(line) {
             Ok(proxy) => {
-                for message in link_compatibility_warnings(line) {
+                let messages = link_compatibility_warnings(line);
+                report.push(ImportReportItem {
+                    index: index + 1,
+                    name: Some(proxy.name().to_string()),
+                    protocol: Some(proxy.kind().to_string()),
+                    status: if messages.is_empty() {
+                        ImportStatus::Accepted
+                    } else {
+                        ImportStatus::Warning
+                    },
+                    messages: messages.clone(),
+                });
+                for message in messages {
                     warnings.push(ParseWarning::new(Some(index + 1), message));
                 }
                 proxies.push(proxy);
             }
-            Err(error) => warnings.push(ParseWarning::new(
-                Some(index + 1),
-                format!("{}: {}", truncate(line, 60), error),
-            )),
+            Err(error) => {
+                let message = error.to_string();
+                report.push(ImportReportItem {
+                    index: index + 1,
+                    name: None,
+                    protocol: line.split_once("://").map(|(s, _)| s.to_string()),
+                    status: ImportStatus::Rejected,
+                    messages: vec![message.clone()],
+                });
+                warnings.push(ParseWarning::new(Some(index + 1), message));
+            }
         }
     }
 
-    LinkOutput { proxies, warnings }
+    LinkOutput {
+        proxies,
+        warnings,
+        report,
+    }
 }
 
 fn parse_link(line: &str) -> Result<Proxy> {

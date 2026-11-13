@@ -76,6 +76,11 @@ impl Rule {
             return Err(Error::InvalidLink(format!("invalid rule: {line}")));
         }
 
+        if parts.len() > 4 || (parts.len() == 4 && parts[3] != "no-resolve") {
+            return Err(Error::InvalidLink(format!(
+                "unsupported rule options: {line}"
+            )));
+        }
         let no_resolve = parts.get(3).is_some_and(|value| *value == "no-resolve");
         Ok(Self::new(parts[0], parts[1], parts[2]).with_no_resolve(no_resolve))
     }

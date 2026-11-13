@@ -12,7 +12,7 @@ VLESS 分享链接的 `pbk`（也接受 `publicKey` / `public-key`）、`sid`、
 
 `pqv` / `mldsa65Verify` 是 ML-DSA-65 公钥验证参数，与 X25519-MLKEM768 密钥交换开关不同。当前 Mihomo REALITY 配置没有对应验证字段，非空值会使该链接导入失败并显示原因，空值按未配置处理。
 
-协议适配不等于实际握手保证。Mihomo 官方文档对 Xray v26.7.11+ REALITY 兼容性有明确限制；实际连接仍取决于服务端版本、指纹和客户端实现。本项目的配置校验不包含真实服务端连接测试。
+协议适配不等于实际握手保证。Mihomo 官方文档对 Xray v26.7.11+ REALITY 兼容性有明确限制；实际连接仍取决于服务端版本、指纹和客户端实现。当前已增加下述受控回环实际传输测试；公网服务端和其他版本仍需分别验证。
 
 ## VLESS 与 XHTTP
 
@@ -53,3 +53,22 @@ XDRIVE、MASQUE 等目标客户端未支持的 VLESS 传输会报告错误。其
 - [Mihomo VLESS 文档](https://wiki.metacubex.one/config/proxies/vless/)
 - [Mihomo REALITY 字段定义](https://github.com/MetaCubeX/mihomo/blob/Meta/adapter/outbound/reality.go)
 - [Mihomo XHTTP 字段定义](https://github.com/MetaCubeX/mihomo/blob/Meta/adapter/outbound/vless.go)
+
+## 2026-11-14 实际回环传输复核
+
+使用官方 Xray v26.11.9 Windows amd64、Mihomo v1.19.34 和本地 Go 1.24.7 TLS 1.3 目标，客户端配置由实际链接解析器及生成器生成。请求经 Mihomo HTTP 代理、Xray VLESS 到本地 HTTP 服务，检查完整响应内容。
+
+| 用例 | 结果 |
+| --- | --- |
+| XHTTP packet-up，无 REALITY | 实际传输通过 |
+| RAW + REALITY，support-x25519mlkem768=true | 实际传输通过 |
+| XHTTP packet-up + REALITY，support-x25519mlkem768=true | 实际传输通过 |
+| RAW + REALITY，support-x25519mlkem768=false | 失败，Mihomo 返回 HTTP 502 |
+
+这组测试说明 true 适配本次测试的新版服务端；false 仍须原样保留供旧环境使用，但不能保证与新版服务端兼容。伪装目标会影响测试：Python/OpenSSL 目标在初次试验中握手失败，换用 Go TLS 目标后上述三个用例通过。不得据此承诺所有指纹、模式或公网目标均可用。
+
+复现：先构建 `cargo build -p swiftsub-core --example validation_profile`，再用 `go build -o tls-target.exe scripts/fixtures/tls-target.go` 构建目标。运行 `python scripts/validate-loopback.py --xray <xray.exe> --mihomo <mihomo.exe> --data-dir <含 GeoSite.dat 的目录> --tls-target <tls-target.exe> --openssl <openssl.exe>`。工具仅在回环地址启动测试服务，结束后清理拥有的进程；配置与日志保存在它输出的临时目录。任一传输失败时脚本返回非零；显式 false 用例对该新版服务端预期失败。生成的测试配置和密钥只用于本次回环服务。
+
+## 导入与输出报告
+
+生成页「诊断」提供逐节点解析状态；链接按原始行号、YAML 按 proxies 项序号标记成功、需检查或失败。生成报告包含节点来源、组成员、最终规则及配置正文 SHA-256。YAML 顶部记录同一个摘要，便于核对导出的报告与配置。报告不会保存原始节点链接或节点认证字段。

@@ -16,7 +16,7 @@ pub enum SourceKind {
     Base64Links,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ParseWarning {
     pub line: Option<usize>,
     pub message: String,
@@ -31,11 +31,30 @@ impl ParseWarning {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImportStatus {
+    Accepted,
+    Warning,
+    Rejected,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ImportReportItem {
+    /// One-based link line or YAML proxies entry index; never contains the original credential-bearing link.
+    pub index: usize,
+    pub name: Option<String>,
+    pub protocol: Option<String>,
+    pub status: ImportStatus,
+    pub messages: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ParseOutput {
     pub proxies: Vec<Proxy>,
     pub warnings: Vec<ParseWarning>,
     pub source_kind: SourceKind,
+    pub report: Vec<ImportReportItem>,
 }
 
 pub fn parse_content(content: &str) -> Result<ParseOutput> {
@@ -59,6 +78,7 @@ fn parse_content_inner(content: &str, depth: usize) -> Result<ParseOutput> {
         return Ok(ParseOutput {
             proxies: output.proxies,
             warnings: output.warnings,
+            report: output.report,
             source_kind: SourceKind::ClashYaml,
         });
     }
@@ -81,6 +101,7 @@ fn parse_content_inner(content: &str, depth: usize) -> Result<ParseOutput> {
         proxies: output.proxies,
         warnings: output.warnings,
         source_kind: SourceKind::Links,
+        report: output.report,
     })
 }
 
@@ -106,5 +127,31 @@ mod tests {
         let output = parse_content(&encoded).unwrap();
         assert_eq!(output.proxies.len(), 1);
         assert_eq!(output.source_kind, SourceKind::Base64Links);
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+    #[test]
+    fn reports_each_link_and_preserves_original_positions_through_base64() {
+        use base64::Engine;
+        let text = "trojan://password@example.org:443#ok\n\nunsupported://secret@example.org:443\nno-scheme";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+        let output = parse_content(&encoded).unwrap();
+        assert_eq!(output.report.len(), 3);
+        assert_eq!(output.report[0].status, ImportStatus::Accepted);
+        assert_eq!(output.report[1].index, 3);
+        assert_eq!(output.report[1].status, ImportStatus::Rejected);
+        let json = serde_json::to_string(&output.report).unwrap();
+        assert!(!json.contains("password"));
+        assert!(!json.contains("secret@"));
+    }
+    #[test]
+    fn yaml_report_includes_rejected_and_unverified_entries() {
+        let output=parse_content("proxies:\n- {name: ok, type: trojan, server: example.org, port: 443, password: p}\n- {name: unknown, type: future, server: example.org, port: 443}\n- {name: invalid}\n").unwrap();
+        assert_eq!(output.report.len(), 3);
+        assert_eq!(output.report[1].status, ImportStatus::Warning);
+        assert_eq!(output.report[2].status, ImportStatus::Rejected);
     }
 }

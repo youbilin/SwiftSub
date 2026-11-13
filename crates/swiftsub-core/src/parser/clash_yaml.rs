@@ -3,11 +3,12 @@ use serde_yaml_ng::{Mapping, Value};
 use crate::error::{Error, Result};
 use crate::model::Proxy;
 
-use super::ParseWarning;
+use super::{ImportReportItem, ImportStatus, ParseWarning};
 
 pub struct ClashYamlOutput {
     pub proxies: Vec<Proxy>,
     pub warnings: Vec<ParseWarning>,
+    pub report: Vec<ImportReportItem>,
 }
 
 pub fn parse_clash_yaml(input: &str) -> Result<ClashYamlOutput> {
@@ -23,6 +24,7 @@ pub fn parse_clash_yaml(input: &str) -> Result<ClashYamlOutput> {
 
     let mut proxies = Vec::with_capacity(sequence.len());
     let mut warnings = Vec::new();
+    let mut report = Vec::new();
 
     for (index, item) in sequence.iter().enumerate() {
         match Proxy::from_value(item.clone()) {
@@ -37,16 +39,47 @@ pub fn parse_clash_yaml(input: &str) -> Result<ClashYamlOutput> {
                         ),
                     ));
                 }
+                let mut messages: Vec<_> = warnings
+                    .iter()
+                    .filter(|w| w.line == Some(index + 1))
+                    .map(|w| w.message.clone())
+                    .collect();
+                let status = if let Some(issue) = proxy.fatal_issue() {
+                    messages.push(issue);
+                    ImportStatus::Rejected
+                } else if messages.is_empty() {
+                    ImportStatus::Accepted
+                } else {
+                    ImportStatus::Warning
+                };
+                report.push(ImportReportItem {
+                    index: index + 1,
+                    name: Some(proxy.name().to_string()),
+                    protocol: Some(proxy.kind().to_string()),
+                    status,
+                    messages,
+                });
                 proxies.push(proxy);
             }
-            Err(error) => warnings.push(ParseWarning::new(
-                Some(index + 1),
-                format!("跳过无效节点: {error}"),
-            )),
+            Err(error) => {
+                let message = format!("跳过无效节点: {error}");
+                report.push(ImportReportItem {
+                    index: index + 1,
+                    name: None,
+                    protocol: None,
+                    status: ImportStatus::Rejected,
+                    messages: vec![message.clone()],
+                });
+                warnings.push(ParseWarning::new(Some(index + 1), message));
+            }
         }
     }
 
-    Ok(ClashYamlOutput { proxies, warnings })
+    Ok(ClashYamlOutput {
+        proxies,
+        warnings,
+        report,
+    })
 }
 
 pub fn looks_like_clash_yaml(input: &str) -> bool {

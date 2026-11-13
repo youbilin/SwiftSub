@@ -572,3 +572,24 @@ fn final_order_survives_target_changes_and_reports_unreachable_conflicts() {
     let reordered = generate_profile(&sample_nodes(), &changed).unwrap();
     assert_eq!(reordered.rules[1].to_line(), reject.to_line());
 }
+
+#[test]
+fn generation_report_is_bound_to_output_body_and_traces_sources() {
+    use sha2::{Digest, Sha256};
+    let nodes = sample_nodes();
+    let profile = generate_profile(&nodes, &GenerateOptions::default()).unwrap();
+    let body = profile.yaml.splitn(4, '\n').nth(3).unwrap();
+    let expected = format!("{:x}", Sha256::digest(body.as_bytes()));
+    assert_eq!(
+        profile.trace["body_sha256"].as_str(),
+        Some(expected.as_str())
+    );
+    assert!(profile.yaml.contains(&expected));
+    assert_eq!(profile.trace["nodes"][0]["source_id"], "fixture");
+    assert_eq!(
+        profile.trace["rules"].as_array().unwrap().len(),
+        profile.stats.rules
+    );
+    assert!(Rule::parse("DOMAIN,example.org,DIRECT,unsupported").is_err());
+    assert!(Rule::parse("DOMAIN,example.org,DIRECT,no-resolve,extra").is_err());
+}
