@@ -84,6 +84,30 @@ impl Render for SwiftSubApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("swiftsub-root")
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.modifiers.control && event.keystroke.key == "f" {
+                    let input = if this.template_dialog_open {
+                        &this.template_rule_search
+                    } else {
+                        &this.search
+                    };
+                    let handle = input.read(cx).focus_handle(cx);
+                    window.focus(&handle, cx);
+                    cx.stop_propagation();
+                } else if event.keystroke.key == "escape" {
+                    if this.qr_content.take().is_some() || this.diagnostics_open {
+                        this.diagnostics_open = false;
+                        cx.notify();
+                        cx.stop_propagation();
+                    } else if this.template_target_picker.take().is_some() {
+                        cx.notify();
+                        cx.stop_propagation();
+                    } else if this.template_dialog_open {
+                        this.request_close_template(window, cx);
+                        cx.stop_propagation();
+                    }
+                }
+            }))
             .relative()
             .size_full()
             .bg(rgb(BG))
@@ -935,6 +959,18 @@ impl SwiftSubApp {
 
     fn template_target_picker_panel(&self, id: &str, cx: &mut Context<Self>) -> AnyElement {
         let mut rows = v_flex().gap_1();
+        let filtering = id == "__target_filter__";
+        if filtering {
+            rows = rows.child(
+                Button::new("filter-all-targets")
+                    .ghost()
+                    .label("全部目标")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_template_rule_target("__target_filter__".into(), String::new(), cx)
+                    })),
+            );
+        }
+
         for target in self.template_target_options() {
             let rule_id = id.to_string();
             let module = catalog::MODULES.iter().find(|module| module.name == target);
@@ -952,7 +988,9 @@ impl SwiftSubApp {
                     .cursor_pointer()
                     .hover(|style| style.bg(rgb(SURFACE_2)))
                     .child(div().flex_1().text_size(px(12.5)).child(target))
-                    .when(inactive, |row| row.child(tag("选择后启用", MUTED)))
+                    .when(inactive && !filtering, |row| {
+                        row.child(tag("选择后启用", MUTED))
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.set_template_rule_target(rule_id.clone(), selected_target.clone(), cx);
                     })),
@@ -965,7 +1003,11 @@ impl SwiftSubApp {
             .child(
                 h_flex()
                     .justify_between()
-                    .child(field_label("选择此规则集的策略组 / 策略"))
+                    .child(field_label(if filtering {
+                        "按策略组筛选规则集"
+                    } else {
+                        "选择此规则集的策略组 / 策略"
+                    }))
                     .child(
                         Button::new("target-picker-back")
                             .ghost()
@@ -980,7 +1022,11 @@ impl SwiftSubApp {
                 div()
                     .text_size(px(11.5))
                     .text_color(rgb(MUTED))
-                    .child("可以绑定内置组或自定义策略组；选择未启用的内置组会同时启用该组。"),
+                    .child(if filtering {
+                        "只筛选显示的规则集，不改变任何规则目标或启用状态。"
+                    } else {
+                        "可以绑定内置组或自定义策略组；选择未启用的内置组会同时启用该组。"
+                    }),
             )
             .child(
                 div()
@@ -1480,15 +1526,25 @@ impl SwiftSubApp {
             })
             .flat_map(|module| module.rule_sets.iter().map(move |spec| (module, spec)))
             .filter(|(module, spec)| {
-                query.is_empty()
+                let enabled = !self.template_disabled_rule_sets.contains(spec.id);
+                let target = self
+                    .template_rule_set_targets
+                    .get(spec.id)
+                    .map(String::as_str)
+                    .unwrap_or(module.name);
+                (query.is_empty()
                     || format!(
-                        "内置 MetaCubeX {} {} {}",
+                        "内置 MetaCubeX {} {} {} {}",
                         module.name,
                         rule_set_label(spec.id),
-                        spec.id
+                        spec.id,
+                        target
                     )
                     .to_lowercase()
-                    .contains(&query)
+                    .contains(&query))
+                    && (!self.template_rules_selected_only || enabled)
+                    && (self.template_rules_target_filter.is_empty()
+                        || self.template_rules_target_filter == target)
             })
             .map(|(_, spec)| spec.id.to_string())
             .collect();
@@ -1516,12 +1572,17 @@ impl SwiftSubApp {
                 builtin_selected,
                 builtin_total,
                 builtin_ids,
-                !query.is_empty(),
+                !query.is_empty()
+                    || self.template_rules_selected_only
+                    || !self.template_rules_target_filter.is_empty(),
                 cx,
             ));
         }
-        let builtin_open =
-            !query.is_empty() || !self.template_rule_sources_collapsed.contains("builtin");
+        let filtered =
+            self.template_rules_selected_only || !self.template_rules_target_filter.is_empty();
+        let builtin_open = filtered
+            || !query.is_empty()
+            || !self.template_rule_sources_collapsed.contains("builtin");
 
         for module in catalog::MODULES.iter().filter(|module| {
             !module.rule_sets.is_empty()
@@ -1687,11 +1748,14 @@ impl SwiftSubApp {
                         .iter()
                         .map(|(entry, _, _, _)| entry.id.to_string())
                         .collect(),
-                    !query.is_empty(),
+                    !query.is_empty() || filtered,
                     cx,
                 ),
             );
-            if query.is_empty() && self.template_rule_sources_collapsed.contains(source.id) {
+            if query.is_empty()
+                && !filtered
+                && self.template_rule_sources_collapsed.contains(source.id)
+            {
                 continue;
             }
             rule_rows = rule_rows.child(
@@ -1844,7 +1908,7 @@ impl SwiftSubApp {
                 .child(Input::new(&self.template_rule_search).cleanable(true))
                 .child(h_flex().gap_2()
                     .child(Button::new("rules-selected-only").ghost().label(if self.template_rules_selected_only {"仅已选 ✓"}else{"全部规则"}).on_click(cx.listener(|this,_,_,cx|{this.template_rules_selected_only=!this.template_rules_selected_only;cx.notify();})))
-                    .child(Button::new("rules-target-filter").ghost().label(if self.template_rules_target_filter.is_empty(){"目标：全部（点击切换）".to_string()}else{format!("目标：{}",self.template_rules_target_filter)}).on_click(cx.listener(|this,_,_,cx|this.cycle_rule_target_filter(cx)))))
+                    .child(Button::new("rules-target-filter").ghost().label(if self.template_rules_target_filter.is_empty(){"目标：全部 ▾".to_string()}else{format!("目标：{} ▾",self.template_rules_target_filter)}).on_click(cx.listener(|this,_,_,cx|this.open_template_target_picker("__target_filter__".into(),cx)))))
                 .child(div().text_size(px(11.)).text_color(rgb(MUTED))
                     .child("展开来源勾选规则集，可同时使用多个来源；来源内全选和清空互不影响。"))
                 .child(
@@ -1953,6 +2017,14 @@ impl SwiftSubApp {
                     .text_color(rgb(MUTED))
                     .child(self.template_change_summary(cx)),
             )
+            .when(self.recovered_draft, |this| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(ACCENT))
+                        .child("已恢复未应用草稿，确认后应用或放弃。"),
+                )
+            })
             .child(tab_content)
             .when_some(self.template_error.clone(), |this, error| {
                 this.child(

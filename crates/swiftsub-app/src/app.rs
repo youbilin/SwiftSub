@@ -2539,17 +2539,6 @@ impl SwiftSubApp {
             .collect()
     }
 
-    pub fn cycle_rule_target_filter(&mut self, cx: &mut Context<Self>) {
-        let mut targets = vec![String::new()];
-        targets.extend(self.template_target_options());
-        let index = targets
-            .iter()
-            .position(|v| *v == self.template_rules_target_filter)
-            .unwrap_or(0);
-        self.template_rules_target_filter = targets[(index + 1) % targets.len()].clone();
-        cx.notify();
-    }
-
     pub fn template_target_options(&self) -> Vec<String> {
         let mut names = vec!["DIRECT".into(), "REJECT".into(), "REJECT-DROP".into()];
         names.extend(
@@ -2576,6 +2565,12 @@ impl SwiftSubApp {
     }
 
     pub fn set_template_rule_target(&mut self, id: String, target: String, cx: &mut Context<Self>) {
+        if id == "__target_filter__" {
+            self.template_rules_target_filter = target;
+            self.template_target_picker = None;
+            cx.notify();
+            return;
+        }
         if let Some(module) = catalog::MODULES.iter().find(|module| module.name == target) {
             self.template_enabled_modules.insert(module.id.to_string());
         }
@@ -2749,6 +2744,14 @@ impl SwiftSubApp {
             return;
         };
         options.policy_groups.clear();
+        options.custom_groups.clear();
+        options.chains.clear();
+        options.custom_rules.clear();
+        options.custom_rule_sets.clear();
+        options.rule_set_targets.clear();
+        options.rule_order.clear();
+        options.listeners.clear();
+        options.extra_yaml.clear();
         let nodes = if self.nodes.iter().any(|n| n.enabled) {
             self.nodes.clone()
         } else {
@@ -3240,13 +3243,15 @@ impl SwiftSubApp {
         }
         // Keep the whole snapshot for deterministic startup recovery as fields evolve.
         settings.insert("routing_snapshot".into(), json.clone());
+        let profile_json = self.profile_snapshot_json(snapshot.clone())?;
         self.store
             .lock()
             .expect("store mutex poisoned")
-            .save_routing_snapshot(
+            .save_routing_profile_snapshot(
                 &settings,
                 save.as_ref()
                     .map(|(id, name)| (*id, name.as_str(), json.as_str())),
+                Some((self.profile_id, profile_json.as_str())),
             )
             .map_err(|e| format!("保存失败，配置未应用：{e}"))?;
         self.options = options;

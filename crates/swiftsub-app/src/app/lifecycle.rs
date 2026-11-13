@@ -145,11 +145,17 @@ impl SwiftSubApp {
             health_interval: self.template_health_interval.read(cx).value().to_string(),
         };
         let json = serde_json::to_string(&draft).map_err(|e| e.to_string())?;
-        self.store
-            .lock()
-            .unwrap()
-            .set_setting(&format!("draft:{}", self.profile_id), &json)
-            .map_err(|e| e.to_string())
+        let store = self.store.lock().unwrap();
+        let key = format!("draft:{}", self.profile_id);
+        if store
+            .get_setting(&key)
+            .map_err(|e| e.to_string())?
+            .as_deref()
+            == Some(json.as_str())
+        {
+            return Ok(());
+        }
+        store.set_setting(&key, &json).map_err(|e| e.to_string())
     }
     pub(super) fn clear_saved_draft(&self) {
         let _ = self
@@ -186,8 +192,7 @@ impl SwiftSubApp {
                 self.template_health_interval
                     .update(cx, |s, cx| s.set_value(draft.health_interval, window, cx));
                 self.recovered_draft = true;
-                self.template_error =
-                    Some("已恢复上次未应用的草稿；确认后应用，或点击两次放弃草稿。".into());
+                self.template_error = None;
                 self.desktop.show();
             }
             Err(e) => self.store_error = Some(format!("草稿无法读取，原数据已保留：{e}")),

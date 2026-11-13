@@ -603,7 +603,26 @@ impl Store {
         settings: &HashMap<String, String>,
         template: Option<(Option<i64>, &str, &str)>,
     ) -> Result<Option<i64>> {
+        self.save_routing_profile_snapshot(settings, template, None)
+    }
+
+    /// Commit active profile, template and legacy settings together.
+    pub fn save_routing_profile_snapshot(
+        &self,
+        settings: &HashMap<String, String>,
+        template: Option<(Option<i64>, &str, &str)>,
+        profile: Option<(i64, &str)>,
+    ) -> Result<Option<i64>> {
         let tx = self.conn.unchecked_transaction()?;
+        if let Some((id, json)) = profile {
+            if tx.execute(
+                "UPDATE profiles SET options_json=?1,updated_at=?2 WHERE id=?3",
+                params![json, now_ts(), id],
+            )? != 1
+            {
+                return Err(rusqlite::Error::QueryReturnedNoRows.into());
+            }
+        }
         let template_id = if let Some((id, name, json)) = template {
             let now = now_ts();
             if let Some(id) = id {
@@ -944,6 +963,10 @@ mod routing_transaction_tests {
         let store = Store::open_in_memory().unwrap();
         let id = store.add_custom_template("original", "{}").unwrap();
         store.set_setting("existing", "old").unwrap();
+        let profile = store.get_or_create_profile("test").unwrap();
+        store
+            .save_profile_options(profile.id, "old-profile")
+            .unwrap();
         store.conn.execute_batch("CREATE TRIGGER reject_routing BEFORE INSERT ON settings WHEN NEW.key='blocked' BEGIN SELECT RAISE(FAIL,'injected write failure'); END;").unwrap();
         let settings = HashMap::from([
             ("existing".into(), "new".into()),
@@ -951,7 +974,11 @@ mod routing_transaction_tests {
         ]);
         assert!(
             store
-                .save_routing_snapshot(&settings, Some((Some(id), "renamed", "{\"new\":true}")))
+                .save_routing_profile_snapshot(
+                    &settings,
+                    Some((Some(id), "renamed", "{\"new\":true}")),
+                    Some((profile.id, "new-profile"))
+                )
                 .is_err()
         );
         assert_eq!(
@@ -960,13 +987,35 @@ mod routing_transaction_tests {
         );
         assert_eq!(store.list_custom_templates().unwrap()[0].name, "original");
         assert!(store.get_setting("blocked").unwrap().is_none());
+        assert_eq!(
+            store
+                .get_profile_by_token(&profile.token)
+                .unwrap()
+                .unwrap()
+                .options_json
+                .as_deref(),
+            Some("old-profile")
+        );
         store
             .conn
             .execute_batch("DROP TRIGGER reject_routing;")
             .unwrap();
         store
-            .save_routing_snapshot(&settings, Some((Some(id), "renamed", "{\"new\":true}")))
+            .save_routing_profile_snapshot(
+                &settings,
+                Some((Some(id), "renamed", "{\"new\":true}")),
+                Some((profile.id, "new-profile")),
+            )
             .unwrap();
+        assert_eq!(
+            store
+                .get_profile_by_token(&profile.token)
+                .unwrap()
+                .unwrap()
+                .options_json
+                .as_deref(),
+            Some("new-profile")
+        );
         assert_eq!(store.list_custom_templates().unwrap()[0].id, id);
         assert_eq!(store.list_custom_templates().unwrap()[0].name, "renamed");
         assert_eq!(

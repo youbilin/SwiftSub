@@ -47,7 +47,7 @@
 - 协议解析：Shadowsocks、VMess、VLESS（Reality、WS、gRPC、XHTTP）、Trojan、Hysteria2、TUIC、HTTP/SOCKS；Clash YAML 中的其他协议原样透传。
 - 节点处理：跨订阅去重、按地区识别、启用/禁用、搜索、实时预览。
 - 筛选代理组：按地区、包含/排除关键词筛选节点，生成自定义代理组。
-- 链式代理：直接选择具体的中转节点与落地节点，生成单跳链路，`dialer-proxy` 指向中转节点。
+- 链式代理：双节点选择器兼容旧配置；高级配置支持 2–16 跳链路，通过 `dialer-proxy` 串联，缺失、重复、禁用或重名节点会阻止生成。
 - 规则集：按来源折叠分类，显示各来源已选数量，可跨来源同时多选，并支持来源内全选 / 清空（搜索时仅作用于匹配项）；支持内置分组规则集单独启停，并可从 MetaCubeX、blackmatrix7、Loyalsoldier、ACL4SSR 常用规则库中选择规则集；所有来源按 GitHub / jsDelivr 镜像解析，也支持粘贴任意 `.mrs`、`.yaml`、`.txt` 规则集链接。每个规则集可路由到对应代理组或 DIRECT / REJECT，未启用的规则集不会写入配置。
 - 自定义规则：模板弹窗内可按 Mihomo 语法逐行添加自定义规则（`DOMAIN-SUFFIX`、`IP-CIDR`、`GEOIP`、`MATCH` 等），随模板保存并参与生成。
 - 模板：内置精简 / 标准 / 完整三套规则集模板；在生成页点击“规则集”可直接调整规则集与自定义规则，点击“存为模板”或模板页“新建模板”可命名保存。模板会保存启用分组、规则集开关、外部规则集、自定义规则、规则集来源、代理组、链式代理与生成参数，之后可一键应用或删除。
@@ -65,12 +65,19 @@
 
 Xray / Mihomo 参数兼容范围与官方核对来源见 [链接参数适配说明](docs/LINK_COMPATIBILITY.md)。
 
-### 尚未实现
+### 扩展功能与使用位置
 
-- 多跳链式代理（当前为单跳）与节点监听端口。
-- 自定义模板导入/导出、规则拖拽排序。
-- 订阅二维码、系统托盘、开机自启、多 Profile。
-- SSR、AnyTLS、Snell、WireGuard、SSH 的链接解析（YAML 已可透传）。
+- 生成页「编辑分流」提供策略组详情、规则顺序拖动、来源分类多选、仅已选 / 按目标筛选、模板版本化导入导出及变更预览。
+- 「高级配置」编辑 DNS、独立 mixed/http/socks 监听、2–16 跳链路、筛选组和扩展 YAML。点击「校验并更新草稿」后再应用；监听可绑定策略组或节点，示例见 [扩展配置](docs/EXTENSIONS.md)。
+- 设置页「多配置管理」可复制、切换、重命名、删除配置并独立选择订阅来源；每个配置有独立 Token 地址，所有地址同时可用。订阅缓存和节点编辑共享。
+- 设置页提供订阅二维码；节点行的二维码按钮分享节点 YAML，支持复制和导出 SVG。订阅服务默认仅监听本机，二维码不会使手机能够访问本机回环地址。
+- Windows 托盘支持打开窗口、复制地址、刷新和退出。设置页可开启关闭窗口隐藏与用户级开机自启；自启默认关闭。移动可执行文件后需重新设置自启。
+- 模板草稿每两秒自动保存，关闭前再次保存，重启恢复但不会自动应用；高级文本与待保存组详情一并恢复。
+- `Ctrl+F` 聚焦节点 / 规则搜索；`Esc` 关闭二维码、诊断或目标选择器，退出分流编辑仍需确认放弃草稿。
+
+### 验证边界
+
+新增协议已通过解析回归，AnyTLS / Snell / SSH / WireGuard / SS + 三跳链 + 监听配置通过 Mihomo v1.19.34 语法检查；新增协议的真实服务端连接尚未逐一验证。REALITY 与 XHTTP 的受控实际传输结果及显式 MLKEM false 的失败记录见 [兼容说明](docs/LINK_COMPATIBILITY.md)。自动启动注册表写入没有在 QA 中主动开启，开机登录场景尚未实机重启验证。
 
 ## 技术结构
 
@@ -107,10 +114,10 @@ cargo build -p swiftsub-app
 cargo run -p swiftsub-app
 ```
 
-测试：
+完整工作区测试：
 
 ```bat
-scripts\cargo-msvc.bat test
+scripts\cargo-msvc.bat test --workspace
 ```
 
 ### 发布构建
@@ -119,7 +126,7 @@ scripts\cargo-msvc.bat test
 scripts\cargo-msvc.bat build --release -p swiftsub-app
 ```
 
-产物：`target\release\swiftsub.exe`。发布配置启用 thin LTO 并剥离符号。
+产物：`target\release\swiftsub.exe`。发布配置启用 thin LTO 并剥离符号。本轮发布包与验收范围见 [发布说明](docs/RELEASE_NOTES.md)。
 
 ## 使用
 

@@ -629,6 +629,12 @@ fn multi_hop_chain_listeners_dns_and_extra_yaml_are_validated() {
     invalid = options.clone();
     invalid.listeners[0].proxy = "missing".into();
     assert!(generate_profile(&nodes, &invalid).is_err());
+    invalid = options.clone();
+    invalid.chains[0].hops[1] = "missing".into();
+    assert!(generate_profile(&nodes, &invalid).is_err());
+    invalid = options.clone();
+    invalid.chains[0].hops[1] = invalid.chains[0].hops[0].clone();
+    assert!(generate_profile(&nodes, &invalid).is_err());
     invalid = options;
     invalid.extra_yaml = "rules: []".into();
     assert!(generate_profile(&nodes, &invalid).is_err());

@@ -34,6 +34,15 @@ impl SwiftSubApp {
         }
     }
 
+    pub(super) fn profile_snapshot_json(
+        &self,
+        snapshot: TemplateSnapshot,
+    ) -> Result<String, String> {
+        let mut config = self.current_profile_config();
+        config.routing = snapshot;
+        serde_json::to_string(&config).map_err(|e| e.to_string())
+    }
+
     pub(super) fn save_active_profile(&self) -> Result<(), String> {
         if self.profile_id <= 0 {
             return Ok(());
@@ -115,7 +124,6 @@ impl SwiftSubApp {
         self.profile_delete_armed = false;
         self.profile_membership = None;
         self.disabled_nodes.clear();
-        self.node_order.clear();
         self.restore_selected_profile(window, cx);
         let _ = self
             .store
@@ -246,10 +254,14 @@ impl SwiftSubApp {
                 (self.preview.clone(), self.aggregate_userinfo())
             } else {
                 // Rebuild inactive profiles from current shared source payloads, preserving membership.
-                let generated = profile
+                let config = profile
                     .options_json
                     .as_deref()
-                    .and_then(|v| serde_json::from_str::<ProfileConfig>(v).ok())
+                    .and_then(|v| serde_json::from_str::<ProfileConfig>(v).ok());
+                let userinfo = config
+                    .as_ref()
+                    .and_then(|c| profile_userinfo(&self.subscriptions, c.membership.as_ref()));
+                let generated = config
                     .and_then(|config| {
                         let options = config
                             .routing
@@ -290,8 +302,24 @@ impl SwiftSubApp {
                                         n.listen_port = o.listen_port;
                                     }
                                 }
+                                for n in &mut imported {
+                                    n.region = detect_region(n.name());
+                                }
                                 nodes.extend(imported);
                             }
+                        }
+                        let mut seen = HashSet::new();
+                        nodes.retain(|n| seen.insert(n.proxy.identity_key()));
+                        if !self.node_order.is_empty() {
+                            let positions: HashMap<_, _> = self
+                                .node_order
+                                .iter()
+                                .enumerate()
+                                .map(|(i, k)| (k, i))
+                                .collect();
+                            nodes.sort_by_key(|n| {
+                                positions.get(&n.source_key).copied().unwrap_or(usize::MAX)
+                            });
                         }
                         generate_profile(&nodes, &options).ok().map(|p| p.yaml)
                     })
@@ -301,7 +329,7 @@ impl SwiftSubApp {
                     .lock()
                     .unwrap()
                     .save_profile_yaml(profile.id, &generated);
-                (generated, None)
+                (generated, userinfo)
             };
             published.insert(
                 profile.token,
@@ -314,4 +342,26 @@ impl SwiftSubApp {
         }
         server.replace_profiles(published);
     }
+}
+
+fn profile_userinfo(
+    subscriptions: &[StoredSubscription],
+    membership: Option<&HashSet<i64>>,
+) -> Option<String> {
+    let mut info = SubscriptionInfo::default();
+    let mut has_data = false;
+    for s in subscriptions
+        .iter()
+        .filter(|s| s.enabled && membership.is_none_or(|ids| ids.contains(&s.id)))
+    {
+        info.upload = info.upload.saturating_add(s.traffic_upload);
+        info.download = info.download.saturating_add(s.traffic_download);
+        info.total = info.total.saturating_add(s.traffic_total);
+        has_data |= s.traffic_upload > 0 || s.traffic_download > 0 || s.traffic_total > 0;
+        if let Some(expire) = s.expire_at.filter(|e| *e > 0) {
+            info.expire = Some(info.expire.map_or(expire, |old| old.min(expire)));
+            has_data = true;
+        }
+    }
+    has_data.then(|| info.to_header_value())
 }
