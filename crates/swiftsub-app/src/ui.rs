@@ -992,187 +992,244 @@ impl SwiftSubApp {
     }
 
     fn template_policy_groups_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut rows = v_flex().gap_2();
-        rows = rows.child(field_label("自定义策略组"));
-        if self.template_policy_groups.is_empty() {
-            rows = rows.child(
-                div()
-                    .text_size(px(11.5))
-                    .text_color(rgb(MUTED))
-                    .child("可新建流媒体、AI 专线等策略组，再到规则集页把规则绑定到该组。"),
+        let mut list = v_flex().gap_1();
+        for (index, group) in self.template_policy_groups.iter().enumerate() {
+            list = list.child(
+                Button::new(format!("edit-policy-{index}"))
+                    .ghost()
+                    .label(format!(
+                        "{} {}",
+                        if self.template_policy_edit == Some(index) {
+                            "▸"
+                        } else {
+                            ""
+                        },
+                        group.name
+                    ))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.edit_template_policy_group(index, window, cx)
+                    })),
             );
         }
-        for (index, group) in self.template_policy_groups.iter().enumerate() {
-            let expanded = self.template_policy_edit == Some(index);
-            let rule_count = self
-                .template_custom_rule_sets
-                .iter()
-                .filter(|binding| binding.target == group.name)
-                .count()
-                + self
-                    .template_rule_set_targets
-                    .values()
-                    .filter(|target| **target == group.name)
-                    .count();
-            let mut card = v_flex()
-                .gap_2()
-                .p_2()
-                .rounded(px(8.))
-                .bg(rgb(SURFACE_2))
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            div()
-                                .id(format!("policy-expand-{index}"))
-                                .flex_1()
-                                .cursor_pointer()
-                                .text_size(px(12.5))
-                                .child(format!(
-                                    "{} {} · {} · {} 条规则集",
-                                    if expanded { "▾" } else { "▸" },
-                                    group.name,
-                                    group.kind.as_str(),
-                                    rule_count
-                                ))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.edit_template_policy_group(index, cx)
-                                })),
-                        )
-                        .child(icon_action(
-                            format!("policy-remove-{index}"),
-                            "×",
-                            DANGER,
-                            cx,
-                            move |this, _, cx| this.remove_template_policy_group(index, cx),
-                        )),
-                );
-            if expanded {
-                let mut kinds = h_flex().gap_1();
+        list = list.child(field_label("内置组"));
+        for module in catalog::MODULES {
+            let id = module.id.to_string();
+            let name = module.name.to_string();
+            let enabled = self.template_enabled_modules.contains(module.id)
+                || matches!(module.id, "select" | "auto" | "final");
+            list = list.child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Switch::new(format!("module-{id}"))
+                            .small()
+                            .checked(enabled)
+                            .on_change(cx.listener(move |this, checked, _, cx| {
+                                this.toggle_template_module(id.clone(), *checked, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new(format!("builtin-{}", module.id))
+                            .ghost()
+                            .label(name.clone())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.edit_builtin_policy_group(name.clone(), window, cx)
+                            })),
+                    ),
+            );
+        }
+        let mut detail = v_flex().gap_2().min_w_0();
+        if let Some(index) = self.template_policy_edit {
+            if let Some(group) = self.template_policy_groups.get(index) {
+                detail = detail
+                    .child(field_label(if group.builtin {
+                        "内置组覆盖（删除覆盖可恢复默认）"
+                    } else {
+                        "策略组详情"
+                    }))
+                    .child(Input::new(&self.template_policy_rename));
+                let mut kinds = h_flex().flex_wrap().gap_1();
                 for (kind, label) in [
-                    (GroupKind::Select, "手动选择"),
-                    (GroupKind::UrlTest, "自动测速"),
+                    (GroupKind::Select, "手动"),
+                    (GroupKind::UrlTest, "测速"),
                     (GroupKind::Fallback, "故障转移"),
                     (GroupKind::LoadBalance, "负载均衡"),
                 ] {
-                    let active = group.kind == kind;
                     kinds = kinds.child(
-                        div()
-                            .id(format!("policy-kind-{index}-{}", kind.as_str()))
-                            .cursor_pointer()
-                            .px_2()
-                            .py_1()
-                            .rounded(px(5.))
-                            .text_size(px(11.))
-                            .bg(rgb(if active { ACCENT_SOFT } else { BG }))
-                            .text_color(rgb(if active { ACCENT } else { MUTED }))
-                            .child(label)
+                        Button::new(format!("kind-{}", kind.as_str()))
+                            .ghost()
+                            .label(format!(
+                                "{}{}",
+                                if group.kind == kind { "✓ " } else { "" },
+                                label
+                            ))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.set_template_policy_kind(index, kind, cx)
                             })),
                     );
                 }
-                card =
-                    card.child(kinds)
-                        .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(
-                        "成员按勾选顺序排列；手动组默认使用首个成员，测速类组使用全局测速参数。",
-                    ));
-                let mut members = h_flex().flex_wrap().gap_1();
-                let choices = std::iter::once((
-                    "__all_nodes".to_string(),
-                    "全部节点".to_string(),
-                    group.include_all_nodes,
-                ))
-                .chain(
-                    self.template_target_options()
-                        .into_iter()
-                        .filter(|name| name != &group.name)
-                        .map(|name| {
-                            let selected = group.members.contains(&name);
-                            (name.clone(), name, selected)
-                        }),
-                );
-                for (name, label, selected) in choices {
-                    members = members.child(
+                detail = detail
+                    .child(kinds)
+                    .child(Input::new(&self.template_health_url))
+                    .child(Input::new(&self.template_health_interval))
+                    .child(
+                        h_flex()
+                            .flex_wrap()
+                            .gap_1()
+                            .child(
+                                Button::new("save-policy-details")
+                                    .primary()
+                                    .label("更新名称 / 测速参数")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.save_policy_details(index, window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("remove-policy")
+                                    .ghost()
+                                    .label(if group.builtin {
+                                        "恢复默认"
+                                    } else {
+                                        "删除组"
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.remove_template_policy_group(index, cx)
+                                    })),
+                            ),
+                    )
+                    .child(field_label("已选成员（拖动或 ↑↓ 调整优先级）"));
+                for (member_index, name) in group.members.iter().enumerate() {
+                    let drag_name = name.clone();
+                    let mut row = h_flex().gap_1().child(
                         div()
-                            .id(format!("policy-member-{index}-{name}"))
-                            .cursor_pointer()
-                            .px_2()
-                            .py_1()
-                            .rounded(px(5.))
-                            .border_1()
-                            .border_color(rgb(if selected { ACCENT } else { BORDER }))
-                            .bg(rgb(if selected { ACCENT_SOFT } else { BG }))
+                            .flex_1()
+                            .min_w_0()
                             .text_size(px(11.))
-                            .child(format!("{} {label}", if selected { "✓" } else { "+" }))
+                            .truncate()
+                            .child(name.clone()),
+                    );
+                    if member_index > 0 {
+                        row = row.child(
+                            Button::new(format!("member-up-{member_index}"))
+                                .ghost()
+                                .label("↑")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.move_policy_member(
+                                        index,
+                                        member_index,
+                                        member_index - 1,
+                                        cx,
+                                    )
+                                })),
+                        );
+                    }
+                    if member_index + 1 < group.members.len() {
+                        row = row.child(
+                            Button::new(format!("member-down-{member_index}"))
+                                .ghost()
+                                .label("↓")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.move_policy_member(
+                                        index,
+                                        member_index,
+                                        member_index + 1,
+                                        cx,
+                                    )
+                                })),
+                        );
+                    }
+                    let name = name.clone();
+                    row = row.child(
+                        Button::new(format!("member-remove-{member_index}"))
+                            .ghost()
+                            .label("×")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_template_policy_member(index, name.clone(), cx)
+                            })),
+                    );
+                    detail = detail.child(
+                        div()
+                            .id(format!("member-drag-{member_index}"))
+                            .cursor_pointer()
+                            .child(row)
+                            .on_drag(
+                                MemberDrag {
+                                    group: index,
+                                    member: member_index,
+                                    name: drag_name,
+                                },
+                                |drag, _, _, cx| {
+                                    cx.new(|_| NodeDragPreview {
+                                        name: drag.name.clone(),
+                                    })
+                                },
+                            )
+                            .on_drop(cx.listener(move |this, drag: &MemberDrag, _, cx| {
+                                if drag.group == index {
+                                    this.move_policy_member(index, drag.member, member_index, cx)
+                                }
+                            })),
+                    );
+                }
+                detail = detail
+                    .child(
+                        Button::new("all-nodes")
+                            .ghost()
+                            .label(if group.include_all_nodes {
+                                "✓ 动态包含全部节点"
+                            } else {
+                                "+ 动态包含全部节点"
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_template_policy_member(index, "__all_nodes".into(), cx)
+                            })),
+                    )
+                    .child(Input::new(&self.template_member_search).cleanable(true));
+                let query = self.template_member_search.read(cx).value().to_lowercase();
+                let mut candidates = self.template_target_options();
+                candidates.extend(
+                    self.nodes
+                        .iter()
+                        .filter(|n| n.enabled)
+                        .map(|n| n.name().to_string()),
+                );
+                let mut seen = std::collections::HashSet::new();
+                candidates.retain(|n| {
+                    n != &group.name
+                        && !group.members.contains(n)
+                        && n.to_lowercase().contains(query.as_str())
+                        && seen.insert(n.clone())
+                });
+                let selected_candidates = candidates.clone();
+                detail = detail.child(
+                    Button::new("bulk-members")
+                        .ghost()
+                        .label(format!("加入搜索结果（{}）", candidates.len()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            for name in &selected_candidates {
+                                this.toggle_template_policy_member(index, name.clone(), cx)
+                            }
+                        })),
+                );
+                let mut choices = h_flex().flex_wrap().gap_1();
+                for (i, name) in candidates.into_iter().take(200).enumerate() {
+                    choices = choices.child(
+                        Button::new(format!("candidate-{i}"))
+                            .ghost()
+                            .label(format!("+ {name}"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.toggle_template_policy_member(index, name.clone(), cx)
                             })),
                     );
                 }
-                card = card.child(members).child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(rgb(MUTED))
-                        .child(format!(
-                            "当前顺序：{}{}",
-                            group.members.join(" → "),
-                            if group.include_all_nodes {
-                                " → 全部节点"
-                            } else {
-                                ""
-                            }
-                        )),
+                detail = detail.child(choices).child(
+                    div().text_size(px(10.)).text_color(rgb(MUTED)).child(
+                        "候选显示前 200 项；搜索或批量加入可处理全部结果。空测速参数继承全局。",
+                    ),
                 );
             }
-            rows = rows.child(card);
-        }
-        if !self.custom_groups.is_empty() || !self.chains.is_empty() {
-            rows = rows.child(field_label("随模板保存的筛选组 / 链式代理"));
-            for name in self
-                .custom_groups
-                .iter()
-                .map(|group| &group.name)
-                .chain(self.chains.iter().map(|chain| &chain.name))
-            {
-                rows = rows.child(div().text_size(px(12.)).child(name.clone()));
-            }
-        }
-        rows = rows.child(field_label("内置策略组（启用状态随模板保存）"));
-        for module in catalog::MODULES {
-            let enabled = self.template_enabled_modules.contains(module.id)
-                || matches!(module.id, "select" | "auto" | "final");
-            let id = module.id.to_string();
-            let required = matches!(module.id, "select" | "auto" | "final");
-            rows =
-                rows.child(
-                    h_flex()
-                        .h(px(34.))
-                        .gap_2()
-                        .px_2()
-                        .rounded(px(6.))
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .child(div().text_size(px(12.5)).child(module.name)),
-                        )
-                        .child(div().text_size(px(10.5)).text_color(rgb(MUTED)).child(
-                            if required {
-                                "必需组".to_string()
-                            } else {
-                                format!("{} 条内置规则集", module.rule_sets.len())
-                            },
-                        ))
-                        .child(
-                            Switch::new(format!("template-module-{id}"))
-                                .small()
-                                .checked(enabled)
-                                .on_change(cx.listener(move |this, checked, _, cx| {
-                                    this.toggle_template_module(id.clone(), *checked, cx)
-                                })),
-                        ),
-                );
+        } else {
+            detail = detail.child(field_label("选择策略组编辑成员、名称和测速参数"));
         }
         v_flex()
             .flex_1()
@@ -1180,7 +1237,7 @@ impl SwiftSubApp {
             .gap_2()
             .child(
                 h_flex()
-                    .gap_2()
+                    .gap_1()
                     .child(
                         div()
                             .flex_1()
@@ -1188,17 +1245,121 @@ impl SwiftSubApp {
                             .child(Input::new(&self.template_policy_name).cleanable(true)),
                     )
                     .child(
-                        Button::new("add-policy-group")
+                        Button::new("add-policy")
                             .primary()
-                            .label("新建策略组")
+                            .label("新建组")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.add_template_policy_group(window, cx)
                             })),
                     ),
             )
             .child(
+                h_resizable("policy-editor")
+                    .child(
+                        resizable_panel()
+                            .size(px(185.))
+                            .size_range(px(140.)..px(350.))
+                            .child(
+                                div()
+                                    .id("policy-list")
+                                    .size_full()
+                                    .overflow_y_scrollbar()
+                                    .child(list),
+                            ),
+                    )
+                    .child(
+                        resizable_panel().child(
+                            div()
+                                .id("policy-detail")
+                                .size_full()
+                                .min_w_0()
+                                .overflow_y_scrollbar()
+                                .child(detail),
+                        ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn template_rule_order_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let profile = match self.draft_generated(cx) {
+            Ok(p) => p,
+            Err(e) => return div().text_color(rgb(DANGER)).child(e).into_any_element(),
+        };
+        let mut rows = v_flex().gap_1();
+        for warning in profile.warnings {
+            rows = rows.child(
                 div()
-                    .id("template-policy-groups-list")
+                    .text_size(px(11.))
+                    .text_color(rgb(WARNING))
+                    .child(warning),
+            );
+        }
+        for (index, rule) in profile.rules.iter().enumerate() {
+            let name = rule.to_line();
+            let total = profile.rules.len();
+            let mut row = h_flex().gap_1().child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(11.))
+                    .child(format!("{}. {name}", index + 1)),
+            );
+            if index > 0 {
+                row = row.child(
+                    Button::new(format!("rule-up-{index}"))
+                        .ghost()
+                        .label("↑")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.move_template_rule(index, index - 1, cx)
+                        })),
+                );
+            }
+            if index + 1 < total {
+                row = row.child(
+                    Button::new(format!("rule-down-{index}"))
+                        .ghost()
+                        .label("↓")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.move_template_rule(index, index + 1, cx)
+                        })),
+                );
+            }
+            rows = rows.child(
+                div()
+                    .id(format!("rule-drag-{index}"))
+                    .p_1()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .cursor_pointer()
+                    .child(row)
+                    .on_drag(RuleDrag { index, name }, |drag, _, _, cx| {
+                        cx.new(|_| NodeDragPreview {
+                            name: drag.name.clone(),
+                        })
+                    })
+                    .on_drop(cx.listener(move |this, drag: &RuleDrag, _, cx| {
+                        this.move_template_rule(drag.index, index, cx)
+                    })),
+            );
+        }
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .gap_2()
+            .child(field_label("最终规则顺序 · 从上到下首次命中生效"))
+            .child(
+                Button::new("reset-rule-order")
+                    .ghost()
+                    .label("恢复默认顺序")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.template_rule_order.clear();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id("rule-order-scroll")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scrollbar()
@@ -1598,13 +1759,14 @@ impl SwiftSubApp {
             .count();
         let header_count = match self.template_tab {
             TemplateTab::PolicyGroups => format!(
-                "{} 个内置组 · {} 个自定义策略组",
+                "{} 个启用模块 · {} 个组配置",
                 self.template_enabled_modules.len(),
                 self.template_policy_groups.len()
             ),
             TemplateTab::RuleSets => {
                 format!("已选 {selected_count} / {total_count} 条 · {selected_sources} 个来源")
             }
+            TemplateTab::RuleOrder => "最终规则排序与检查".into(),
             TemplateTab::CustomRules => format!("{custom_rule_count} 条自定义规则"),
             TemplateTab::Tools => "筛选代理组与链式代理".into(),
         };
@@ -1613,6 +1775,7 @@ impl SwiftSubApp {
             self.template_target_picker_panel(id, cx)
         } else {
             match self.template_tab {
+            TemplateTab::RuleOrder => self.template_rule_order_panel(cx),
             TemplateTab::Tools => div().id("workspace-tools").flex_1().min_h_0().overflow_y_scrollbar().child(v_flex().gap_4().child(self.custom_groups_section(cx)).child(self.chains_section(cx))).into_any_element(),
             TemplateTab::PolicyGroups => self.template_policy_groups_panel(cx),
             TemplateTab::RuleSets => v_flex()
@@ -1724,6 +1887,8 @@ impl SwiftSubApp {
             .child(
                 h_flex()
                     .gap_1()
+                    .flex_wrap()
+                    .child(self.template_tab_pill("规则顺序", TemplateTab::RuleOrder, cx))
                     .child(self.template_tab_pill("策略组", TemplateTab::PolicyGroups, cx))
                     .child(self.template_tab_pill("规则集", TemplateTab::RuleSets, cx))
                     .child(self.template_tab_pill("自定义规则", TemplateTab::CustomRules, cx))
@@ -4114,4 +4279,16 @@ fn info_row(label: &'static str, value: String, mono: bool) -> AnyElement {
                 .child(value),
         )
         .into_any_element()
+}
+
+#[derive(Clone)]
+struct RuleDrag {
+    index: usize,
+    name: String,
+}
+#[derive(Clone)]
+struct MemberDrag {
+    group: usize,
+    member: usize,
+    name: String,
 }

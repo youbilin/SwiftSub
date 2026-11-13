@@ -49,6 +49,7 @@ pub struct GenerateOptions {
     pub rule_set_targets: HashMap<String, String>,
     pub chains: Vec<ChainSpec>,
     pub dns: DnsOptions,
+    pub rule_order: Vec<String>,
 }
 
 impl Default for GenerateOptions {
@@ -70,6 +71,7 @@ impl Default for GenerateOptions {
             rule_set_targets: HashMap::new(),
             chains: Vec::new(),
             dns: DnsOptions::default(),
+            rule_order: Vec::new(),
         }
     }
 }
@@ -87,6 +89,8 @@ pub struct GeneratedProfile {
     pub yaml: String,
     pub stats: ProfileStats,
     pub warnings: Vec<String>,
+    pub rules: Vec<Rule>,
+    pub groups: Vec<ProxyGroup>,
 }
 
 pub fn generate_profile(nodes: &[Node], options: &GenerateOptions) -> Result<GeneratedProfile> {
@@ -107,6 +111,7 @@ pub fn generate_profile(nodes: &[Node], options: &GenerateOptions) -> Result<Gen
 
     let modules = resolve_enabled_modules(options);
     let mut groups = build_groups(&nodes, &modules, options, &mut warnings);
+    let builtin_names: HashSet<String> = groups.iter().map(|g| g.name.clone()).collect();
     let final_group = groups.pop();
 
     let mut used_group_names: HashSet<String> =
@@ -135,12 +140,15 @@ pub fn generate_profile(nodes: &[Node], options: &GenerateOptions) -> Result<Gen
         groups.push(final_group);
     }
 
+    let mut overridden = HashSet::new();
     for spec in &options.policy_groups {
         let name = spec.name.trim();
         if name.is_empty()
             || name.contains([',', '\n', '\r'])
             || name != spec.name
-            || used_group_names.contains(name)
+            || (used_group_names.contains(name) && !spec.builtin)
+            || (spec.builtin
+                && (!builtin_names.contains(name) || !overridden.insert(name.to_string())))
             || used_proxy_names.contains(name)
             || [
                 "DIRECT",
@@ -172,15 +180,30 @@ pub fn generate_profile(nodes: &[Node], options: &GenerateOptions) -> Result<Gen
         members.retain(|member| seen.insert(member.clone()));
         let mut group = ProxyGroup::new(name, spec.kind, members);
         if spec.kind != GroupKind::Select {
-            group = group.with_health_check(&options.test_url, options.test_interval);
+            let url = spec.test_url.as_deref().unwrap_or(&options.test_url);
+            let interval = spec.test_interval.unwrap_or(options.test_interval);
+            if !(url.starts_with("https://") || url.starts_with("http://")) || interval == 0 {
+                return Err(Error::UnknownRuleTarget(format!(
+                    "策略组「{name}」测速参数无效"
+                )));
+            }
+            group = group.with_health_check(url, interval);
         }
-        groups.push(group);
+        if spec.builtin {
+            let index = groups
+                .iter()
+                .position(|g| g.name == name)
+                .expect("validated builtin");
+            groups[index] = group;
+        } else {
+            groups.push(group);
+        }
     }
 
     let group_names: HashSet<String> = groups.iter().map(|group| group.name.clone()).collect();
     let proxy_names = used_proxy_names;
 
-    let (rules, providers) = build_rules(&modules, options, &group_names)?;
+    let (rules, providers) = build_rules(&modules, options, &group_names, &mut warnings)?;
     validate_group_references(&groups, &group_names, &proxy_names)?;
 
     let mut proxies: Vec<Value> = nodes.iter().map(|node| node.proxy.to_value()).collect();
@@ -205,6 +228,8 @@ pub fn generate_profile(nodes: &[Node], options: &GenerateOptions) -> Result<Gen
         yaml,
         stats,
         warnings,
+        rules,
+        groups,
     })
 }
 
@@ -447,6 +472,7 @@ fn build_rules(
     modules: &[&'static Module],
     options: &GenerateOptions,
     group_names: &HashSet<String>,
+    warnings: &mut Vec<String>,
 ) -> Result<(Vec<Rule>, IndexMap<String, ProviderSpec>)> {
     let mut providers: IndexMap<String, ProviderSpec> = IndexMap::new();
     let mut high_priority = Vec::new();
@@ -565,10 +591,67 @@ fn build_rules(
         rules.push(Rule::match_all(FINAL_GROUP));
     }
 
-    let mut seen = HashSet::new();
-    rules.retain(|rule| seen.insert(rule.to_line()));
+    let ranks: HashMap<&str, usize> = options
+        .rule_order
+        .iter()
+        .enumerate()
+        .map(|(i, key)| (key.as_str(), i))
+        .collect();
+    if !ranks.is_empty() {
+        rules.sort_by_key(|rule| {
+            ranks
+                .get(rule_identity(rule).as_str())
+                .copied()
+                .or_else(|| {
+                    // Preserve position on a target edit when no exact identity remains.
+                    options.rule_order.iter().position(|key| {
+                        Rule::parse(key).is_ok_and(|old| {
+                            old.kind == rule.kind
+                                && old.payload == rule.payload
+                                && old.no_resolve == rule.no_resolve
+                        })
+                    })
+                })
+                .unwrap_or(usize::MAX)
+        });
+    }
 
+    let mut seen = HashSet::new();
+    let mut matchers: HashMap<(String, Option<String>), String> = HashMap::new();
+    rules.retain(|rule| {
+        if !seen.insert(rule.to_line()) {
+            warnings.push(format!("重复规则已合并：{}", rule.to_line()));
+            return false;
+        }
+        let key = (rule.kind.clone(), rule.payload.clone());
+        if let Some(target) = matchers.get(&key) {
+            if target != &rule.target {
+                warnings.push(format!(
+                    "规则目标冲突：{}，先匹配 {}，随后 {}",
+                    rule_identity(rule),
+                    target,
+                    rule.target
+                ));
+            }
+        } else {
+            matchers.insert(key, rule.target.clone());
+        }
+        true
+    });
+    if let Some(index) = rules.iter().position(|r| r.kind == "MATCH") {
+        if index + 1 < rules.len() {
+            warnings.push(format!(
+                "第 {} 条 MATCH 后有 {} 条规则无法命中，请调整最终顺序",
+                index + 1,
+                rules.len() - index - 1
+            ));
+        }
+    }
     Ok((rules, providers))
+}
+
+pub fn rule_identity(rule: &Rule) -> String {
+    rule.to_line()
 }
 
 fn validate_rule_target(rule: &Rule, group_names: &HashSet<String>) -> Result<()> {

@@ -410,6 +410,7 @@ fn policy_groups_generate_types_members_and_builtin_rule_target_overrides() {
                 vec![]
             },
             include_all_nodes: *kind != GroupKind::Select,
+            ..Default::default()
         })
         .collect();
     let options = GenerateOptions {
@@ -459,6 +460,7 @@ fn invalid_policy_group_names_members_and_cycles_fail_validation() {
         kind: GroupKind::Select,
         members: members.iter().map(|name| (*name).into()).collect(),
         include_all_nodes: false,
+        ..Default::default()
     };
     for groups in [
         vec![group("节点选择", &["DIRECT"])],
@@ -497,4 +499,76 @@ fn builtin_rule_target_must_exist_and_is_never_silently_replaced() {
     };
     let error = generate_profile(&sample_nodes(), &options).unwrap_err();
     assert!(error.to_string().contains("不存在的策略组"));
+}
+
+#[test]
+fn builtin_overrides_preserve_references_and_override_health_checks() {
+    use swiftsub_core::model::PolicyGroupSpec;
+    let options = GenerateOptions {
+        policy_groups: vec![PolicyGroupSpec {
+            name: "自动选择".into(),
+            builtin: true,
+            kind: GroupKind::Fallback,
+            include_all_nodes: true,
+            test_url: Some("https://example.org/check".into()),
+            test_interval: Some(77),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let profile = generate_profile(&sample_nodes(), &options).unwrap();
+    let group = profile
+        .groups
+        .iter()
+        .find(|g| g.name == "自动选择")
+        .unwrap();
+    assert_eq!(group.kind, GroupKind::Fallback);
+    assert_eq!(group.interval, Some(77));
+    assert_eq!(group.url.as_deref(), Some("https://example.org/check"));
+    assert_eq!(group.proxies.len(), 5);
+    let mut invalid = options.clone();
+    invalid.policy_groups[0].name = "不存在".into();
+    assert!(generate_profile(&sample_nodes(), &invalid).is_err());
+    invalid = options.clone();
+    invalid.policy_groups.push(invalid.policy_groups[0].clone());
+    assert!(generate_profile(&sample_nodes(), &invalid).is_err());
+    invalid = options;
+    invalid.policy_groups[0].test_interval = Some(0);
+    assert!(generate_profile(&sample_nodes(), &invalid).is_err());
+}
+
+#[test]
+fn final_order_survives_target_changes_and_reports_unreachable_conflicts() {
+    use swiftsub_core::generator::rule_identity;
+    let direct = Rule::new("DOMAIN", "example.org", "DIRECT");
+    let reject = Rule::new("DOMAIN", "example.org", "REJECT");
+    let catchall = Rule::match_all("漏网之鱼");
+    let options = GenerateOptions {
+        custom_rules: vec![
+            direct.clone(),
+            direct.clone(),
+            reject.clone(),
+            catchall.clone(),
+        ],
+        rule_order: vec![rule_identity(&catchall), rule_identity(&direct)],
+        ..Default::default()
+    };
+    let p = generate_profile(&sample_nodes(), &options).unwrap();
+    assert_eq!(p.rules[0].kind, "MATCH");
+    assert_eq!(p.rules[1].to_line(), direct.to_line());
+    assert_eq!(
+        p.rules
+            .iter()
+            .filter(|r| r.to_line() == direct.to_line())
+            .count(),
+        1
+    );
+    assert!(p.warnings.iter().any(|w| w.contains("重复规则")));
+    assert!(p.warnings.iter().any(|w| w.contains("目标冲突")));
+    assert!(p.warnings.iter().any(|w| w.contains("无法命中")));
+    assert_ne!(rule_identity(&direct), rule_identity(&reject));
+    let mut changed = options.clone();
+    changed.custom_rules = vec![reject.clone()];
+    let reordered = generate_profile(&sample_nodes(), &changed).unwrap();
+    assert_eq!(reordered.rules[1].to_line(), reject.to_line());
 }

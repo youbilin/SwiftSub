@@ -136,7 +136,7 @@ impl ChainSpec {
 }
 
 /// A routing policy group with explicit group/policy members and optional all-node membership.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyGroupSpec {
     pub name: String,
     #[serde(default)]
@@ -145,4 +145,11 @@ pub struct PolicyGroupSpec {
     pub members: Vec<String>,
     #[serde(default)]
     pub include_all_nodes: bool,
+    /// Replace the generated group of the same name. Never creates a missing builtin.
+    #[serde(default)]
+    pub builtin: bool,
+    #[serde(default)]
+    pub test_url: Option<String>,
+    #[serde(default)]
+    pub test_interval: Option<u32>,
 }

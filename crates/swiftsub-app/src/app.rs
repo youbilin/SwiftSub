@@ -43,6 +43,7 @@ pub enum TemplateTab {
     PolicyGroups,
     RuleSets,
     CustomRules,
+    RuleOrder,
     Tools,
 }
 
@@ -56,6 +57,8 @@ pub(crate) struct TemplateSnapshot {
     custom_rule_sets: Vec<RuleSetBinding>,
     #[serde(default)]
     custom_rule_lines: Vec<String>,
+    #[serde(default)]
+    rule_order: Vec<String>,
     #[serde(default)]
     rule_provider_base_url: String,
     #[serde(default)]
@@ -83,6 +86,7 @@ impl TemplateSnapshot {
         options.custom_groups = self.custom_groups.clone();
         options.chains = self.chains.clone();
         options.policy_groups = self.policy_groups.clone();
+        options.rule_order = self.rule_order.clone();
         options.rule_set_targets = self.rule_set_targets.clone();
         options.test_url = self.test_url.clone();
         options.test_interval = self.test_interval;
@@ -286,6 +290,11 @@ pub struct SwiftSubApp {
     pub template_policy_groups: Vec<PolicyGroupSpec>,
     pub template_rule_set_targets: HashMap<String, String>,
     pub template_policy_name: Entity<InputState>,
+    pub template_policy_rename: Entity<InputState>,
+    pub template_health_url: Entity<InputState>,
+    pub template_health_interval: Entity<InputState>,
+    pub template_member_search: Entity<InputState>,
+    pub template_rule_order: Vec<String>,
     pub template_policy_edit: Option<usize>,
     pub template_target_picker: Option<String>,
     pub template_rule_search: Entity<InputState>,
@@ -383,6 +392,14 @@ impl SwiftSubApp {
             .new(|cx| InputState::new(window, cx).placeholder("规则集链接（.mrs / .yaml / .txt）"));
         let template_policy_name = cx
             .new(|cx| InputState::new(window, cx).placeholder("策略组名称，例如 流媒体 / AI 专线"));
+        let template_policy_rename =
+            cx.new(|cx| InputState::new(window, cx).placeholder("策略组名称"));
+        let template_health_url =
+            cx.new(|cx| InputState::new(window, cx).placeholder("测速 URL，留空继承全局"));
+        let template_health_interval =
+            cx.new(|cx| InputState::new(window, cx).placeholder("测速间隔秒数，留空继承"));
+        let template_member_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("搜索策略组 / 节点成员"));
         let template_custom_rules = cx.new(|cx| {
             TextareaState::new(window, cx).placeholder(
                 "每行一条规则，例如 DOMAIN-SUFFIX,example.com,节点选择\nIP-CIDR,1.1.1.0/24,DIRECT,no-resolve",
@@ -463,7 +480,16 @@ impl SwiftSubApp {
                     .unwrap_or_default(),
             )
         };
+        let rule_order = store
+            .lock()
+            .expect("store mutex poisoned")
+            .get_setting("rule_order")
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default();
         let options = GenerateOptions {
+            rule_order,
             policy_groups,
             rule_set_targets,
             rule_provider_base_url,
@@ -538,6 +564,11 @@ impl SwiftSubApp {
             template_policy_groups: Vec::new(),
             template_rule_set_targets: HashMap::new(),
             template_policy_name,
+            template_policy_rename,
+            template_health_url,
+            template_health_interval,
+            template_member_search,
+            template_rule_order: Vec::new(),
             template_policy_edit: None,
             template_target_picker: None,
             template_rule_search,
@@ -610,6 +641,10 @@ impl SwiftSubApp {
         );
         let search_obs = cx.observe_in(&app.search, window, |_, _, _, cx| cx.notify());
         let chain_search_obs = cx.observe_in(&app.chain_search, window, |_, _, _, cx| cx.notify());
+        let member_search_obs =
+            cx.observe_in(&app.template_member_search, window, |_, _, _, cx| {
+                cx.notify()
+            });
         let template_rule_search_obs =
             cx.observe_in(&app.template_rule_search, window, |_, _, _, cx| cx.notify());
         app._subscriptions = vec![
@@ -618,6 +653,7 @@ impl SwiftSubApp {
             search_obs,
             chain_search_obs,
             template_rule_search_obs,
+            member_search_obs,
         ];
 
         let args: Vec<String> = std::env::args().collect();
@@ -2040,6 +2076,7 @@ impl SwiftSubApp {
         self.template_custom_rule_sets = self.custom_rule_sets.clone();
         self.template_enabled_modules = self.enabled_modules.clone();
         self.template_policy_groups = self.options.policy_groups.clone();
+        self.template_rule_order = self.options.rule_order.clone();
         self.template_rule_set_targets = self.options.rule_set_targets.clone();
         self.template_policy_edit = None;
         self.template_target_picker = None;
@@ -2071,6 +2108,7 @@ impl SwiftSubApp {
         self.template_custom_rule_sets = self.custom_rule_sets.clone();
         self.template_enabled_modules = self.enabled_modules.clone();
         self.template_policy_groups = self.options.policy_groups.clone();
+        self.template_rule_order = self.options.rule_order.clone();
         self.template_rule_set_targets = self.options.rule_set_targets.clone();
         self.template_policy_edit = None;
         self.template_target_picker = None;
@@ -2319,8 +2357,9 @@ impl SwiftSubApp {
                 kind: GroupKind::Select,
                 members: vec!["节点选择".into(), "自动选择".into(), "DIRECT".into()],
                 include_all_nodes: false,
+                ..Default::default()
             });
-            self.template_policy_edit = Some(self.template_policy_groups.len() - 1);
+            self.edit_template_policy_group(self.template_policy_groups.len() - 1, window, cx);
             self.template_error = None;
             self.template_policy_name
                 .update(cx, |state, cx| state.set_value("", window, cx));
@@ -2328,12 +2367,244 @@ impl SwiftSubApp {
         cx.notify();
     }
 
-    pub fn edit_template_policy_group(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.template_policy_edit = if self.template_policy_edit == Some(index) {
+    pub fn edit_template_policy_group(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(group) = self.template_policy_groups.get(index) {
+            self.template_policy_edit = Some(index);
+            self.template_policy_rename
+                .update(cx, |s, cx| s.set_value(group.name.clone(), window, cx));
+            self.template_health_url.update(cx, |s, cx| {
+                s.set_value(group.test_url.clone().unwrap_or_default(), window, cx)
+            });
+            self.template_health_interval.update(cx, |s, cx| {
+                s.set_value(
+                    group
+                        .test_interval
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
+                    window,
+                    cx,
+                )
+            });
+        }
+        cx.notify();
+    }
+
+    pub fn draft_generate_options(&self, cx: &Context<Self>) -> Result<GenerateOptions, String> {
+        let mut options = self.options.clone();
+        options.enabled_modules = Some(self.template_enabled_modules.iter().cloned().collect());
+        options.disabled_rule_sets = self.template_disabled_rule_sets.iter().cloned().collect();
+        options.custom_rule_sets = self.template_custom_rule_sets.clone();
+        options.custom_rules =
+            parse_custom_rule_lines(&self.template_custom_rules.read(cx).value())?;
+        options.policy_groups = self.template_policy_groups.clone();
+        options.rule_set_targets = self.template_rule_set_targets.clone();
+        options.rule_order = self.template_rule_order.clone();
+        Ok(options)
+    }
+
+    pub fn draft_generated(
+        &self,
+        cx: &Context<Self>,
+    ) -> Result<swiftsub_core::generator::GeneratedProfile, String> {
+        let options = self.draft_generate_options(cx)?;
+        let nodes = if self.nodes.iter().any(|n| n.enabled) {
+            self.nodes.clone()
+        } else {
+            build_nodes(
+                vec![Proxy::new("direct", "模板校验节点", "127.0.0.1", 1)],
+                "validation",
+                "validation",
+            )
+        };
+        generate_profile(&nodes, &options).map_err(|e| e.to_string())
+    }
+
+    pub fn edit_builtin_policy_group(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self
+            .template_policy_groups
+            .iter()
+            .position(|g| g.name == name)
+        {
+            self.edit_template_policy_group(index, window, cx);
+            return;
+        }
+        // Defaults are generated with the draft's modules but without any overrides.
+        let Ok(mut options) = self.draft_generate_options(cx) else {
+            return;
+        };
+        options.policy_groups.clear();
+        let nodes = if self.nodes.iter().any(|n| n.enabled) {
+            self.nodes.clone()
+        } else {
+            build_nodes(
+                vec![Proxy::new("direct", "模板校验节点", "127.0.0.1", 1)],
+                "validation",
+                "validation",
+            )
+        };
+        if let Ok(profile) = generate_profile(&nodes, &options) {
+            if let Some(group) = profile.groups.iter().find(|g| g.name == name) {
+                let all_nodes = matches!(name.as_str(), "节点选择" | "自动选择");
+                self.template_policy_groups.push(PolicyGroupSpec {
+                    name,
+                    kind: group.kind,
+                    members: if all_nodes {
+                        Vec::new()
+                    } else {
+                        group.proxies.clone()
+                    },
+                    include_all_nodes: all_nodes,
+                    builtin: true,
+                    ..Default::default()
+                });
+                self.edit_template_policy_group(self.template_policy_groups.len() - 1, window, cx);
+            } else {
+                self.template_error = Some("该组没有匹配节点，请先启用节点或模块".into());
+                cx.notify();
+            }
+        }
+    }
+
+    pub fn save_policy_details(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self.template_policy_groups.get(index) else {
+            return;
+        };
+        let old_name = group.name.clone();
+        let name = self
+            .template_policy_rename
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let url = self.template_health_url.read(cx).value().trim().to_string();
+        let interval_text = self
+            .template_health_interval
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let interval = if interval_text.is_empty() {
             None
         } else {
-            Some(index)
+            match interval_text.parse::<u32>() {
+                Ok(n) if n > 0 => Some(n),
+                _ => {
+                    self.template_error = Some("测速间隔必须是正整数".into());
+                    cx.notify();
+                    return;
+                }
+            }
         };
+        if (!url.is_empty() && !(url.starts_with("https://") || url.starts_with("http://")))
+            || name.is_empty()
+            || name.contains([',', '\n', '\r'])
+            || (name != old_name
+                && (group.builtin
+                    || self.template_target_options().contains(&name)
+                    || ["PASS", "COMPATIBLE", "GLOBAL"].contains(&name.as_str())
+                    || self.nodes.iter().any(|n| n.name() == name)))
+        {
+            self.template_error = Some("名称重复或无效，或测速 URL 无效；内置组名称固定".into());
+            cx.notify();
+            return;
+        }
+        // Parse first: invalid rule text must not result in a partially renamed draft.
+        let mut rules = match parse_custom_rule_lines(&self.template_custom_rules.read(cx).value())
+        {
+            Ok(rules) => rules,
+            Err(e) => {
+                self.template_error = Some(e);
+                cx.notify();
+                return;
+            }
+        };
+        if old_name != name {
+            for g in &mut self.template_policy_groups {
+                for member in &mut g.members {
+                    if *member == old_name {
+                        *member = name.clone();
+                    }
+                }
+            }
+            for b in &mut self.template_custom_rule_sets {
+                if b.target == old_name {
+                    b.target = name.clone();
+                }
+            }
+            for t in self.template_rule_set_targets.values_mut() {
+                if *t == old_name {
+                    *t = name.clone();
+                }
+            }
+            for rule in &mut rules {
+                if rule.target == old_name {
+                    rule.target = name.clone();
+                }
+            }
+            self.template_custom_rules.update(cx, |s, cx| {
+                s.set_value(
+                    rules
+                        .iter()
+                        .map(Rule::to_line)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    window,
+                    cx,
+                )
+            });
+        }
+        let group = &mut self.template_policy_groups[index];
+        group.name = name;
+        group.test_url = (!url.is_empty()).then_some(url);
+        group.test_interval = interval;
+        self.template_error = None;
+        cx.notify();
+    }
+
+    pub fn move_policy_member(
+        &mut self,
+        index: usize,
+        from: usize,
+        to: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(g) = self.template_policy_groups.get_mut(index) {
+            if from < g.members.len() && to < g.members.len() {
+                let member = g.members.remove(from);
+                g.members.insert(to, member);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn move_template_rule(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        if let Ok(profile) = self.draft_generated(cx) {
+            let mut keys: Vec<_> = profile
+                .rules
+                .iter()
+                .map(swiftsub_core::generator::rule_identity)
+                .collect();
+            if from < keys.len() && to < keys.len() {
+                let key = keys.remove(from);
+                keys.insert(to, key);
+                self.template_rule_order = keys;
+            }
+        }
         cx.notify();
     }
 
@@ -2388,7 +2659,7 @@ impl SwiftSubApp {
                     .any(|(i, group)| i != index && group.members.contains(name))
                 || parse_custom_rule_lines(&self.template_custom_rules.read(cx).value())
                     .is_ok_and(|rules| rules.iter().any(|rule| &rule.target == name));
-            if referenced {
+            if referenced && !self.template_policy_groups[index].builtin {
                 self.template_error = Some(format!(
                     "策略组「{name}」仍被规则或其他组引用，请先更改目标"
                 ));
@@ -2421,6 +2692,7 @@ impl SwiftSubApp {
             custom_rule_sets: self.normalize_rule_set_bindings(&self.template_custom_rule_sets),
             custom_rule_lines: rules.iter().map(Rule::to_line).collect(),
             policy_groups: self.template_policy_groups.clone(),
+            rule_order: self.template_rule_order.clone(),
             rule_set_targets: self.template_rule_set_targets.clone(),
             rule_provider_base_url: self.options.rule_provider_base_url.clone(),
             custom_groups: self.custom_groups.clone(),
@@ -2536,6 +2808,7 @@ impl SwiftSubApp {
         self.custom_groups = snapshot.custom_groups;
         self.chains = snapshot.chains;
         self.options.policy_groups = snapshot.policy_groups;
+        self.options.rule_order = snapshot.rule_order;
         self.options.rule_set_targets = snapshot.rule_set_targets;
         self.custom_rule_sets = self.normalize_rule_set_bindings(&snapshot.custom_rule_sets);
         self.options.custom_rules = parse_custom_rule_lines(&snapshot.custom_rule_lines.join("\n"))
@@ -2654,6 +2927,7 @@ impl SwiftSubApp {
             .collect();
         self.disabled_rule_sets.clear();
         self.custom_rule_sets.clear();
+        self.options.rule_order.clear();
         self.options.custom_rules.clear();
         self.options.policy_groups.clear();
         self.options.rule_set_targets.clear();
@@ -2691,6 +2965,9 @@ impl SwiftSubApp {
 
     fn save_rule_set_config(&self) {
         let store = self.store.lock().expect("store mutex poisoned");
+        if let Ok(value) = serde_json::to_string(&self.options.rule_order) {
+            let _ = store.set_setting("rule_order", &value);
+        }
         if let Ok(value) = serde_json::to_string(&self.options.policy_groups) {
             let _ = store.set_setting("policy_groups", &value);
         }
