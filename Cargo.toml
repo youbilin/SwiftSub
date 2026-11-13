@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/swiftsub-core",
+    "crates/swiftsub-fetch",
+    "crates/swiftsub-store",
+    "crates/swiftsub-server",
+    "crates/swiftsub-app",
+]
+default-members = ["crates/swiftsub-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.90"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[workspace.dependencies]
+base64 = "0.22"
+hex = "0.4"
+indexmap = { version = "2.7", features = ["serde"] }
+percent-encoding = "2.3"
+regex = "1.11"
+rusqlite = { version = "0.42", features = ["bundled"] }
+tiny_http = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml_ng = "0.10"
+sha2 = "0.10"
+thiserror = "2.0"
+url = "2.5"
+uuid = { version = "1.29", features = ["v4"] }

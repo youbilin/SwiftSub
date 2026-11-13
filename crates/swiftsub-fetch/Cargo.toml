@@ -1,0 +1,19 @@
+[package]
+name = "swiftsub-fetch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = [
+  "blocking",
+  "rustls-tls",
+  "socks",
+  "gzip",
+  "charset",
+  "http2",
+] }
+thiserror.workspace = true
+
+[dev-dependencies]
+tiny_http.workspace = true
