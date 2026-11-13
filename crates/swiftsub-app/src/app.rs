@@ -1,3 +1,4 @@
+mod profiles;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -362,6 +363,10 @@ pub struct SwiftSubApp {
     pub template_tab: TemplateTab,
     pub template_rule_sources_collapsed: HashSet<String>,
     pub module_categories_collapsed: HashSet<String>,
+    pub profiles: Vec<swiftsub_store::Profile>,
+    pub profile_name_input: Entity<InputState>,
+    pub profile_membership: Option<HashSet<i64>>,
+    pub profile_delete_armed: bool,
     pub profile_id: i64,
     pub profile_token: String,
     pub server: Option<LocalServer>,
@@ -404,7 +409,21 @@ impl SwiftSubApp {
 
         let (profile_id, profile_token) = {
             let guard = store.lock().expect("store mutex poisoned");
-            match guard.get_or_create_profile("默认配置") {
+            let active = guard
+                .get_setting("active_profile")
+                .ok()
+                .flatten()
+                .and_then(|id| id.parse::<i64>().ok());
+            let existing = guard.list_profiles().unwrap_or_default();
+            let selected = existing
+                .iter()
+                .find(|p| Some(p.id) == active)
+                .or_else(|| existing.first())
+                .cloned();
+            match selected
+                .map(Ok)
+                .unwrap_or_else(|| guard.get_or_create_profile("默认配置"))
+            {
                 Ok(profile) => (profile.id, profile.token),
                 Err(_) => (0, "swiftsub-local".to_string()),
             }
@@ -558,6 +577,12 @@ impl SwiftSubApp {
             ..Default::default()
         };
 
+        let profiles = store
+            .lock()
+            .expect("store mutex poisoned")
+            .list_profiles()
+            .unwrap_or_default();
+        let profile_name_input = cx.new(|cx| InputState::new(window, cx).placeholder("配置名称"));
         let mut app = Self {
             page: Page::Subscriptions,
             light_theme,
@@ -653,6 +678,10 @@ impl SwiftSubApp {
                 "region".to_string(),
                 "service".to_string(),
             ]),
+            profiles,
+            profile_name_input,
+            profile_membership: None,
+            profile_delete_armed: false,
             profile_id,
             profile_token,
             server: None,
@@ -755,6 +784,7 @@ impl SwiftSubApp {
         }
         app.load_module_config();
         app.load_templates();
+        app.restore_selected_profile(window, cx);
         app.reload_subscriptions(cx);
         if demo_mode {
             if app.subscriptions.is_empty() {
@@ -1677,10 +1707,9 @@ impl SwiftSubApp {
 
         {
             let store = self.store.lock().expect("store mutex poisoned");
-            for subscription in subscriptions
-                .iter()
-                .filter(|subscription| subscription.enabled)
-            {
+            for subscription in subscriptions.iter().filter(|subscription| {
+                subscription.enabled && self.profile_includes(subscription.id)
+            }) {
                 let Some(payload) = subscription.payload.as_deref() else {
                     continue;
                 };
@@ -1756,13 +1785,19 @@ impl SwiftSubApp {
     }
 
     pub fn regenerate(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = self.save_active_profile() {
+            self.store_error = Some(format!("配置保存失败：{error}"));
+        }
         if self.nodes.is_empty() {
             self.preview.clear();
+            let _ = self
+                .store
+                .lock()
+                .expect("store mutex poisoned")
+                .save_profile_yaml(self.profile_id, "");
             self.stats = ProfileStats::default();
             self.gen_warnings = self.parse_warnings.clone();
-            if let Some(server) = &self.server {
-                server.update_profile(ProfileSnapshot::default());
-            }
+            self.publish_profiles();
             cx.notify();
             return;
         }
@@ -1798,15 +1833,17 @@ impl SwiftSubApp {
                     let store = self.store.lock().expect("store mutex poisoned");
                     let _ = store.save_profile_yaml(self.profile_id, &self.preview);
                 }
-                if let Some(server) = &self.server {
-                    server.update_profile(ProfileSnapshot {
-                        yaml: self.preview.clone(),
-                        userinfo_header: self.aggregate_userinfo(),
-                        update_interval_hours: 24,
-                    });
-                }
+                self.publish_profiles();
             }
             Err(error) => {
+                self.preview.clear();
+                self.stats = ProfileStats::default();
+                let _ = self
+                    .store
+                    .lock()
+                    .expect("store mutex poisoned")
+                    .save_profile_yaml(self.profile_id, "");
+                self.publish_profiles();
                 self.gen_warnings = vec![format!("生成失败：{error}")];
             }
         }
@@ -1851,8 +1888,10 @@ impl SwiftSubApp {
                         let store = self.store.lock().expect("store mutex poisoned");
                         let _ = store.set_setting("server_port", &port.to_string());
                     }
-                    self.server_url = Some(server.url_for(&self.subscription_filename));
+                    self.server_url =
+                        Some(server.profile_url(&self.profile_token, &self.subscription_filename));
                     self.server = Some(server);
+                    self.publish_profiles();
                     self.server_error = None;
                     return;
                 }
@@ -3664,7 +3703,8 @@ impl SwiftSubApp {
 
     fn refresh_server_url(&mut self) {
         if let Some(server) = &self.server {
-            self.server_url = Some(server.url_for(&self.subscription_filename));
+            self.server_url =
+                Some(server.profile_url(&self.profile_token, &self.subscription_filename));
         }
     }
 
@@ -3685,6 +3725,10 @@ impl SwiftSubApp {
                 self.subscription_filename_input
                     .update(cx, |state, cx| state.set_value(filename, window, cx));
                 self.refresh_server_url();
+                if let Err(e) = self.save_active_profile() {
+                    self.show_toast(e, cx);
+                    return;
+                }
                 self.show_toast("订阅文件名已更新".to_string(), cx);
             }
             Err(error) => self.show_toast(error, cx),
@@ -3777,7 +3821,7 @@ impl SwiftSubApp {
         for subscription in self
             .subscriptions
             .iter()
-            .filter(|subscription| subscription.enabled)
+            .filter(|subscription| subscription.enabled && self.profile_includes(subscription.id))
         {
             if subscription.traffic_upload > 0
                 || subscription.traffic_download > 0

@@ -3958,6 +3958,88 @@ impl SwiftSubApp {
             .into_any_element()
     }
 
+    fn profile_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut rows = v_flex().gap_2();
+        for profile in &self.profiles {
+            let id = profile.id;
+            rows = rows.child(
+                h_flex()
+                    .gap_2()
+                    .child(div().flex_1().child(profile.name.clone()))
+                    .child(
+                        Button::new(format!("profile-{id}"))
+                            .ghost()
+                            .label(if id == self.profile_id {
+                                "当前配置"
+                            } else {
+                                "切换"
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.switch_profile(id, window, cx)
+                            })),
+                    ),
+            );
+        }
+        rows = rows
+            .child(Input::new(&self.profile_name_input).cleanable(true))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("create-profile")
+                            .label("复制为新配置")
+                            .on_click(cx.listener(|this, _, w, cx| this.create_profile(w, cx))),
+                    )
+                    .child(
+                        Button::new("rename-profile")
+                            .ghost()
+                            .label("重命名")
+                            .on_click(cx.listener(|this, _, _, cx| this.rename_profile(cx))),
+                    )
+                    .child(
+                        Button::new("delete-profile")
+                            .ghost()
+                            .label(if self.profile_delete_armed {
+                                "确认删除"
+                            } else {
+                                "删除"
+                            })
+                            .on_click(
+                                cx.listener(|this, _, w, cx| this.delete_active_profile(w, cx)),
+                            ),
+                    ),
+            );
+        rows =
+            rows.child(div().text_sm().text_color(rgb(MUTED)).child(
+                "规则与订阅选择独立保存；所有配置地址同时可用。订阅内容缓存与节点编辑共享。",
+            ));
+        rows = rows.child(
+            Button::new("profile-all-sources")
+                .ghost()
+                .label("包含全部订阅（含以后新增）")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.profile_membership = None;
+                    this.refresh_profile_nodes(cx);
+                })),
+        );
+        for sub in &self.subscriptions {
+            let id = sub.id;
+            rows = rows.child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Switch::new(format!("profile-sub-{id}"))
+                            .checked(self.profile_includes(id))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_profile_subscription(id, cx)
+                            })),
+                    )
+                    .child(sub.name.clone()),
+            );
+        }
+        settings_section("多配置管理", vec![rows.into_any_element()], div())
+    }
+
     fn settings_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let service_url = self
             .server_url
@@ -4132,7 +4214,14 @@ impl SwiftSubApp {
                     .child(service_section)
                     .child(generation_section),
             )
-            .child(v_flex().flex_1().min_w_0().gap_4().child(data_section));
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_4()
+                    .child(self.profile_settings(cx))
+                    .child(data_section),
+            );
 
         let mut content = v_flex().gap_4();
         if let Some(error) = &self.store_error {

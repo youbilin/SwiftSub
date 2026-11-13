@@ -662,7 +662,7 @@ impl Store {
     }
 
     pub fn get_or_create_profile(&self, name: &str) -> Result<Profile> {
-        if let Some(profile) = self.default_profile()? {
+        if let Some(profile) = self.list_profiles()?.into_iter().find(|p| p.name == name) {
             return Ok(profile);
         }
 
@@ -673,8 +673,30 @@ impl Store {
              VALUES (?1, ?2, ?3, ?3)",
             params![name, token, now],
         )?;
-        self.default_profile()?
+        self.get_profile_by_token(&token)?
             .ok_or(StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+    }
+
+    pub fn list_profiles(&self) -> Result<Vec<Profile>> {
+        let mut stmt = self.conn.prepare("SELECT id, name, token, options_json, last_yaml, generated_at FROM profiles ORDER BY id")?;
+        Ok(stmt
+            .query_map([], map_profile)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn rename_profile(&self, id: i64, name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE profiles SET name=?1, updated_at=?2 WHERE id=?3",
+            params![name, now_ts(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_profile(&self, id: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM profiles WHERE id=?1 AND (SELECT COUNT(*) FROM profiles)>1",
+            [id],
+        )? > 0)
     }
 
     pub fn default_profile(&self) -> Result<Option<Profile>> {
@@ -956,5 +978,39 @@ mod routing_transaction_tests {
                 .save_routing_snapshot(&settings, Some((Some(id + 999), "missing", "{}")))
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    #[test]
+    fn profiles_preserve_identity_settings_and_last_profile() {
+        let store = Store::open_in_memory().unwrap();
+        let one = store.get_or_create_profile("one").unwrap();
+        let two = store.get_or_create_profile("two").unwrap();
+        assert_ne!(one.id, two.id);
+        assert_ne!(one.token, two.token);
+        store.save_profile_options(one.id, "first").unwrap();
+        store.save_profile_options(two.id, "second").unwrap();
+        assert_eq!(
+            store
+                .get_or_create_profile("one")
+                .unwrap()
+                .options_json
+                .as_deref(),
+            Some("first")
+        );
+        store.rename_profile(two.id, "renamed").unwrap();
+        assert_eq!(
+            store
+                .get_profile_by_token(&two.token)
+                .unwrap()
+                .unwrap()
+                .name,
+            "renamed"
+        );
+        assert!(store.delete_profile(one.id).unwrap());
+        assert!(!store.delete_profile(two.id).unwrap());
     }
 }

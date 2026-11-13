@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -55,7 +56,7 @@ pub struct LocalServer {
     token: String,
     server: Arc<Server>,
     shutdown: Arc<AtomicBool>,
-    state: Arc<RwLock<ProfileSnapshot>>,
+    state: Arc<RwLock<HashMap<String, ProfileSnapshot>>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -79,20 +80,22 @@ impl LocalServer {
 
         let server = Arc::new(server);
         let shutdown = Arc::new(AtomicBool::new(false));
-        let state = Arc::new(RwLock::new(initial));
+        let state = Arc::new(RwLock::new(HashMap::from([(
+            config.token.clone(),
+            initial,
+        )])));
         let token = config.token.clone();
 
         let handle = {
             let server = Arc::clone(&server);
             let shutdown = Arc::clone(&shutdown);
             let state = Arc::clone(&state);
-            let token = token.clone();
             thread::Builder::new()
                 .name("swiftsub-http".into())
                 .spawn(move || {
                     while !shutdown.load(Ordering::Relaxed) {
                         match server.recv_timeout(Duration::from_millis(250)) {
-                            Ok(Some(request)) => handle_request(request, &token, &state),
+                            Ok(Some(request)) => handle_request(request, &state),
                             Ok(None) => {}
                             Err(_) => break,
                         }
@@ -121,8 +124,23 @@ impl LocalServer {
 
     pub fn update_profile(&self, snapshot: ProfileSnapshot) {
         if let Ok(mut state) = self.state.write() {
-            *state = snapshot;
+            state.insert(self.token.clone(), snapshot);
         }
+    }
+
+    pub fn replace_profiles(&self, profiles: HashMap<String, ProfileSnapshot>) {
+        if let Ok(mut state) = self.state.write() {
+            *state = profiles;
+        }
+    }
+
+    pub fn profile_url(&self, token: &str, filename: &str) -> String {
+        format!(
+            "http://127.0.0.1:{}/sub/{}/{}",
+            self.addr.port(),
+            token,
+            filename.trim_start_matches('/')
+        )
     }
 
     pub fn url(&self) -> String {
@@ -159,7 +177,7 @@ fn is_valid_profile_filename(name: &str) -> bool {
         && (name.ends_with(".yaml") || name.ends_with(".yml"))
 }
 
-fn handle_request(request: Request, token: &str, state: &Arc<RwLock<ProfileSnapshot>>) {
+fn handle_request(request: Request, state: &Arc<RwLock<HashMap<String, ProfileSnapshot>>>) {
     if request.method() != &Method::Get && request.method() != &Method::Head {
         let _ = request.respond(Response::empty(StatusCode(405)));
         return;
@@ -171,12 +189,15 @@ fn handle_request(request: Request, token: &str, state: &Arc<RwLock<ProfileSnaps
         return;
     }
 
-    let prefix = format!("/sub/{token}");
-    let Some(suffix) = path.strip_prefix(&prefix) else {
+    let Some(rest) = path.strip_prefix("/sub/") else {
         let _ = request.respond(Response::empty(StatusCode(404)));
         return;
     };
-    let valid_suffix = if matches!(suffix, "" | "/") {
+    let (token, suffix) = rest
+        .split_once('/')
+        .map(|(t, f)| (t, format!("/{f}")))
+        .unwrap_or((rest, String::new()));
+    let valid_suffix = if matches!(suffix.as_str(), "" | "/") {
         true
     } else {
         suffix
@@ -189,7 +210,13 @@ fn handle_request(request: Request, token: &str, state: &Arc<RwLock<ProfileSnaps
     }
 
     let snapshot = match state.read() {
-        Ok(snapshot) => snapshot.clone(),
+        Ok(profiles) => match profiles.get(token) {
+            Some(snapshot) => snapshot.clone(),
+            None => {
+                let _ = request.respond(Response::empty(StatusCode(404)));
+                return;
+            }
+        },
         Err(_) => {
             let _ = request.respond(Response::empty(StatusCode(503)));
             return;
@@ -298,6 +325,44 @@ mod tests {
             &format!("If-None-Match: {etag}\r\n"),
         );
         assert!(response.starts_with("HTTP/1.1 304"));
+    }
+
+    #[test]
+    fn profiles_remain_isolated_when_active_profile_changes_or_is_deleted() {
+        let server = LocalServer::start(
+            ServerConfig {
+                port: 0,
+                token: "one".into(),
+                bind_lan: false,
+                update_interval_hours: 24,
+            },
+            ProfileSnapshot::default(),
+        )
+        .unwrap();
+        server.replace_profiles(HashMap::from([
+            (
+                "one".into(),
+                ProfileSnapshot {
+                    yaml: "first".into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "two".into(),
+                ProfileSnapshot {
+                    yaml: "second".into(),
+                    ..Default::default()
+                },
+            ),
+        ]));
+        assert!(request(server.local_addr(), "/sub/one/a.yaml", "").ends_with("first"));
+        assert!(request(server.local_addr(), "/sub/two/a.yaml", "").ends_with("second"));
+        assert!(
+            request(server.local_addr(), "/sub/one-extra/a.yaml", "").starts_with("HTTP/1.1 404")
+        );
+        server.replace_profiles(HashMap::from([("two".into(), ProfileSnapshot::default())]));
+        assert!(request(server.local_addr(), "/sub/one/a.yaml", "").starts_with("HTTP/1.1 404"));
+        assert!(request(server.local_addr(), "/sub/two/a.yaml", "").starts_with("HTTP/1.1 503"));
     }
 
     fn response_etag(response: &str) -> String {
