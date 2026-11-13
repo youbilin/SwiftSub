@@ -123,6 +123,7 @@ impl SwiftSubApp {
             .expect("store mutex poisoned")
             .set_setting("active_profile", &id.to_string());
         self.rebuild_nodes(cx);
+        self.restore_draft(window, cx);
     }
 
     pub fn create_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {

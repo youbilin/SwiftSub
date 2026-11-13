@@ -1,4 +1,6 @@
+mod lifecycle;
 mod profiles;
+mod sharing;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -276,6 +278,11 @@ pub enum ChainSide {
 }
 
 pub struct SwiftSubApp {
+    pub desktop: crate::desktop::DesktopIntegration,
+    pub close_to_tray: bool,
+    pub autostart: bool,
+    pub qr_content: Option<(String, String)>,
+    pub recovered_draft: bool,
     pub page: Page,
     pub light_theme: bool,
     pub store: Arc<Mutex<Store>>,
@@ -356,6 +363,8 @@ pub struct SwiftSubApp {
     pub template_rule_order: Vec<String>,
     pub template_policy_edit: Option<usize>,
     pub template_target_picker: Option<String>,
+    pub template_rules_selected_only: bool,
+    pub template_rules_target_filter: String,
     pub template_rule_search: Entity<InputState>,
     pub template_rule_url: Entity<InputState>,
     pub template_custom_rules: Entity<TextareaState>,
@@ -584,6 +593,11 @@ impl SwiftSubApp {
             .unwrap_or_default();
         let profile_name_input = cx.new(|cx| InputState::new(window, cx).placeholder("配置名称"));
         let mut app = Self {
+            desktop: crate::desktop::DesktopIntegration::new(window),
+            close_to_tray: false,
+            autostart: crate::desktop::autostart_enabled(),
+            qr_content: None,
+            recovered_draft: false,
             page: Page::Subscriptions,
             light_theme,
             store,
@@ -664,6 +678,8 @@ impl SwiftSubApp {
             template_rule_order: Vec::new(),
             template_policy_edit: None,
             template_target_picker: None,
+            template_rules_selected_only: false,
+            template_rules_target_filter: String::new(),
             template_rule_search,
             template_rule_url,
             template_custom_rules,
@@ -843,6 +859,8 @@ impl SwiftSubApp {
         app.recount_manual_nodes();
         app.start_server();
         app.start_scheduler(cx);
+        app.start_desktop_lifecycle(window, cx);
+        app.restore_draft(window, cx);
         app
     }
 
@@ -2298,6 +2316,8 @@ impl SwiftSubApp {
     }
 
     pub fn close_template_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_saved_draft();
+        self.recovered_draft = false;
         if let Some(baseline) = self.template_baseline.take() {
             self.custom_groups = baseline.custom_groups;
             self.chains = baseline.chains;
@@ -2517,6 +2537,17 @@ impl SwiftSubApp {
                 binding
             })
             .collect()
+    }
+
+    pub fn cycle_rule_target_filter(&mut self, cx: &mut Context<Self>) {
+        let mut targets = vec![String::new()];
+        targets.extend(self.template_target_options());
+        let index = targets
+            .iter()
+            .position(|v| *v == self.template_rules_target_filter)
+            .unwrap_or(0);
+        self.template_rules_target_filter = targets[(index + 1) % targets.len()].clone();
+        cx.notify();
     }
 
     pub fn template_target_options(&self) -> Vec<String> {

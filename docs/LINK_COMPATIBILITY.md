@@ -60,6 +60,7 @@ XDRIVE、MASQUE 等目标客户端未支持的 VLESS 传输会报告错误。其
 
 | 用例 | 结果 |
 | --- | --- |
+| RAW + REALITY，参数省略（默认 true） | 实际传输通过 |
 | XHTTP packet-up，无 REALITY | 实际传输通过 |
 | RAW + REALITY，support-x25519mlkem768=true | 实际传输通过 |
 | XHTTP packet-up + REALITY，support-x25519mlkem768=true | 实际传输通过 |

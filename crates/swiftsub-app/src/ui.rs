@@ -115,6 +115,9 @@ impl Render for SwiftSubApp {
                 self.template_dialog_open && self.page != Page::Generator,
                 |this| this.child(self.template_dialog(cx)),
             )
+            .when(self.qr_content.is_some(), |this| {
+                this.child(self.qr_dialog(cx))
+            })
             .when(self.diagnostics_open, |this| {
                 this.child(self.diagnostics_dialog(cx))
             })
@@ -1401,7 +1404,10 @@ impl SwiftSubApp {
             selected_count += 1;
             let haystack =
                 format!("{} {} {}", binding.name, binding.url, binding.target).to_lowercase();
-            if query.is_empty() || haystack.contains(&query) {
+            if (query.is_empty() || haystack.contains(&query))
+                && (self.template_rules_target_filter.is_empty()
+                    || self.template_rules_target_filter == binding.target)
+            {
                 visible_count += 1;
                 url_rows.push(binding);
             }
@@ -1536,7 +1542,18 @@ impl SwiftSubApp {
                     spec.id
                 )
                 .to_lowercase();
-                if query.is_empty() || haystack.contains(&query) {
+                let target = self
+                    .template_rule_set_targets
+                    .get(spec.id)
+                    .map(String::as_str)
+                    .unwrap_or(module.name);
+                if (query.is_empty()
+                    || haystack.contains(&query)
+                    || target.to_lowercase().contains(&query))
+                    && (!self.template_rules_selected_only || enabled)
+                    && (self.template_rules_target_filter.is_empty()
+                        || self.template_rules_target_filter == target)
+                {
                     visible_count += 1;
                     visible.push((*spec, enabled));
                 }
@@ -1647,7 +1664,11 @@ impl SwiftSubApp {
                     source.name, entry.name, entry.id, entry.path, target
                 )
                 .to_lowercase();
-                if query.is_empty() || haystack.contains(&query) {
+                if (query.is_empty() || haystack.contains(&query))
+                    && (!self.template_rules_selected_only || selected)
+                    && (self.template_rules_target_filter.is_empty()
+                        || self.template_rules_target_filter == target)
+                {
                     visible_count += 1;
                     entries.push((entry, selected, target, binding_id));
                 }
@@ -1821,6 +1842,9 @@ impl SwiftSubApp {
                         ),
                 )
                 .child(Input::new(&self.template_rule_search).cleanable(true))
+                .child(h_flex().gap_2()
+                    .child(Button::new("rules-selected-only").ghost().label(if self.template_rules_selected_only {"仅已选 ✓"}else{"全部规则"}).on_click(cx.listener(|this,_,_,cx|{this.template_rules_selected_only=!this.template_rules_selected_only;cx.notify();})))
+                    .child(Button::new("rules-target-filter").ghost().label(if self.template_rules_target_filter.is_empty(){"目标：全部（点击切换）".to_string()}else{format!("目标：{}",self.template_rules_target_filter)}).on_click(cx.listener(|this,_,_,cx|this.cycle_rule_target_filter(cx)))))
                 .child(div().text_size(px(11.)).text_color(rgb(MUTED))
                     .child("展开来源勾选规则集，可同时使用多个来源；来源内全选和清空互不影响。"))
                 .child(
@@ -2839,6 +2863,10 @@ impl SwiftSubApp {
                             ),
                     ),
             )
+            .child(icon_action(format!("share-node-{key}"), "▦", MUTED, cx, {
+                let key = key.clone();
+                move |this, _, cx| this.share_node_qr(&key, cx)
+            }))
             .child(icon_action(
                 format!("rename-node-{key}"),
                 "✎",
@@ -3958,6 +3986,69 @@ impl SwiftSubApp {
             .into_any_element()
     }
 
+    fn qr_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (title, content) = self.qr_content.as_ref().expect("QR open");
+        let mut matrix = v_flex().bg(gpui_kit::rgb(0xffffff)).p(px(24.));
+        if let Ok(code) = qrcode::QrCode::new(content.as_bytes()) {
+            let cell = 320.0 / code.width() as f32;
+            for y in 0..code.width() {
+                let mut row = h_flex();
+                for x in 0..code.width() {
+                    row = row.child(div().w(px(cell)).h(px(cell)).flex_shrink_0().bg(
+                        gpui_kit::rgb(if code[(x, y)] == qrcode::Color::Dark {
+                            0
+                        } else {
+                            0xffffff
+                        }),
+                    ));
+                }
+                matrix = matrix.child(row);
+            }
+        }
+        modal(
+            v_flex()
+                .w(px(450.))
+                .p_5()
+                .gap_3()
+                .rounded(px(12.))
+                .bg(rgb(SURFACE))
+                .child(div().text_lg().child(title.clone()))
+                .child(div().flex().justify_center().child(matrix))
+                .child(div().text_sm().text_color(rgb(MUTED)).child(
+                    "节点二维码包含凭据；YAML 可导入 SwiftSub。订阅地址仅供本机客户端使用。",
+                ))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("copy-qr")
+                                .label("复制内容")
+                                .on_click(cx.listener(|this, _, _, cx| this.copy_qr_content(cx))),
+                        )
+                        .child(
+                            Button::new("export-qr")
+                                .label("导出 SVG")
+                                .on_click(cx.listener(|this, _, _, cx| this.export_qr(cx))),
+                        )
+                        .child(Button::new("close-qr").ghost().label("关闭").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.qr_content = None;
+                                cx.notify();
+                            }),
+                        )),
+                ),
+        )
+    }
+
+    fn desktop_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        settings_section("桌面与草稿",vec![
+            info_row("系统托盘",if self.desktop.available{"运行中"}else{"不可用"}.into(),false),
+            h_flex().gap_3().child(Switch::new("close-to-tray").checked(self.close_to_tray).on_change(cx.listener(|this,value,_,cx|this.set_close_to_tray(*value,cx)))).child("关闭窗口时隐藏到托盘").into_any_element(),
+            h_flex().gap_3().child(Switch::new("autostart").checked(self.autostart).on_change(cx.listener(|this,value,_,cx|this.set_autostart(*value,cx)))).child("开机自启（后台运行）").into_any_element(),
+            div().text_sm().text_color(rgb(MUTED)).child("草稿每两秒自动保存，重启后恢复；托盘右键可退出。未应用的高级文本也会保留。移动程序后请重新设置自启。").into_any_element(),
+        ],div())
+    }
+
     fn profile_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut rows = v_flex().gap_2();
         for profile in &self.profiles {
@@ -4021,6 +4112,12 @@ impl SwiftSubApp {
                     this.profile_membership = None;
                     this.refresh_profile_nodes(cx);
                 })),
+        );
+        rows = rows.child(
+            Button::new("subscription-qr")
+                .ghost()
+                .label("订阅二维码")
+                .on_click(cx.listener(|this, _, _, cx| this.share_subscription_qr(cx))),
         );
         for sub in &self.subscriptions {
             let id = sub.id;
@@ -4220,6 +4317,7 @@ impl SwiftSubApp {
                     .min_w_0()
                     .gap_4()
                     .child(self.profile_settings(cx))
+                    .child(self.desktop_settings(cx))
                     .child(data_section),
             );
 

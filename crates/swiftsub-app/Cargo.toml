@@ -11,6 +11,8 @@ path = "src/main.rs"
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 gpui-kit = "=0.9.1"
+qrcode = { version = "0.14.1", default-features = false }
+raw-window-handle = "0.6"
 rfd = "0.18"
 serde.workspace = true
 serde_json.workspace = true
@@ -18,3 +20,6 @@ swiftsub-core = { path = "../swiftsub-core" }
 swiftsub-fetch = { path = "../swiftsub-fetch" }
 swiftsub-server = { path = "../swiftsub-server" }
 swiftsub-store = { path = "../swiftsub-store" }
+
+[target."cfg(windows)".dependencies]
+tray-icon = { version = "0.25.1", default-features = false }
