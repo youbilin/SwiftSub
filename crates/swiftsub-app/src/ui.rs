@@ -1769,6 +1769,7 @@ impl SwiftSubApp {
             TemplateTab::RuleSets => {
                 format!("已选 {selected_count} / {total_count} 条 · {selected_sources} 个来源")
             }
+            TemplateTab::Advanced => "DNS / 多跳 / 独立监听 / 扩展 YAML".into(),
             TemplateTab::Changes => "应用前配置差异".into(),
             TemplateTab::RuleOrder => "最终规则排序与检查".into(),
             TemplateTab::CustomRules => format!("{custom_rule_count} 条自定义规则"),
@@ -1779,6 +1780,12 @@ impl SwiftSubApp {
             self.template_target_picker_panel(id, cx)
         } else {
             match self.template_tab {
+            TemplateTab::Advanced => v_flex().flex_1().min_h_0().gap_2()
+                .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child("编辑 JSON 后点击更新草稿。chains.hops 按入口到落地填写节点名称或 source_key（2–16 跳）。listeners 每项填写 name / port / proxy；proxy 可指向节点或策略组。extra_yaml 为顶层 YAML 字符串，可覆盖 DNS 或添加其他设置。"))
+                .child(Textarea::new(&self.advanced_draft).h(px(280.)))
+                .child(h_flex().gap_2().child(Button::new("advanced-validate").primary().label("校验并更新草稿").on_click(cx.listener(|this,_,_,cx|this.update_advanced_draft(cx))))
+                    .child(Button::new("advanced-reset").ghost().label("重载已更新草稿").on_click(cx.listener(|this,_,window,cx|this.reset_advanced_draft(window,cx)))))
+                .into_any_element(),
             TemplateTab::Changes => {
                 let mut rows=v_flex().gap_2();
                 match self.draft_generated(cx) {
@@ -1913,6 +1920,7 @@ impl SwiftSubApp {
                     .child(self.template_tab_pill("策略组", TemplateTab::PolicyGroups, cx))
                     .child(self.template_tab_pill("规则集", TemplateTab::RuleSets, cx))
                     .child(self.template_tab_pill("自定义规则", TemplateTab::CustomRules, cx))
+                    .child(self.template_tab_pill("高级配置", TemplateTab::Advanced, cx))
                     .child(self.template_tab_pill("筛选与链式", TemplateTab::Tools, cx)),
             )
             .child(

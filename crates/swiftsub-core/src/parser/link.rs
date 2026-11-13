@@ -88,6 +88,8 @@ fn parse_link(line: &str) -> Result<Proxy> {
 
     match scheme.to_lowercase().as_str() {
         "ss" => parse_ss(rest),
+        "ssr" => parse_ssr(rest),
+        "anytls" | "snell" | "wireguard" | "wg" | "ssh" => parse_extended_proxy(scheme, rest),
         "vmess" => parse_vmess(rest),
         "vless" => parse_vless(rest),
         "trojan" => parse_trojan(rest),
@@ -96,6 +98,255 @@ fn parse_link(line: &str) -> Result<Proxy> {
         "http" | "https" | "socks" | "socks5" | "socks4" => parse_simple_proxy(scheme, rest),
         other => Err(Error::UnsupportedProtocol(other.to_string())),
     }
+}
+
+fn parse_ssr(rest: &str) -> Result<Proxy> {
+    let decoded = decode_base64_text(rest.trim())?;
+    let (body, query) = decoded
+        .split_once("/?")
+        .or_else(|| decoded.split_once('?'))
+        .unwrap_or((&decoded, ""));
+    let fields: Vec<_> = body.rsplitn(6, ':').collect();
+    if fields.len() != 6 {
+        return Err(Error::InvalidLink(
+            "SSR payload requires server, port, protocol, cipher, obfs and password".into(),
+        ));
+    }
+    let port = fields[4]
+        .parse::<u16>()
+        .ok()
+        .filter(|p| *p > 0)
+        .ok_or(Error::MissingField("port"))?;
+    let server = fields[5].trim_matches(['[', ']']);
+    let mut values = HashMap::new();
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            values.insert(k, percent_decode(v));
+        }
+    }
+    let decode = |key: &str| -> Result<Option<String>> {
+        values.get(key).map(|v| decode_base64_text(v)).transpose()
+    };
+    let name = decode("remarks")?
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("SSR-{server}:{port}"));
+    let mut proxy = Proxy::new("ssr", name, server, port);
+    proxy.insert("password", decode_base64_text(fields[0])?);
+    proxy.insert("obfs", fields[1]);
+    proxy.insert("cipher", fields[2]);
+    proxy.insert("protocol", fields[3]);
+    proxy.insert("udp", true);
+    if let Some(v) = decode("protoparam")? {
+        proxy.insert("protocol-param", v);
+    }
+    if let Some(v) = decode("obfsparam")? {
+        proxy.insert("obfs-param", v);
+    }
+    if let Some(issue) = proxy.fatal_issue() {
+        return Err(Error::InvalidLink(issue));
+    }
+    Ok(proxy)
+}
+
+fn parse_extended_proxy(scheme: &str, rest: &str) -> Result<Proxy> {
+    let kind = if scheme.eq_ignore_ascii_case("wg") {
+        "wireguard".to_string()
+    } else {
+        scheme.to_lowercase()
+    };
+    let (body, fragment) = split_fragment(rest);
+    let (authority, query) = split_query(body);
+    let authority = if kind == "anytls" && !authority.contains('@') {
+        decode_base64_text(authority)?
+    } else {
+        authority.to_string()
+    };
+    let url = Url::parse(&format!(
+        "neutral://{}{}{}",
+        authority,
+        query.map(|_| "?").unwrap_or(""),
+        query.unwrap_or_default()
+    ))?;
+    let server = url
+        .host_str()
+        .ok_or(Error::MissingField("server"))?
+        .trim_matches(['[', ']'])
+        .to_string();
+    let port = url.port().unwrap_or(if kind == "ssh" {
+        22
+    } else if kind == "wireguard" {
+        51820
+    } else {
+        443
+    });
+    if port == 0 {
+        return Err(Error::MissingField("port"));
+    }
+    let name = fragment.unwrap_or_else(|| format!("{kind}-{server}:{port}"));
+    let mut proxy = Proxy::new(kind.clone(), name, server, port);
+    let q = query_map(&url);
+    let user = percent_decode(url.username());
+    let pass = url.password().map(percent_decode);
+    let credential = match &pass {
+        Some(pass) if !user.is_empty() => format!("{user}:{pass}"),
+        Some(pass) => pass.clone(),
+        None => user.clone(),
+    };
+    match kind.as_str() {
+        "anytls" => {
+            if query_value(&q, &["security"]).is_some_and(|s| !matches!(s, "tls" | "none"))
+                || query_value(&q, &["type", "network"])
+                    .is_some_and(|s| !matches!(s, "tcp" | "none"))
+                || ["pbk", "sid", "path", "host", "servicename"]
+                    .iter()
+                    .any(|key| q.contains_key(*key))
+            {
+                return Err(Error::InvalidLink(
+                    "AnyTLS only supports native TLS/TCP".into(),
+                ));
+            }
+            proxy.insert("password", credential);
+            proxy.insert("tls", true);
+            if let Some(v) = query_value(&q, &["sni", "peer", "servername"]) {
+                proxy.insert("sni", v);
+            }
+            if let Some(v) =
+                query_optional_bool(&q, &["insecure", "allowinsecure", "skip-cert-verify"])?
+            {
+                proxy.insert("skip-cert-verify", v);
+            }
+            if let Some(v) = query_value(&q, &["fp", "client-fingerprint"]) {
+                proxy.insert("client-fingerprint", v);
+            }
+            if let Some(v) = query_value(&q, &["alpn"]) {
+                insert_alpn(&mut proxy, v);
+            }
+            for field in [
+                "idle-session-check-interval",
+                "idle-session-timeout",
+                "min-idle-session",
+            ] {
+                if let Some(v) = q.get(field) {
+                    let n = v
+                        .parse::<u32>()
+                        .map_err(|_| Error::InvalidLink(format!("invalid {field}")))?;
+                    proxy.insert(field, n);
+                }
+            }
+        }
+        "snell" => {
+            let psk = if credential.is_empty() {
+                query_value(&q, &["psk", "password"])
+                    .unwrap_or_default()
+                    .to_string()
+            } else {
+                credential
+            };
+            proxy.insert("psk", psk);
+            let version = query_value(&q, &["version"])
+                .unwrap_or("3")
+                .parse::<u32>()
+                .map_err(|_| Error::InvalidLink("invalid Snell version".into()))?;
+            if !(1..=3).contains(&version) {
+                return Err(Error::InvalidLink(
+                    "Mihomo Snell supports versions 1–3".into(),
+                ));
+            }
+            proxy.insert("version", version);
+            if let Some(mode) = query_value(&q, &["obfs"]) {
+                if !matches!(mode, "http" | "tls") {
+                    return Err(Error::InvalidLink("invalid Snell obfs".into()));
+                }
+                let mut map = Mapping::new();
+                map.insert(Value::String("mode".into()), Value::String(mode.into()));
+                if let Some(host) = query_value(&q, &["obfs-host"]) {
+                    map.insert(Value::String("host".into()), Value::String(host.into()));
+                }
+                proxy.insert("obfs-opts", Value::Mapping(map));
+            }
+            if let Some(v) = query_optional_bool(&q, &["udp", "udp-relay"])? {
+                proxy.insert("udp", v);
+            }
+        }
+        "ssh" => {
+            if user.is_empty() {
+                return Err(Error::MissingField("username"));
+            }
+            proxy.insert("username", user);
+            if let Some(v) = pass.filter(|s| !s.is_empty()) {
+                proxy.insert("password", v);
+            }
+            for field in ["private-key", "private-key-passphrase"] {
+                if let Some(v) = q.get(field) {
+                    proxy.insert(field, v.clone());
+                }
+            }
+            if let Some(v) = q.get("host-key") {
+                proxy.insert(
+                    "host-key",
+                    Value::Sequence(v.split(',').map(|s| Value::String(s.into())).collect()),
+                );
+            }
+        }
+        "wireguard" => {
+            let private = query_value(&q, &["privatekey", "private-key"]).unwrap_or(&credential);
+            let public = query_value(&q, &["publickey", "public-key", "peer-public-key"])
+                .ok_or(Error::MissingField("public-key"))?;
+            for key in [private, public] {
+                if super::decode_base64(key)?.len() != 32 {
+                    return Err(Error::InvalidLink(
+                        "WireGuard key must decode to 32 bytes".into(),
+                    ));
+                }
+            }
+            proxy.insert("private-key", private);
+            proxy.insert("public-key", public);
+            if let Some(v) = query_value(&q, &["presharedkey", "pre-shared-key", "preshared-key"]) {
+                if super::decode_base64(v)?.len() != 32 {
+                    return Err(Error::InvalidLink(
+                        "WireGuard preshared key must be 32 bytes".into(),
+                    ));
+                }
+                proxy.insert("pre-shared-key", v);
+            }
+            let addresses =
+                query_value(&q, &["address", "ip"]).ok_or(Error::MissingField("address"))?;
+            for address in addresses.split(',') {
+                let ip = address
+                    .split('/')
+                    .next()
+                    .unwrap_or_default()
+                    .parse::<std::net::IpAddr>()
+                    .map_err(|_| Error::InvalidLink("invalid WireGuard address".into()))?;
+                proxy.insert(if ip.is_ipv4() { "ip" } else { "ipv6" }, ip.to_string());
+            }
+            if let Some(v) = q.get("reserved") {
+                let values = v
+                    .split(',')
+                    .map(|s| s.parse::<u8>().map(Value::from))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|_| Error::InvalidLink("reserved requires three bytes".into()))?;
+                if values.len() != 3 {
+                    return Err(Error::InvalidLink("reserved requires three bytes".into()));
+                }
+                proxy.insert("reserved", Value::Sequence(values));
+            }
+            if let Some(v) = q.get("mtu") {
+                let mtu = v
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|n| *n >= 576)
+                    .ok_or_else(|| Error::InvalidLink("invalid MTU".into()))?;
+                proxy.insert("mtu", mtu);
+            }
+            proxy.insert("udp", true);
+        }
+        _ => unreachable!(),
+    }
+    if let Some(issue) = proxy.fatal_issue() {
+        return Err(Error::InvalidLink(issue));
+    }
+    Ok(proxy)
 }
 
 fn parse_ss(rest: &str) -> Result<Proxy> {
@@ -829,6 +1080,64 @@ fn link_compatibility_warnings(line: &str) -> Vec<String> {
     let Ok(url) = Url::parse(line) else {
         return Vec::new();
     };
+    if matches!(
+        url.scheme(),
+        "anytls" | "snell" | "wireguard" | "wg" | "ssh"
+    ) {
+        let supported: &[&str] = match url.scheme() {
+            "anytls" => &[
+                "security",
+                "type",
+                "network",
+                "sni",
+                "peer",
+                "servername",
+                "insecure",
+                "allowinsecure",
+                "skip-cert-verify",
+                "fp",
+                "client-fingerprint",
+                "alpn",
+                "idle-session-check-interval",
+                "idle-session-timeout",
+                "min-idle-session",
+            ],
+            "snell" => &[
+                "psk",
+                "password",
+                "version",
+                "obfs",
+                "obfs-host",
+                "udp",
+                "udp-relay",
+            ],
+            "ssh" => &["private-key", "private-key-passphrase", "host-key"],
+            _ => &[
+                "privatekey",
+                "private-key",
+                "publickey",
+                "public-key",
+                "peer-public-key",
+                "presharedkey",
+                "pre-shared-key",
+                "preshared-key",
+                "address",
+                "ip",
+                "reserved",
+                "mtu",
+            ],
+        };
+        let unsupported: Vec<_> = url
+            .query_pairs()
+            .map(|(k, _)| k.to_lowercase())
+            .filter(|k| !supported.contains(&k.as_str()))
+            .collect();
+        return if unsupported.is_empty() {
+            vec![]
+        } else {
+            vec![format!("以下分享参数未转换：{}", unsupported.join("、"))]
+        };
+    }
     if !url.scheme().eq_ignore_ascii_case("vless") {
         return Vec::new();
     }
@@ -860,7 +1169,7 @@ fn link_compatibility_warnings(line: &str) -> Vec<String> {
         if !unsupported.is_empty() {
             warnings.push(format!(
                 "XHTTP extra 中以下参数尚未转换，请检查节点配置：{}",
-                unsupported.join("?")
+                unsupported.join("、")
             ));
         }
     }
@@ -1247,5 +1556,44 @@ mod tests {
         assert_eq!(proxy.kind(), "tuic");
         assert_eq!(proxy.get_str("congestion-controller"), Some("bbr"));
         assert_eq!(proxy.get_str("udp-relay-mode"), Some("native"));
+    }
+}
+
+#[cfg(test)]
+mod extended_tests {
+    use super::*;
+    #[test]
+    fn parses_additional_protocols_and_rejects_invalid_parameters() {
+        use base64::Engine;
+        let raw = "example.org:8388:auth_sha1_v4:aes-256-cfb:tls1.2_ticket_auth:cGFzcw/?remarks=U1NSLXRlc3Q&protoparam=dXNlcg";
+        let ssr = format!(
+            "ssr://{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+        );
+        let p = parse_link(&ssr).unwrap();
+        assert_eq!(p.kind(), "ssr");
+        assert_eq!(p.get_str("protocol-param"), Some("user"));
+        let p=parse_link("anytls://p%40ss@example.org:443?sni=tls.example&insecure=false&idle-session-timeout=30#test").unwrap();
+        assert_eq!(p.get_str("password"), Some("p@ss"));
+        assert_eq!(p.fields()["skip-cert-verify"].as_bool(), Some(false));
+        let p = parse_link("snell://psk@example.org:443?version=3&obfs=tls&obfs-host=cdn.example")
+            .unwrap();
+        assert_eq!(p.get_str("psk"), Some("psk"));
+        let p = parse_link("ssh://user:p%40ss@example.org:22?host-key=ssh-ed25519%20AAA#shell")
+            .unwrap();
+        assert_eq!(p.get_str("username"), Some("user"));
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA%3D";
+        let p=parse_link(&format!("wireguard://{key}@example.org:51820?publickey={key}&address=10.0.0.2%2F32%2Cfd00%3A%3A2%2F128&reserved=1%2C2%2C3&mtu=1280")).unwrap();
+        assert_eq!(p.get_str("ip"), Some("10.0.0.2"));
+        assert_eq!(p.get_str("ipv6"), Some("fd00::2"));
+        for link in [
+            "snell://p@example.org?version=4",
+            "ssh://user@example.org:22",
+            "anytls://p@example.org?security=reality",
+            "wireguard://bad@example.org?publickey=bad&address=10.0.0.1",
+        ] {
+            assert!(parse_link(link).is_err(), "{link}");
+        }
+        assert!(!link_compatibility_warnings("anytls://p@example.org?unknown=1").is_empty());
     }
 }

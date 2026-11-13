@@ -236,10 +236,33 @@ impl Proxy {
                     return Some("VMess 缺少 uuid".to_string());
                 }
             }
-            "trojan" | "hysteria2" => {
+            "trojan" | "hysteria2" | "anytls" => {
                 if self.get_str("password").unwrap_or_default().is_empty() {
                     return Some(format!("{} 缺少 password", self.kind().to_uppercase()));
                 }
+            }
+            "snell" if self.get_str("psk").unwrap_or_default().is_empty() => {
+                return Some("Snell 缺少 psk".into());
+            }
+            "ssh"
+                if self.get_str("username").unwrap_or_default().is_empty()
+                    || (self.get_str("password").unwrap_or_default().is_empty()
+                        && self.get_str("private-key").unwrap_or_default().is_empty()) =>
+            {
+                return Some("SSH 缺少 username 或认证字段".into());
+            }
+            "wireguard"
+                if self.get_str("private-key").unwrap_or_default().is_empty()
+                    || self.get_str("public-key").unwrap_or_default().is_empty() =>
+            {
+                return Some("WireGuard 缺少密钥".into());
+            }
+            "ssr"
+                if ["cipher", "password", "protocol", "obfs"]
+                    .iter()
+                    .any(|k| self.get_str(k).unwrap_or_default().is_empty()) =>
+            {
+                return Some("SSR 缺少必填字段".into());
             }
             "tuic" => {
                 if self.get_str("uuid").unwrap_or_default().is_empty() {

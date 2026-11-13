@@ -109,10 +109,14 @@ impl CustomGroupSpec {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChainSpec {
     pub name: String,
+    #[serde(default)]
     pub entry_node: String,
     #[serde(default)]
     pub entry_name: String,
+    #[serde(default)]
     pub landing_node: String,
+    #[serde(default)]
+    pub hops: Vec<String>,
     #[serde(default)]
     pub landing_name: String,
 }
@@ -130,6 +134,7 @@ impl ChainSpec {
             entry_node: entry_node.into(),
             entry_name: entry_name.into(),
             landing_node: landing_node.into(),
+            hops: Vec::new(),
             landing_name: landing_name.into(),
         }
     }

@@ -1,6 +1,7 @@
 use serde_yaml_ng::{Mapping, Value};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct DnsOptions {
     pub ipv6: bool,
     pub fake_ip_range: String,

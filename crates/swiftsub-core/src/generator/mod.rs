@@ -32,6 +32,26 @@ pub struct RuleSetBinding {
     pub no_resolve: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListenerSpec {
+    pub name: String,
+    pub port: u16,
+    pub proxy: String,
+    #[serde(default = "default_listener_kind")]
+    pub kind: String,
+    #[serde(default = "default_listener_address")]
+    pub listen: String,
+    #[serde(default)]
+    pub udp: bool,
+}
+fn default_listener_kind() -> String {
+    "mixed".into()
+}
+fn default_listener_address() -> String {
+    "127.0.0.1".into()
+}
+
 #[derive(Clone, Debug)]
 pub struct GenerateOptions {
     pub preset: Preset,
@@ -50,6 +70,8 @@ pub struct GenerateOptions {
     pub chains: Vec<ChainSpec>,
     pub dns: DnsOptions,
     pub rule_order: Vec<String>,
+    pub listeners: Vec<ListenerSpec>,
+    pub extra_yaml: String,
 }
 
 impl Default for GenerateOptions {
@@ -72,6 +94,8 @@ impl Default for GenerateOptions {
             chains: Vec::new(),
             dns: DnsOptions::default(),
             rule_order: Vec::new(),
+            listeners: Vec::new(),
+            extra_yaml: String::new(),
         }
     }
 }
@@ -134,8 +158,7 @@ pub fn generate_profile(nodes: &[Node], options: &GenerateOptions) -> Result<Gen
         options,
         &mut used_group_names,
         &mut used_proxy_names,
-        &mut warnings,
-    );
+    )?;
     groups.extend(chain_groups);
     if let Some(final_group) = final_group {
         groups.push(final_group);
@@ -209,7 +232,74 @@ pub fn generate_profile(nodes: &[Node], options: &GenerateOptions) -> Result<Gen
 
     let mut proxies: Vec<Value> = nodes.iter().map(|node| node.proxy.to_value()).collect();
     proxies.extend(chain_proxies.iter().map(Proxy::to_value));
-    let root = build_root(proxies, &groups, &rules, &providers, options);
+    let mut root = build_root(proxies, &groups, &rules, &providers, options);
+    if options.mixed_port == 0 || options.dns.domestic.is_empty() || options.dns.foreign.is_empty()
+    {
+        return Err(Error::InvalidLink(
+            "监听端口不能为零，DNS 列表不能为空".into(),
+        ));
+    }
+    let mut listener_names = HashSet::new();
+    let mut ports = HashSet::from([options.mixed_port]);
+    let mut listeners = Vec::new();
+    for listener in &options.listeners {
+        if listener.name.trim().is_empty()
+            || !listener_names.insert(&listener.name)
+            || listener.port == 0
+            || !ports.insert(listener.port)
+            || !matches!(listener.kind.as_str(), "mixed" | "http" | "socks")
+            || listener.listen.parse::<std::net::IpAddr>().is_err()
+            || !(group_names.contains(&listener.proxy)
+                || proxy_names.contains(&listener.proxy)
+                || matches!(listener.proxy.as_str(), "DIRECT" | "REJECT"))
+        {
+            return Err(Error::InvalidLink(format!(
+                "监听配置无效、端口冲突或目标不存在：{}",
+                listener.name
+            )));
+        }
+        listeners.push(serde_yaml_ng::to_value(listener)?);
+    }
+    if !listeners.is_empty() {
+        // Mihomo uses 'type', whereas the Rust/UI field is named 'kind'.
+        for value in &mut listeners {
+            let map = value.as_mapping_mut().expect("listener mapping");
+            let kind = map
+                .remove(Value::String("kind".into()))
+                .expect("listener kind");
+            map.insert(Value::String("type".into()), kind);
+        }
+        root.insert(
+            Value::String("listeners".into()),
+            Value::Sequence(listeners),
+        );
+    }
+    if !options.extra_yaml.trim().is_empty() {
+        let extra: Value = serde_yaml_ng::from_str(&options.extra_yaml)?;
+        let extra = extra
+            .as_mapping()
+            .ok_or_else(|| Error::InvalidLink("扩展 YAML 必须是顶层映射".into()))?;
+        for (key, value) in extra {
+            let key_str = key
+                .as_str()
+                .ok_or_else(|| Error::InvalidLink("扩展 YAML 键必须为字符串".into()))?;
+            if matches!(
+                key_str,
+                "proxies"
+                    | "proxy-groups"
+                    | "rules"
+                    | "rule-providers"
+                    | "listeners"
+                    | "mixed-port"
+                    | "allow-lan"
+            ) {
+                return Err(Error::InvalidLink(format!(
+                    "{key_str} 请通过对应编辑器修改"
+                )));
+            }
+            root.insert(key.clone(), value.clone());
+        }
+    }
 
     let body = serde_yaml_ng::to_string(&Value::Mapping(root))?;
     use sha2::{Digest, Sha256};
@@ -229,7 +319,7 @@ pub fn generate_profile(nodes: &[Node], options: &GenerateOptions) -> Result<Gen
     );
 
     let stats = ProfileStats {
-        proxies: nodes.len(),
+        proxies: nodes.len() + chain_proxies.len(),
         groups: groups.len(),
         rules: rules.len(),
         rule_sets: providers.len(),
@@ -382,48 +472,66 @@ fn build_chains(
     options: &GenerateOptions,
     used_group_names: &mut HashSet<String>,
     used_proxy_names: &mut HashSet<String>,
-    warnings: &mut Vec<String>,
-) -> (Vec<Proxy>, Vec<ProxyGroup>) {
+) -> Result<(Vec<Proxy>, Vec<ProxyGroup>)> {
     let mut proxies = Vec::new();
     let mut groups = Vec::new();
 
     for chain in &options.chains {
-        let entry = nodes
-            .iter()
-            .find(|node| node.source_key == chain.entry_node);
-        let landing = nodes
-            .iter()
-            .find(|node| node.source_key == chain.landing_node);
-
-        let (Some(entry), Some(landing)) = (entry, landing) else {
-            warnings.push(format!(
-                "链式代理「{}」引用的节点已被删除或禁用，已跳过",
-                chain.name
-            ));
-            continue;
+        let selectors = if chain.hops.is_empty() {
+            vec![chain.entry_node.clone(), chain.landing_node.clone()]
+        } else {
+            chain.hops.clone()
         };
-        if entry.source_key == landing.source_key {
-            warnings.push(format!(
-                "链式代理「{}」的中转和落地是同一节点，已跳过",
+        if selectors.len() < 2 || selectors.len() > 16 {
+            return Err(Error::InvalidConfig(format!(
+                "链式代理「{}」需 2–16 跳",
                 chain.name
-            ));
-            continue;
+            )));
         }
-
-        let mut proxy = landing.proxy.clone();
-        let name = unique_proxy_name(
-            &format!("{} · {}", chain.name, landing.name()),
-            used_proxy_names,
-        );
-        proxy.set_name(name.clone());
-        proxy.set_dialer_proxy(entry.name());
-        proxies.push(proxy);
-
+        let mut route = Vec::new();
+        let mut seen = HashSet::new();
+        for selector in &selectors {
+            let matches: Vec<_> = nodes
+                .iter()
+                .filter(|n| n.source_key == *selector || n.name() == selector)
+                .collect();
+            if matches.len() != 1 || !seen.insert(matches[0].source_key.clone()) {
+                route.clear();
+                break;
+            }
+            route.push(matches[0]);
+        }
+        if route.len() != selectors.len() {
+            return Err(Error::InvalidConfig(format!(
+                "链式代理「{}」节点不存在、禁用、重名或重复",
+                chain.name
+            )));
+        }
+        let mut previous = route[0].name().to_string();
+        for (index, node) in route.iter().enumerate().skip(1) {
+            let mut proxy = node.proxy.clone();
+            let name = unique_proxy_name(
+                &if chain.hops.is_empty() {
+                    format!("{} · {}", chain.name, node.name())
+                } else {
+                    format!("{} · hop{} · {}", chain.name, index + 1, node.name())
+                },
+                used_proxy_names,
+            );
+            proxy.set_name(name.clone());
+            proxy.set_dialer_proxy(previous);
+            previous = name;
+            proxies.push(proxy);
+        }
         let group_name = unique_group_name(&chain.name, used_group_names);
-        groups.push(ProxyGroup::new(group_name, GroupKind::Select, vec![name]));
+        groups.push(ProxyGroup::new(
+            group_name,
+            GroupKind::Select,
+            vec![previous],
+        ));
     }
 
-    (proxies, groups)
+    Ok((proxies, groups))
 }
 
 fn unique_group_name(base: &str, used: &mut HashSet<String>) -> String {

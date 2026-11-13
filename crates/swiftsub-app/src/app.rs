@@ -45,6 +45,7 @@ pub enum TemplateTab {
     CustomRules,
     RuleOrder,
     Changes,
+    Advanced,
     Tools,
 }
 
@@ -60,6 +61,12 @@ pub(crate) struct TemplateSnapshot {
     custom_rule_lines: Vec<String>,
     #[serde(default)]
     rule_order: Vec<String>,
+    #[serde(default)]
+    dns: swiftsub_core::generator::DnsOptions,
+    #[serde(default)]
+    listeners: Vec<swiftsub_core::generator::ListenerSpec>,
+    #[serde(default)]
+    extra_yaml: String,
     #[serde(default)]
     rule_provider_base_url: String,
     #[serde(default)]
@@ -88,6 +95,9 @@ impl TemplateSnapshot {
         options.chains = self.chains.clone();
         options.policy_groups = self.policy_groups.clone();
         options.rule_order = self.rule_order.clone();
+        options.dns = self.dns.clone();
+        options.listeners = self.listeners.clone();
+        options.extra_yaml = self.extra_yaml.clone();
         options.rule_set_targets = self.rule_set_targets.clone();
         options.test_url = self.test_url.clone();
         options.test_interval = self.test_interval;
@@ -98,6 +108,20 @@ impl TemplateSnapshot {
         }
         Ok(options)
     }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdvancedDraft {
+    dns: swiftsub_core::generator::DnsOptions,
+    #[serde(default)]
+    listeners: Vec<swiftsub_core::generator::ListenerSpec>,
+    #[serde(default)]
+    chains: Vec<ChainSpec>,
+    #[serde(default)]
+    custom_groups: Vec<CustomGroupSpec>,
+    #[serde(default)]
+    extra_yaml: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -334,6 +358,7 @@ pub struct SwiftSubApp {
     pub template_rule_search: Entity<InputState>,
     pub template_rule_url: Entity<InputState>,
     pub template_custom_rules: Entity<TextareaState>,
+    pub advanced_draft: Entity<TextareaState>,
     pub template_tab: TemplateTab,
     pub template_rule_sources_collapsed: HashSet<String>,
     pub module_categories_collapsed: HashSet<String>,
@@ -434,6 +459,7 @@ impl SwiftSubApp {
             cx.new(|cx| InputState::new(window, cx).placeholder("测速间隔秒数，留空继承"));
         let template_member_search =
             cx.new(|cx| InputState::new(window, cx).placeholder("搜索策略组 / 节点成员"));
+        let advanced_draft = cx.new(|cx| TextareaState::new(window, cx));
         let template_custom_rules = cx.new(|cx| {
             TextareaState::new(window, cx).placeholder(
                 "每行一条规则，例如 DOMAIN-SUFFIX,example.com,节点选择\nIP-CIDR,1.1.1.0/24,DIRECT,no-resolve",
@@ -616,6 +642,7 @@ impl SwiftSubApp {
             template_rule_search,
             template_rule_url,
             template_custom_rules,
+            advanced_draft,
             template_tab: TemplateTab::RuleSets,
             template_rule_sources_collapsed: rule_catalog::SOURCES
                 .iter()
@@ -722,6 +749,9 @@ impl SwiftSubApp {
             app.options.test_interval = snapshot.test_interval;
             app.options.mixed_port = snapshot.mixed_port;
             app.options.allow_lan = snapshot.allow_lan;
+            app.options.dns = snapshot.dns;
+            app.options.listeners = snapshot.listeners;
+            app.options.extra_yaml = snapshot.extra_yaml;
         }
         app.load_module_config();
         app.load_templates();
@@ -2197,6 +2227,7 @@ impl SwiftSubApp {
         self.template_edit_id = None;
         self.template_discard_armed = false;
         self.template_dialog_open = true;
+        self.reset_advanced_draft(window, cx);
         self.template_error = None;
         self.template_tab = TemplateTab::PolicyGroups;
         self.template_disabled_rule_sets = self.disabled_rule_sets.clone();
@@ -2256,6 +2287,72 @@ impl SwiftSubApp {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.template_custom_rules
             .update(cx, |state, cx| state.set_value("", window, cx));
+        cx.notify();
+    }
+
+    pub fn reset_advanced_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let base = self.template_base_options.as_ref().unwrap_or(&self.options);
+        let draft = AdvancedDraft {
+            dns: base.dns.clone(),
+            listeners: base.listeners.clone(),
+            chains: self.chains.clone(),
+            custom_groups: self.custom_groups.clone(),
+            extra_yaml: base.extra_yaml.clone(),
+        };
+        if let Ok(text) = serde_json::to_string_pretty(&draft) {
+            self.advanced_draft
+                .update(cx, |s, cx| s.set_value(text, window, cx));
+        }
+    }
+
+    pub fn update_advanced_draft(&mut self, cx: &mut Context<Self>) {
+        let result = serde_json::from_str::<AdvancedDraft>(&self.advanced_draft.read(cx).value())
+            .map_err(|e| e.to_string());
+        let draft = match result {
+            Ok(d) => d,
+            Err(e) => {
+                self.template_error = Some(format!("高级配置格式错误：{e}"));
+                cx.notify();
+                return;
+            }
+        };
+        let mut options = match self.draft_generate_options(cx) {
+            Ok(o) => o,
+            Err(e) => {
+                self.template_error = Some(e);
+                cx.notify();
+                return;
+            }
+        };
+        options.dns = draft.dns.clone();
+        options.listeners = draft.listeners.clone();
+        options.extra_yaml = draft.extra_yaml.clone();
+        options.chains = draft.chains.clone();
+        options.custom_groups = draft.custom_groups.clone();
+        let validation_nodes = if self.nodes.iter().any(|n| n.enabled) {
+            self.nodes.clone()
+        } else {
+            build_nodes(
+                vec![Proxy::new("direct", "模板校验节点", "127.0.0.1", 1)],
+                "validation",
+                "validation",
+            )
+        };
+        let result = generate_profile(&validation_nodes, &options);
+        if let Err(e) = result {
+            self.template_error = Some(e.to_string());
+            cx.notify();
+            return;
+        }
+        let base = self
+            .template_base_options
+            .get_or_insert_with(|| self.options.clone());
+        base.dns = draft.dns;
+        base.listeners = draft.listeners;
+        base.extra_yaml = draft.extra_yaml;
+        self.chains = draft.chains;
+        self.custom_groups = draft.custom_groups;
+        self.template_error = None;
         cx.notify();
     }
 
@@ -2833,6 +2930,9 @@ impl SwiftSubApp {
             custom_rule_lines: rules.iter().map(Rule::to_line).collect(),
             policy_groups: self.template_policy_groups.clone(),
             rule_order: self.template_rule_order.clone(),
+            dns: base.dns.clone(),
+            listeners: base.listeners.clone(),
+            extra_yaml: base.extra_yaml.clone(),
             rule_set_targets: self.template_rule_set_targets.clone(),
             rule_provider_base_url: base.rule_provider_base_url.clone(),
             custom_groups: self.custom_groups.clone(),
@@ -2947,6 +3047,9 @@ impl SwiftSubApp {
             policy_groups: self.options.policy_groups.clone(),
             rule_set_targets: self.options.rule_set_targets.clone(),
             rule_order: self.options.rule_order.clone(),
+            dns: self.options.dns.clone(),
+            listeners: self.options.listeners.clone(),
+            extra_yaml: self.options.extra_yaml.clone(),
             custom_groups: self.custom_groups.clone(),
             chains: self.chains.clone(),
             test_url: self.options.test_url.clone(),
@@ -3003,6 +3106,15 @@ impl SwiftSubApp {
                     != serde_json::to_string(&base.chains).ok()
                 {
                     changes.push("链式代理");
+                }
+                if draft.dns != base.dns {
+                    changes.push("DNS");
+                }
+                if draft.listeners != base.listeners {
+                    changes.push("独立监听");
+                }
+                if draft.extra_yaml != base.extra_yaml {
+                    changes.push("扩展 YAML");
                 }
                 if draft.test_url != base.test_url || draft.test_interval != base.test_interval {
                     changes.push("全局测速");
@@ -3165,6 +3277,7 @@ impl SwiftSubApp {
         self.template_custom_rules.update(cx, |s, cx| {
             s.set_value(snapshot.custom_rule_lines.join("\n"), window, cx)
         });
+        self.reset_advanced_draft(window, cx);
         self.page = Page::Generator;
         cx.notify();
     }

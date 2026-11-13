@@ -593,3 +593,43 @@ fn generation_report_is_bound_to_output_body_and_traces_sources() {
     assert!(Rule::parse("DOMAIN,example.org,DIRECT,unsupported").is_err());
     assert!(Rule::parse("DOMAIN,example.org,DIRECT,no-resolve,extra").is_err());
 }
+
+#[test]
+fn multi_hop_chain_listeners_dns_and_extra_yaml_are_validated() {
+    use swiftsub_core::generator::ListenerSpec;
+    let nodes = sample_nodes();
+    let hops = nodes.iter().take(3).map(|n| n.source_key.clone()).collect();
+    let mut chain = ChainSpec::new("three-hop", "", "", "", "");
+    chain.hops = hops;
+    let options = GenerateOptions {
+        chains: vec![chain],
+        listeners: vec![ListenerSpec {
+            name: "node-port".into(),
+            port: 19001,
+            proxy: nodes[0].name().into(),
+            kind: "mixed".into(),
+            listen: "127.0.0.1".into(),
+            udp: false,
+        }],
+        extra_yaml: "log-level: debug\n".into(),
+        ..Default::default()
+    };
+    let profile = generate_profile(&nodes, &options).unwrap();
+    let yaml: Value = serde_yaml_ng::from_str(&profile.yaml).unwrap();
+    assert_eq!(yaml["proxies"].as_sequence().unwrap().len(), 7);
+    let first_clone = &yaml["proxies"][5];
+    let second_clone = &yaml["proxies"][6];
+    assert_eq!(first_clone["dialer-proxy"].as_str(), Some(nodes[0].name()));
+    assert_eq!(second_clone["dialer-proxy"], first_clone["name"]);
+    assert_eq!(yaml["listeners"][0]["type"], "mixed");
+    assert_eq!(yaml["log-level"], "debug");
+    let mut invalid = options.clone();
+    invalid.listeners[0].port = invalid.mixed_port;
+    assert!(generate_profile(&nodes, &invalid).is_err());
+    invalid = options.clone();
+    invalid.listeners[0].proxy = "missing".into();
+    assert!(generate_profile(&nodes, &invalid).is_err());
+    invalid = options;
+    invalid.extra_yaml = "rules: []".into();
+    assert!(generate_profile(&nodes, &invalid).is_err());
+}

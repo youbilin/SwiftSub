@@ -2,6 +2,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
     #[error("invalid node link: {0}")]
     InvalidLink(String),
     #[error("unsupported protocol: {0}")]

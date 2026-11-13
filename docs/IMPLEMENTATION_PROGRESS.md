@@ -37,3 +37,9 @@
 验证：workspace 58 项测试通过；四来源 + 26 providers + 4 种策略组 / 内置覆盖通过 Mihomo v1.19.34 `-t`。真实窗口检查诊断，重启恢复模板配置。debug 合成生成基准：100 / 1000 / 10000 节点约 6 / 44 / 433 ms（单次观测，不代表界面滚动性能）。
 
 完成受控实际传输：Xray v26.11.9 + Mihomo v1.19.34，XHTTP、RAW+REALITY true、XHTTP+REALITY true 成功读取目标 HTTP 内容；显式 MLKEM false 在该新版服务端失败。复现脚本与完整限制见 LINK_COMPATIBILITY.md。公网、旧版 Xray、全部 XHTTP 模式及多个 DPI / 系统主题尚未穷举。
+
+## 第五批 A：生成与导入扩展
+
+已实现 2–16 跳链路（旧双跳格式兼容）、绑定策略的独立 mixed/http/socks 监听、DNS 配置和受保护的顶层扩展 YAML。高级页通过 JSON 校验并更新草稿，应用后持久化。链路节点缺失、禁用、重复或名称歧义会阻止生成。新增 SSR、AnyTLS、Snell v1–3、SSH 和 WireGuard 链接解析；未知扩展参数进入诊断。
+
+验证：workspace 60 项测试通过；extension_profile 示例生成 AnyTLS/Snell/SSH/WireGuard/SS、三跳链、独立 SOCKS 监听和 DNS，经 Mihomo v1.19.34 `-t` 通过。这是配置语法验证，上述新增协议尚未完成真实服务端连接验证。
