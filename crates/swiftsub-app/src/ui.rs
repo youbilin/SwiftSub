@@ -1,7 +1,7 @@
-use gpui_kit::base::InteractiveElementExt as _;
+use gpui_kit::base::{Disableable as _, InteractiveElementExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, Textarea};
-use gpui_kit::component::resizable::{h_resizable, resizable_panel};
+use gpui_kit::component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Sizable as _, StyledExt as _, TitleBar, h_flex, v_flex};
@@ -13,8 +13,8 @@ use swiftsub_core::region::Region;
 use swiftsub_store::Subscription as StoredSubscription;
 
 use crate::app::{
-    AddMode, ChainSide, CustomDialog, Page, SwiftSubApp, TemplateTab, format_bytes, format_expire,
-    format_timestamp, template_summary_counts,
+    AddMode, ChainSide, CustomDialog, Page, SettingsTab, SwiftSubApp, TemplateTab, format_bytes,
+    format_expire, format_timestamp, template_summary_counts,
 };
 use crate::rule_catalog;
 
@@ -81,11 +81,16 @@ fn rgba(color: u32) -> Rgba {
 }
 
 impl Render for SwiftSubApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("swiftsub-root")
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.modifiers.control && event.keystroke.key == "f" {
+                    if this.template_dialog_open {
+                        this.set_template_tab(TemplateTab::RuleSets, cx);
+                    } else if this.page != Page::Generator {
+                        return;
+                    }
                     let input = if this.template_dialog_open {
                         &this.template_rule_search
                     } else {
@@ -115,7 +120,12 @@ impl Render for SwiftSubApp {
             .v_flex()
             .child(self.header())
             .child(self.nav_bar(cx))
-            .child(div().flex_1().min_h_0().child(self.page_view(cx)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.page_view(window.viewport_size().width, cx)),
+            )
             .when(self.add_open, |this| this.child(self.add_dialog(cx)))
             .when_some(self.confirm_delete, |this, id| {
                 this.child(self.confirm_delete_dialog(id, cx))
@@ -167,12 +177,12 @@ impl Render for SwiftSubApp {
 }
 
 impl SwiftSubApp {
-    fn page_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn page_view(&mut self, width: Pixels, cx: &mut Context<Self>) -> AnyElement {
         match self.page {
             Page::Subscriptions => self.subscriptions_page(cx),
-            Page::Generator => self.generator_page(cx),
+            Page::Generator => self.generator_page(width, cx),
             Page::Templates => self.templates_page(cx),
-            Page::Settings => self.settings_page(cx),
+            Page::Settings => self.settings_page(width, cx),
         }
     }
 
@@ -1866,8 +1876,8 @@ impl SwiftSubApp {
         } else {
             match self.template_tab {
             TemplateTab::Advanced => v_flex().flex_1().min_h_0().gap_2()
-                .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child("编辑 JSON 后点击更新草稿。chains.hops 按入口到落地填写节点名称或 source_key（2–16 跳）。listeners 每项填写 name / port / proxy；proxy 可指向节点或策略组。extra_yaml 为顶层 YAML 字符串，可覆盖 DNS 或添加其他设置。"))
-                .child(Textarea::new(&self.advanced_draft).h(px(280.)))
+                .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child("编辑 DNS、监听或链路 JSON 后，先校验并更新草稿，再应用配置。链路按入口到落地填写 2–16 个节点。"))
+                .child(div().flex_1().min_h_0().child(Textarea::new(&self.advanced_draft).h_full()))
                 .child(h_flex().gap_2().child(Button::new("advanced-validate").primary().label("校验并更新草稿").on_click(cx.listener(|this,_,_,cx|this.update_advanced_draft(cx))))
                     .child(Button::new("advanced-reset").ghost().label("重载已更新草稿").on_click(cx.listener(|this,_,window,cx|this.reset_advanced_draft(window,cx)))))
                 .into_any_element(),
@@ -1891,44 +1901,33 @@ impl SwiftSubApp {
             TemplateTab::Tools => div().id("workspace-tools").flex_1().min_h_0().overflow_y_scrollbar().child(v_flex().gap_4().child(self.custom_groups_section(cx)).child(self.chains_section(cx))).into_any_element(),
             TemplateTab::PolicyGroups => self.template_policy_groups_panel(cx),
             TemplateTab::RuleSets => v_flex()
-                .flex_1()
-                .min_h_0()
-                .gap_2()
-                .child(
-                    h_flex()
-                        .justify_between()
-                        .child(field_label("规则集"))
-                        .child(
-                            div()
-                                .text_size(px(11.5))
-                                .text_color(rgb(MUTED))
-                                .child(format!("MetaCubeX 镜像：{source}")),
-                        ),
-                )
-                .child(Input::new(&self.template_rule_search).cleanable(true))
-                .child(h_flex().gap_2()
-                    .child(Button::new("rules-selected-only").ghost().label(if self.template_rules_selected_only {"仅已选 ✓"}else{"全部规则"}).on_click(cx.listener(|this,_,_,cx|{this.template_rules_selected_only=!this.template_rules_selected_only;cx.notify();})))
-                    .child(Button::new("rules-target-filter").ghost().label(if self.template_rules_target_filter.is_empty(){"目标：全部 ▾".to_string()}else{format!("目标：{} ▾",self.template_rules_target_filter)}).on_click(cx.listener(|this,_,_,cx|this.open_template_target_picker("__target_filter__".into(),cx)))))
-                .child(div().text_size(px(11.)).text_color(rgb(MUTED))
-                    .child("展开来源勾选规则集，可同时使用多个来源；来源内全选和清空互不影响。"))
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .child(Input::new(&self.template_rule_url).cleanable(true)),
-                        )
-                        .child(
-                            Button::new("add-rule-set-url")
-                                .ghost()
-                                .label("添加链接")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.add_template_rule_set_url(window, cx)
-                                })),
-                        ),
-                )
+                .flex_1().min_h_0().gap_2()
+                .child(h_flex().gap_2().flex_wrap().flex_shrink_0()
+                    .child(div().flex_1().min_w(px(160.)).child(Input::new(&self.template_rule_search).cleanable(true)))
+                    .child(Button::new("rules-selected-only").ghost().small()
+                        .label(if self.template_rules_selected_only {"仅已选 ✓"} else {"仅已选"})
+                        .on_click(cx.listener(|this,_,_,cx| {this.template_rules_selected_only = !this.template_rules_selected_only; cx.notify();})))
+                    .child(Button::new("rules-target-filter").ghost().small()
+                        .label(if self.template_rules_target_filter.is_empty() {"全部目标 ▾".to_string()} else {format!("{} ▾", self.template_rules_target_filter)})
+                        .on_click(cx.listener(|this,_,_,cx| this.open_template_target_picker("__target_filter__".into(),cx))))
+                    .child(Button::new("rules-link-toggle").ghost().small()
+                        .label(if self.template_rule_link_open {"收起链接"} else {"添加链接"})
+                        .on_click(cx.listener(|this,_,_,cx| {this.template_rule_link_open = !this.template_rule_link_open; cx.notify();}))))
+                .when(!query.is_empty() || self.template_rules_selected_only || !self.template_rules_target_filter.is_empty(), |column| {
+                    column.child(h_flex().justify_between().flex_shrink_0()
+                        .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(format!("匹配 {visible_count} 条规则集")))
+                        .child(Button::new("clear-rule-filters").ghost().small().label("清除筛选")
+                            .on_click(cx.listener(|this,_,window,cx| {
+                                this.template_rules_selected_only = false;
+                                this.template_rules_target_filter.clear();
+                                this.template_rule_search.update(cx, |input,cx| input.set_value("",window,cx));
+                                cx.notify();
+                            }))))
+                })
+                .when(self.template_rule_link_open, |column| column.child(h_flex().gap_2().flex_shrink_0()
+                    .child(div().flex_1().min_w_0().child(Input::new(&self.template_rule_url).cleanable(true)))
+                    .child(Button::new("add-rule-set-url").primary().small().label("加入规则集")
+                        .on_click(cx.listener(|this,_,window,cx| this.add_template_rule_set_url(window,cx))))))
                 .child(
                     div()
                         .id("template-rule-set-list")
@@ -1946,7 +1945,7 @@ impl SwiftSubApp {
                     div()
                         .text_size(px(11.5))
                         .text_color(rgb(MUTED))
-                        .child("点击蓝色目标选择策略组；选择规则会启用对应服务组，组和规则一起保存到模板。"),
+                        .child(format!("可同时勾选多个来源 · 点击蓝色目标绑定策略组 · MetaCubeX 镜像：{source}")),
                 )
                 .into_any_element(),
             TemplateTab::CustomRules => v_flex()
@@ -1954,7 +1953,7 @@ impl SwiftSubApp {
                 .min_h_0()
                 .gap_2()
                 .child(field_label("自定义规则（Mihomo 语法）"))
-                .child(Textarea::new(&self.template_custom_rules).h(px(330.)))
+                .child(div().flex_1().min_h_0().child(Textarea::new(&self.template_custom_rules).h_full()))
                 .child(
                     div()
                         .text_size(px(11.5))
@@ -1974,61 +1973,71 @@ impl SwiftSubApp {
         let embedded = self.page == Page::Generator;
         let panel = v_flex()
             .when(embedded, |this| this.size_full().min_w_0().min_h_0())
-            .when(!embedded, |this| this.w(px(660.)).h(px(620.)))
-            .p(px(22.))
-            .gap_3()
-            .rounded(px(14.))
+            .when(!embedded, |this| this.w(px(760.)).h(px(600.)))
+            .p(px(14.))
+            .gap_2()
             .bg(rgb(SURFACE))
-            .border_1()
-            .border_color(rgb(BORDER))
+            .when(!embedded, |this| {
+                this.rounded(px(14.)).border_1().border_color(rgb(BORDER))
+            })
             .child(
                 h_flex()
-                    .justify_between()
+                    .gap_3()
+                    .flex_shrink_0()
                     .child(
                         div()
-                            .text_size(px(17.))
+                            .text_size(px(16.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("分流配置模板"),
+                            .child("分流编辑"),
                     )
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(11.))
                             .text_color(rgb(MUTED))
                             .child(header_count),
                     ),
             )
-            .child(field_label("模板名称（保存模板时必填）"))
-            .child(Input::new(&self.template_name).cleanable(true))
             .child(
                 h_flex()
                     .gap_1()
                     .flex_wrap()
-                    .child(self.template_tab_pill("变更预览", TemplateTab::Changes, cx))
-                    .child(self.template_tab_pill("规则顺序", TemplateTab::RuleOrder, cx))
+                    .flex_shrink_0()
                     .child(self.template_tab_pill("策略组", TemplateTab::PolicyGroups, cx))
                     .child(self.template_tab_pill("规则集", TemplateTab::RuleSets, cx))
                     .child(self.template_tab_pill("自定义规则", TemplateTab::CustomRules, cx))
+                    .child(self.template_tab_pill("规则顺序", TemplateTab::RuleOrder, cx))
+                    .child(self.template_tab_pill("筛选与链式", TemplateTab::Tools, cx))
                     .child(self.template_tab_pill("高级配置", TemplateTab::Advanced, cx))
-                    .child(self.template_tab_pill("筛选与链式", TemplateTab::Tools, cx)),
+                    .child(self.template_tab_pill("变更预览", TemplateTab::Changes, cx)),
             )
             .child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(rgb(MUTED))
-                    .child(self.template_change_summary(cx)),
+                h_flex()
+                    .gap_2()
+                    .flex_shrink_0()
+                    .min_w_0()
+                    .when(self.recovered_draft, |row| {
+                        row.child(tag("已恢复草稿", ACCENT))
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(10.5))
+                            .text_color(rgb(MUTED))
+                            .child(self.template_change_summary(cx)),
+                    ),
             )
-            .when(self.recovered_draft, |this| {
-                this.child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(ACCENT))
-                        .child("已恢复未应用草稿，确认后应用或放弃。"),
-                )
-            })
             .child(tab_content)
             .when_some(self.template_error.clone(), |this, error| {
                 this.child(
                     div()
+                        .id("template-error")
+                        .max_h(px(64.))
+                        .overflow_y_scrollbar()
                         .text_size(px(12.))
                         .text_color(rgb(DANGER))
                         .child(error),
@@ -2038,24 +2047,33 @@ impl SwiftSubApp {
                 h_flex()
                     .gap_2()
                     .flex_wrap()
-                    .justify_end()
+                    .flex_shrink_0()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .min_w(px(140.))
+                            .flex_1()
+                            .child(Input::new(&self.template_name).cleanable(true)),
+                    )
                     .child(
                         Button::new("template-cancel")
                             .ghost()
                             .label(if self.template_discard_armed {
                                 "放弃草稿"
                             } else {
-                                "取消"
+                                "关闭编辑"
                             })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.request_close_template(window, cx)
                             })),
                     )
-                    .when(self.page == Page::Generator, |this| {
-                        this.child(
+                    .when(embedded, |row| {
+                        row.child(
                             Button::new("template-apply")
-                                .ghost()
-                                .label("仅应用")
+                                .primary()
+                                .label("应用配置")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.apply_template_rule_sets(window, cx)
                                 })),
@@ -2063,11 +2081,11 @@ impl SwiftSubApp {
                     })
                     .child(
                         Button::new("template-save")
-                            .primary()
+                            .ghost()
                             .label(if self.template_edit_id.is_some() {
-                                "更新并应用"
+                                "更新模板并应用"
                             } else {
-                                "保存并应用"
+                                "存为模板并应用"
                             })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.save_current_template(window, cx)
@@ -2576,13 +2594,24 @@ impl SwiftSubApp {
             .into_any_element()
     }
 
-    fn generator_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let mut panels = h_resizable("configuration-workspace");
+    fn generator_page(&mut self, width: Pixels, cx: &mut Context<Self>) -> AnyElement {
+        let stacked_preview = self.preview_open && width < px(1380.);
+        let layout_id = match (self.template_dialog_open, stacked_preview) {
+            (true, true) => "workspace-edit-stacked",
+            (true, false) => "workspace-edit-wide",
+            (false, true) => "workspace-browse-stacked",
+            (false, false) => "workspace-browse-wide",
+        };
+        let mut panels = h_resizable(layout_id);
         if self.nodes_panel_open {
             panels = panels.child(
                 resizable_panel()
-                    .size(px(300.))
-                    .size_range(px(220.)..px(500.))
+                    .size(px(if self.template_dialog_open {
+                        250.
+                    } else {
+                        300.
+                    }))
+                    .size_range(px(230.)..px(460.))
                     .child(self.generator_nodes_panel(cx)),
             );
         }
@@ -2591,15 +2620,42 @@ impl SwiftSubApp {
         } else {
             self.generator_config_panel(cx)
         };
-        panels = panels.child(resizable_panel().child(editor));
-        if self.preview_open {
+        let editor = if stacked_preview {
+            v_resizable(if self.template_dialog_open {
+                "edit-preview-stack"
+            } else {
+                "browse-preview-stack"
+            })
+            .child(resizable_panel().child(editor))
+            .child(
+                resizable_panel()
+                    .size(px(190.))
+                    .size_range(px(140.)..px(420.))
+                    .child(self.generator_preview(false, cx)),
+            )
+            .into_any_element()
+        } else {
+            editor
+        };
+        panels = panels.child(
+            resizable_panel()
+                .size_range(px(420.)..px(3000.))
+                .child(editor),
+        );
+        if self.preview_open && !stacked_preview {
             panels = panels.child(
                 resizable_panel()
-                    .size(px(380.))
-                    .size_range(px(260.)..px(1000.))
-                    .child(self.generator_preview(cx)),
+                    .size(px(340.))
+                    .size_range(px(280.)..px(1000.))
+                    .child(self.generator_preview(true, cx)),
             );
         }
+        let profile_name = self
+            .profiles
+            .iter()
+            .find(|p| p.id == self.profile_id)
+            .map(|p| p.name.as_str())
+            .unwrap_or("当前配置");
         v_flex()
             .size_full()
             .min_h_0()
@@ -2629,20 +2685,28 @@ impl SwiftSubApp {
                             .flex_1()
                             .text_size(px(12.))
                             .text_color(rgb(MUTED))
-                            .child(if self.template_dialog_open {
-                                "正在编辑草稿 · 应用后更新订阅输出"
-                            } else {
-                                "当前配置 · 拖动分隔线调整面板宽度"
-                            }),
+                            .min_w_0()
+                            .truncate()
+                            .child(format!(
+                                "{} · {}",
+                                profile_name,
+                                if self.template_dialog_open {
+                                    "编辑草稿"
+                                } else {
+                                    "当前输出"
+                                }
+                            )),
                     )
-                    .child(
-                        Button::new("workspace-edit")
-                            .ghost()
-                            .label("编辑分流")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_template_dialog(window, cx)
-                            })),
-                    )
+                    .when(!self.template_dialog_open, |bar| {
+                        bar.child(
+                            Button::new("workspace-edit")
+                                .ghost()
+                                .label("编辑分流")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_template_dialog(window, cx)
+                                })),
+                        )
+                    })
                     .child(
                         Button::new("workspace-preview")
                             .ghost()
@@ -2742,39 +2806,27 @@ impl SwiftSubApp {
                     .gap_2()
                     .child(
                         h_flex()
-                            .justify_between()
+                            .gap_2()
                             .child(
                                 div()
-                                    .text_size(px(16.))
+                                    .flex_1()
+                                    .text_size(px(15.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child("节点管理"),
                             )
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_size(px(11.5))
-                                            .text_color(rgb(MUTED))
-                                            .child(node_summary),
-                                    )
-                                    .child(text_action(
-                                        "batch-rename-open",
-                                        "批量改名",
-                                        ACCENT,
-                                        cx,
-                                        |this, _, cx| this.open_batch_rename(cx),
-                                    ))
-                                    .when(!self.preview_open, |this| {
-                                        this.child(text_action(
-                                            "open-preview",
-                                            "预览",
-                                            ACCENT,
-                                            cx,
-                                            |this, _, cx| this.toggle_preview(cx),
-                                        ))
-                                    }),
-                            ),
+                            .child(text_action(
+                                "batch-rename-open",
+                                "批量改名",
+                                ACCENT,
+                                cx,
+                                |this, _, cx| this.open_batch_rename(cx),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(MUTED))
+                            .child(node_summary),
                     )
                     .child(Input::new(&self.search).cleanable(true)),
             )
@@ -2849,118 +2901,122 @@ impl SwiftSubApp {
         let name = node.name().to_string();
         let source_id = node.source_id.clone();
         let yaml = node.proxy.to_yaml_text().unwrap_or_default();
-        let enabled = node.enabled;
         let switch = Switch::new(format!("node-switch-{key}"))
             .small()
-            .checked(enabled)
+            .checked(node.enabled)
             .on_change(cx.listener({
                 let key = key.clone();
                 move |this, checked, _, cx| this.toggle_node(key.clone(), *checked, cx)
             }));
-
-        h_flex()
+        let name_cell = div()
+            .id(format!("node-name-{key}"))
+            .flex_1()
+            .min_w_0()
+            .text_size(px(12.5))
+            .text_color(rgb(if node.enabled { TEXT } else { MUTED }))
+            .truncate()
+            .cursor_pointer()
+            .child(name.clone())
+            .on_double_click(cx.listener({
+                let key = key.clone();
+                let name = name.clone();
+                let source_id = source_id.clone();
+                let yaml = yaml.clone();
+                move |this, _, window, cx| {
+                    this.open_node_rename(
+                        key.clone(),
+                        source_id.clone(),
+                        name.clone(),
+                        yaml.clone(),
+                        window,
+                        cx,
+                    )
+                }
+            }));
+        v_flex()
             .id(format!("node-row-{key}"))
-            .min_h(px(58.))
-            .px_3()
+            .min_h(px(64.))
+            .px_2()
+            .py_1()
             .gap_1()
+            .justify_center()
             .border_b_1()
             .border_color(rgb(BORDER))
+            .hover(|style| style.bg(rgb(SURFACE_2)))
             .child(
-                div()
-                    .id(format!("node-drag-{key}"))
-                    .w(px(22.))
-                    .h(px(30.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(6.))
-                    .text_size(px(12.))
-                    .text_color(rgb(MUTED))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(SURFACE_2)))
-                    .child("≡")
-                    .on_drag(
-                        NodeDrag {
-                            key: key.clone(),
-                            name: name.clone(),
-                        },
-                        |drag, _, _, cx| {
-                            cx.new(|_| NodeDragPreview {
-                                name: drag.name.clone(),
-                            })
-                        },
-                    ),
-            )
-            .child(switch)
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
+                h_flex()
                     .gap_1()
                     .child(
                         div()
-                            .id(format!("node-name-{key}"))
+                            .id(format!("node-drag-{key}"))
+                            .w(px(18.))
+                            .h(px(24.))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.))
+                            .text_size(px(12.))
+                            .text_color(rgb(MUTED))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(SURFACE_3)))
+                            .child("≡")
+                            .on_drag(
+                                NodeDrag {
+                                    key: key.clone(),
+                                    name: name.clone(),
+                                },
+                                |drag, _, _, cx| {
+                                    cx.new(|_| NodeDragPreview {
+                                        name: drag.name.clone(),
+                                    })
+                                },
+                            ),
+                    )
+                    .child(name_cell)
+                    .child(switch),
+            )
+            .child(
+                h_flex()
+                    .pl(px(22.))
+                    .gap_1()
+                    .child(tag(node.region.label(), MUTED))
+                    .child(
+                        div()
                             .flex_1()
                             .min_w_0()
-                            .text_size(px(12.5))
                             .truncate()
-                            .cursor_pointer()
-                            .child(name.clone())
-                            .on_double_click(cx.listener({
-                                let key = key.clone();
-                                let name = name.clone();
-                                let source_id = source_id.clone();
-                                let yaml = yaml.clone();
-                                move |this, _, window, cx| {
-                                    this.open_node_rename(
-                                        key.clone(),
-                                        source_id.clone(),
-                                        name.clone(),
-                                        yaml.clone(),
-                                        window,
-                                        cx,
-                                    )
-                                }
-                            })),
+                            .text_size(px(10.))
+                            .text_color(rgb(MUTED))
+                            .child(node.proxy.kind().to_uppercase()),
                     )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(tag(node.region.label(), MUTED))
-                            .child(
-                                div()
-                                    .text_size(px(10.))
-                                    .text_color(rgb(MUTED))
-                                    .child(node.proxy.kind().to_uppercase()),
-                            ),
-                    ),
+                    .child(icon_action(format!("share-node-{key}"), "▦", MUTED, cx, {
+                        let key = key.clone();
+                        move |this, _, cx| this.share_node_qr(&key, cx)
+                    }))
+                    .child(icon_action(
+                        format!("rename-node-{key}"),
+                        "✎",
+                        MUTED,
+                        cx,
+                        {
+                            let key = key.clone();
+                            let name = name.clone();
+                            let source_id = source_id.clone();
+                            let yaml = yaml.clone();
+                            move |this, window, cx| {
+                                this.open_node_rename(
+                                    key.clone(),
+                                    source_id.clone(),
+                                    name.clone(),
+                                    yaml.clone(),
+                                    window,
+                                    cx,
+                                )
+                            }
+                        },
+                    )),
             )
-            .child(icon_action(format!("share-node-{key}"), "▦", MUTED, cx, {
-                let key = key.clone();
-                move |this, _, cx| this.share_node_qr(&key, cx)
-            }))
-            .child(icon_action(
-                format!("rename-node-{key}"),
-                "✎",
-                MUTED,
-                cx,
-                {
-                    let key = key.clone();
-                    let name = name.clone();
-                    let source_id = source_id.clone();
-                    let yaml = yaml.clone();
-                    move |this, window, cx| {
-                        this.open_node_rename(
-                            key.clone(),
-                            source_id.clone(),
-                            name.clone(),
-                            yaml.clone(),
-                            window,
-                            cx,
-                        )
-                    }
-                },
-            ))
             .on_drop(cx.listener(move |this, drag: &NodeDrag, _, cx| {
                 this.move_node(drag.key.clone(), key.clone(), cx)
             }))
@@ -3634,37 +3690,30 @@ impl SwiftSubApp {
             .into_any_element()
     }
 
-    fn generator_preview(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let mut header = h_flex()
+    fn generator_preview(&mut self, show_url: bool, cx: &mut Context<Self>) -> AnyElement {
+        let stats = || {
+            h_flex()
+                .flex_wrap()
+                .gap_2()
+                .child(stat_chip("节点", self.stats.proxies))
+                .child(stat_chip("代理组", self.stats.groups))
+                .child(stat_chip("规则", self.stats.rules))
+                .child(stat_chip("规则集", self.stats.rule_sets))
+        };
+        let header = h_flex()
+            .gap_2()
             .flex_wrap()
             .min_w_0()
-            .px(px(16.))
-            .py(px(12.))
-            .gap_2()
-            .border_b_1()
-            .border_color(rgb(BORDER))
             .child(
                 div()
                     .flex_1()
-                    .min_w_0()
+                    .min_w(px(85.))
+                    .flex_shrink_0()
                     .text_size(px(16.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .whitespace_nowrap()
-                    .child("预览"),
+                    .child("当前输出"),
             )
-            .child(div().flex_1().min_w_0())
-            .child(stat_chip("节点", self.stats.proxies))
-            .child(stat_chip("代理组", self.stats.groups))
-            .child(stat_chip("规则", self.stats.rules))
-            .child(stat_chip("规则集", self.stats.rule_sets));
-
-        header = header
-            .child(
-                Button::new("export-preview")
-                    .ghost()
-                    .label("导出")
-                    .on_click(cx.listener(|this, _, _, cx| this.export_preview(cx))),
-            )
+            .when(!show_url, |row| row.child(stats()))
             .child(
                 Button::new("copy-preview")
                     .primary()
@@ -3678,6 +3727,15 @@ impl SwiftSubApp {
                 cx,
                 |this, _, cx| this.toggle_preview(cx),
             ));
+        let header = v_flex()
+            .px(px(16.))
+            .py(px(10.))
+            .gap_2()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .child(header)
+            .when(show_url, |column| column.child(stats()));
 
         let mut body = div()
             .id("preview-scroll")
@@ -3781,7 +3839,7 @@ impl SwiftSubApp {
             panel = panel.child(banner);
         }
 
-        if let Some(url) = &self.server_url {
+        if let Some(url) = self.server_url.as_ref().filter(|_| show_url) {
             panel = panel.child(
                 h_flex()
                     .min_w_0()
@@ -4128,10 +4186,25 @@ impl SwiftSubApp {
             rows = rows.child(
                 h_flex()
                     .gap_2()
-                    .child(div().flex_1().child(profile.name.clone()))
+                    .px_3()
+                    .py_1()
+                    .rounded(px(8.))
+                    .bg(rgb(if id == self.profile_id {
+                        ACCENT_SOFT
+                    } else {
+                        SURFACE_2
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(profile.name.clone()),
+                    )
                     .child(
                         Button::new(format!("profile-{id}"))
                             .ghost()
+                            .disabled(id == self.profile_id)
                             .label(if id == self.profile_id {
                                 "当前配置"
                             } else {
@@ -4144,10 +4217,12 @@ impl SwiftSubApp {
             );
         }
         rows = rows
+            .child(div().pt_2().child(field_label("当前配置名称")))
             .child(Input::new(&self.profile_name_input).cleanable(true))
             .child(
                 h_flex()
                     .gap_2()
+                    .flex_wrap()
                     .child(
                         Button::new("create-profile")
                             .label("复制为新配置")
@@ -4176,26 +4251,44 @@ impl SwiftSubApp {
             rows.child(div().text_sm().text_color(rgb(MUTED)).child(
                 "规则与订阅选择独立保存；所有配置地址同时可用。订阅内容缓存与节点编辑共享。",
             ));
+        rows = rows.child(div().pt_2().child(field_label("此配置包含的订阅")));
         rows = rows.child(
-            Button::new("profile-all-sources")
-                .ghost()
-                .label("包含全部订阅（含以后新增）")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.profile_membership = None;
-                    this.refresh_profile_nodes(cx);
-                })),
-        );
-        rows = rows.child(
-            Button::new("subscription-qr")
-                .ghost()
-                .label("订阅二维码")
-                .on_click(cx.listener(|this, _, _, cx| this.share_subscription_qr(cx))),
+            h_flex()
+                .gap_2()
+                .flex_wrap()
+                .child(
+                    Button::new("profile-all-sources")
+                        .ghost()
+                        .label(if self.profile_membership.is_none() {
+                            "✓ 全部订阅（含以后新增）"
+                        } else {
+                            "改为包含全部订阅（含以后新增）"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.profile_membership = None;
+                            this.refresh_profile_nodes(cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED))
+                        .child(format!(
+                            "已包含 {} / {} 个订阅",
+                            self.subscriptions
+                                .iter()
+                                .filter(|sub| self.profile_includes(sub.id))
+                                .count(),
+                            self.subscriptions.len()
+                        )),
+                ),
         );
         for sub in &self.subscriptions {
             let id = sub.id;
             rows = rows.child(
                 h_flex()
                     .gap_2()
+                    .flex_wrap()
                     .child(
                         Switch::new(format!("profile-sub-{id}"))
                             .checked(self.profile_includes(id))
@@ -4206,10 +4299,17 @@ impl SwiftSubApp {
                     .child(sub.name.clone()),
             );
         }
-        settings_section("多配置管理", vec![rows.into_any_element()], div())
+        settings_section(
+            "多配置管理",
+            vec![rows.into_any_element()],
+            Button::new("subscription-qr")
+                .ghost()
+                .label("订阅二维码")
+                .on_click(cx.listener(|this, _, _, cx| this.share_subscription_qr(cx))),
+        )
     }
 
-    fn settings_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn settings_page(&mut self, width: Pixels, cx: &mut Context<Self>) -> AnyElement {
         let service_url = self
             .server_url
             .clone()
@@ -4372,48 +4472,79 @@ impl SwiftSubApp {
             ),
         );
 
-        let columns = h_flex()
-            .items_start()
-            .gap_4()
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_4()
-                    .child(service_section)
-                    .child(generation_section),
-            )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_4()
-                    .child(self.profile_settings(cx))
-                    .child(self.desktop_settings(cx))
-                    .child(data_section),
+        let section = match self.settings_tab {
+            SettingsTab::Profiles => self.profile_settings(cx),
+            SettingsTab::Service => service_section,
+            SettingsTab::Generation => generation_section,
+            SettingsTab::Desktop => self.desktop_settings(cx),
+            SettingsTab::Data => data_section,
+        };
+        let compact = width < px(1100.);
+        let mut navigation = div()
+            .flex()
+            .gap_2()
+            .when(compact, |nav| nav.flex_row().flex_wrap())
+            .when(!compact, |nav| nav.flex_col().w(px(160.)).flex_shrink_0());
+        for (tab, label) in [
+            (SettingsTab::Profiles, "配置管理"),
+            (SettingsTab::Service, "本地订阅"),
+            (SettingsTab::Generation, "规则与生成"),
+            (SettingsTab::Desktop, "桌面与草稿"),
+            (SettingsTab::Data, "数据与关于"),
+        ] {
+            let active = tab == self.settings_tab;
+            navigation = navigation.child(
+                div()
+                    .id(format!("settings-tab-{tab:?}"))
+                    .cursor_pointer()
+                    .px_3()
+                    .py_2()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(rgb(if active { ACCENT } else { BORDER }))
+                    .bg(rgb(if active { ACCENT_SOFT } else { SURFACE }))
+                    .text_size(px(13.))
+                    .text_color(rgb(if active { TEXT } else { MUTED }))
+                    .hover(|s| s.bg(rgb(SURFACE_2)))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings_tab = tab;
+                        this.settings_scroll.set_offset(point(px(0.), px(0.)));
+                        cx.notify();
+                    })),
             );
-
-        let mut content = v_flex().gap_4();
+        }
+        let mut content = v_flex().gap_3().w_full().min_w_0();
         if let Some(error) = &self.store_error {
             content = content.child(banner(error.clone(), WARNING));
         }
-        content = content.child(columns);
-
+        content = content.child(section);
         v_flex()
             .size_full()
             .min_h_0()
-            .p(px(24.))
-            .gap_4()
+            .p(px(20.))
+            .gap_3()
             .child(self.page_title("设置", div()))
             .child(
                 div()
-                    .id("settings-scroll")
+                    .flex()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.settings_scroll)
-                    .child(content)
-                    .vertical_scrollbar(&self.settings_scroll),
+                    .gap_4()
+                    .when(compact, |body| body.flex_col())
+                    .when(!compact, |body| body.flex_row())
+                    .child(navigation)
+                    .child(
+                        div()
+                            .id("settings-scroll")
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.settings_scroll)
+                            .child(content)
+                            .vertical_scrollbar(&self.settings_scroll),
+                    ),
             )
             .into_any_element()
     }

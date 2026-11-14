@@ -42,6 +42,15 @@ pub enum Page {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsTab {
+    Profiles,
+    Service,
+    Generation,
+    Desktop,
+    Data,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TemplateTab {
     PolicyGroups,
     RuleSets,
@@ -370,6 +379,8 @@ pub struct SwiftSubApp {
     pub template_custom_rules: Entity<TextareaState>,
     pub advanced_draft: Entity<TextareaState>,
     pub template_tab: TemplateTab,
+    pub template_rule_link_open: bool,
+    pub settings_tab: SettingsTab,
     pub template_rule_sources_collapsed: HashSet<String>,
     pub module_categories_collapsed: HashSet<String>,
     pub profiles: Vec<swiftsub_store::Profile>,
@@ -472,7 +483,8 @@ impl SwiftSubApp {
         let node_rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("节点名称"));
         let node_edit_textarea =
             cx.new(|cx| TextareaState::new(window, cx).placeholder("节点配置 YAML"));
-        let template_name = cx.new(|cx| InputState::new(window, cx).placeholder("规则集模板名称"));
+        let template_name =
+            cx.new(|cx| InputState::new(window, cx).placeholder("模板名称（保存模板时填写）"));
         let template_rule_search =
             cx.new(|cx| InputState::new(window, cx).placeholder("搜索规则集…"));
         let template_rule_url = cx
@@ -685,6 +697,8 @@ impl SwiftSubApp {
             template_custom_rules,
             advanced_draft,
             template_tab: TemplateTab::RuleSets,
+            template_rule_link_open: false,
+            settings_tab: SettingsTab::Profiles,
             template_rule_sources_collapsed: rule_catalog::SOURCES
                 .iter()
                 .map(|source| source.id.to_string())
