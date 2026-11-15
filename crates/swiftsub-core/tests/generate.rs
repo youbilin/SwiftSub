@@ -671,3 +671,25 @@ fn presets_and_legacy_region_selection_do_not_create_region_groups() {
         }
     }
 }
+
+#[test]
+fn retired_region_targets_migrate_but_authored_groups_survive() {
+    use swiftsub_core::model::PolicyGroupSpec;
+    let mut options = GenerateOptions::default();
+    options.policy_groups.push(PolicyGroupSpec {
+        name: "香港".into(),
+        builtin: true,
+        ..Default::default()
+    });
+    options
+        .custom_rules
+        .push(Rule::parse("DOMAIN-SUFFIX,example.test,香港").unwrap());
+    let profile = generate_profile(&sample_nodes(), &options).unwrap();
+    assert!(profile.yaml.contains("DOMAIN-SUFFIX,example.test,节点选择"));
+    assert!(!profile.groups.iter().any(|g| g.name == "香港"));
+    options.policy_groups[0].builtin = false;
+    options.policy_groups[0].include_all_nodes = true;
+    let profile = generate_profile(&sample_nodes(), &options).unwrap();
+    assert!(profile.groups.iter().any(|g| g.name == "香港"));
+    assert!(profile.yaml.contains("DOMAIN-SUFFIX,example.test,香港"));
+}

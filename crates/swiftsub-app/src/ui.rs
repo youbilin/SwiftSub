@@ -1,3 +1,4 @@
+mod saved_configs;
 use gpui_kit::base::{Disableable as _, InteractiveElementExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, Textarea};
@@ -182,6 +183,7 @@ impl SwiftSubApp {
             Page::Subscriptions => self.subscriptions_page(cx),
             Page::Generator => self.generator_page(width, cx),
             Page::Templates => self.templates_page(cx),
+            Page::SavedConfigs => self.saved_configs_page(cx),
             Page::Settings => self.settings_page(width, cx),
         }
     }
@@ -216,6 +218,7 @@ impl SwiftSubApp {
             .border_color(rgb(BORDER))
             .child(self.nav_item("订阅源", Page::Subscriptions, cx))
             .child(self.nav_item("配置生成", Page::Generator, cx))
+            .child(self.nav_item("我的配置", Page::SavedConfigs, cx))
             .child(self.nav_item("模板", Page::Templates, cx))
             .child(self.nav_item("设置", Page::Settings, cx))
             .child(div().flex_1())
@@ -1879,10 +1882,10 @@ impl SwiftSubApp {
         } else {
             match self.template_tab {
             TemplateTab::Advanced => v_flex().flex_1().min_h_0().gap_2()
-                .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child("编辑 DNS、监听或链路 JSON 后，先校验并更新草稿，再应用配置。链路按入口到落地填写 2–16 个节点。"))
+                .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child("编辑 DNS、监听或链路 JSON 后，先校验配置，自动保存。链路按入口到落地填写 2–16 个节点。"))
                 .child(div().flex_1().min_h_0().child(Textarea::new(&self.advanced_draft).h_full()))
-                .child(h_flex().gap_2().child(Button::new("advanced-validate").primary().label("校验并更新草稿").on_click(cx.listener(|this,_,_,cx|this.update_advanced_draft(cx))))
-                    .child(Button::new("advanced-reset").ghost().label("重载已更新草稿").on_click(cx.listener(|this,_,window,cx|this.reset_advanced_draft(window,cx)))))
+                .child(h_flex().gap_2().child(Button::new("advanced-validate").primary().label("校验配置").on_click(cx.listener(|this,_,_,cx|this.update_advanced_draft(cx))))
+                    .child(Button::new("advanced-reset").ghost().label("重载已保存配置").on_click(cx.listener(|this,_,window,cx|this.reset_advanced_draft(window,cx)))))
                 .into_any_element(),
             TemplateTab::Changes => {
                 let mut rows=v_flex().gap_2();
@@ -2644,10 +2647,16 @@ impl SwiftSubApp {
             );
         }
         let profile_name = self
-            .profiles
-            .iter()
-            .find(|p| p.id == self.profile_id)
-            .map(|p| p.name.as_str())
+            .editing_saved_config
+            .as_ref()
+            .and_then(|id| self.saved_configs.iter().find(|c| &c.id == id))
+            .map(|c| c.name.as_str())
+            .or_else(|| {
+                self.profiles
+                    .iter()
+                    .find(|p| p.id == self.profile_id)
+                    .map(|p| p.name.as_str())
+            })
             .unwrap_or("当前配置");
         v_flex()
             .size_full()
@@ -2723,6 +2732,24 @@ impl SwiftSubApp {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.diagnostics_open = true;
                                 cx.notify();
+                            })),
+                    )
+                    .when(self.editing_saved_config.is_some(), |bar| {
+                        bar.child(
+                            Button::new("update-saved-generated")
+                                .ghost()
+                                .label("更新原配置")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.save_generated_config(true, window, cx)
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("save-generated-new")
+                            .primary()
+                            .label("保存新配置")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save_generated_config(false, window, cx)
                             })),
                     )
                     .child(
@@ -3886,7 +3913,7 @@ impl SwiftSubApp {
             .child(self.builtin_template_row(
                 Preset::Standard,
                 "标准",
-                "常用地区与服务分流，满足多数场景",
+                "常用服务分流，满足多数场景",
                 cx,
             ))
             .child(self.builtin_template_row(Preset::Full, "完整", "启用全部服务与扩展规则集", cx));
@@ -4164,11 +4191,11 @@ impl SwiftSubApp {
     }
 
     fn desktop_settings(&self, cx: &mut Context<Self>) -> AnyElement {
-        settings_section("桌面与草稿",vec![
+        settings_section("桌面与编辑",vec![
             info_row("系统托盘",if self.desktop.available{"运行中"}else{"不可用"}.into(),false),
             h_flex().gap_3().child(Switch::new("close-to-tray").checked(self.close_to_tray).on_change(cx.listener(|this,value,_,cx|this.set_close_to_tray(*value,cx)))).child("关闭窗口时隐藏到托盘").into_any_element(),
             h_flex().gap_3().child(Switch::new("autostart").checked(self.autostart).on_change(cx.listener(|this,value,_,cx|this.set_autostart(*value,cx)))).child("开机自启（后台运行）").into_any_element(),
-            div().text_sm().text_color(rgb(MUTED)).child("草稿每两秒自动保存，重启后恢复；托盘右键可退出。未应用的高级文本也会保留。移动程序后请重新设置自启。").into_any_element(),
+            div().text_sm().text_color(rgb(MUTED)).child("分流修改每两秒自动保存；未完成的文本保留供下次继续。托盘右键可退出。移动程序后请重新设置自启。").into_any_element(),
         ],div())
     }
 
@@ -4482,7 +4509,7 @@ impl SwiftSubApp {
             (SettingsTab::Profiles, "配置管理"),
             (SettingsTab::Service, "本地订阅"),
             (SettingsTab::Generation, "规则与生成"),
-            (SettingsTab::Desktop, "桌面与草稿"),
+            (SettingsTab::Desktop, "桌面与编辑"),
             (SettingsTab::Data, "数据与关于"),
         ] {
             let active = tab == self.settings_tab;

@@ -1,3 +1,5 @@
+mod saved_configs;
+pub use saved_configs::SavedConfig;
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -62,6 +64,15 @@ CREATE TABLE IF NOT EXISTS profiles (
     options_json TEXT,
     last_yaml TEXT,
     generated_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS saved_configs (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    yaml TEXT NOT NULL,
+    source_json TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -254,6 +265,11 @@ impl Store {
                 conn.execute("ALTER TABLE node_overrides ADD COLUMN extras TEXT", [])?;
             }
             conn.pragma_update(None, "user_version", 2)?;
+        }
+
+        if version < 3 {
+            conn.execute_batch(SCHEMA)?;
+            conn.pragma_update(None, "user_version", 3)?;
         }
 
         Ok(Self { conn })

@@ -6327,6 +6327,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "swiftsub-core",
  "swiftsub-fetch",
  "swiftsub-server",

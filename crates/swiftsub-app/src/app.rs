@@ -1,5 +1,6 @@
 mod lifecycle;
 mod profiles;
+mod saved_configs;
 mod sharing;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -37,6 +38,7 @@ use crate::rule_catalog;
 pub enum Page {
     Subscriptions,
     Generator,
+    SavedConfigs,
     Templates,
     Settings,
 }
@@ -118,7 +120,19 @@ impl TemplateSnapshot {
         if !self.rule_provider_base_url.is_empty() {
             options.rule_provider_base_url = self.rule_provider_base_url.clone();
         }
+        options.remove_legacy_region_groups();
         Ok(options)
+    }
+
+    fn remove_legacy_regions(&mut self) {
+        if let Ok(options) = self.generate_options(&GenerateOptions::default()) {
+            self.enabled_modules = options.enabled_modules.unwrap_or_default();
+            self.policy_groups = options.policy_groups;
+            self.custom_rule_sets = options.custom_rule_sets;
+            self.custom_rule_lines = options.custom_rules.iter().map(Rule::to_line).collect();
+            self.rule_set_targets = options.rule_set_targets;
+            self.listeners = options.listeners;
+        }
     }
 }
 
@@ -329,6 +343,13 @@ pub struct SwiftSubApp {
     pub custom_groups: Vec<CustomGroupSpec>,
     pub chains: Vec<ChainSpec>,
     pub custom_templates: Vec<CustomTemplate>,
+    pub saved_configs: Vec<swiftsub_store::SavedConfig>,
+    pub saved_config_id: Option<String>,
+    pub saved_config_name: Entity<InputState>,
+    pub saved_config_yaml: Entity<TextareaState>,
+    pub saved_config_error: Option<String>,
+    pub saved_config_delete_armed: bool,
+    pub editing_saved_config: Option<String>,
     pub template_name: Entity<InputState>,
     pub template_error: Option<String>,
     pub template_dialog_open: bool,
@@ -605,6 +626,9 @@ impl SwiftSubApp {
             .list_profiles()
             .unwrap_or_default();
         let profile_name_input = cx.new(|cx| InputState::new(window, cx).placeholder("配置名称"));
+        let saved_config_name = cx.new(|cx| InputState::new(window, cx).placeholder("配置名称"));
+        let saved_config_yaml =
+            cx.new(|cx| TextareaState::new(window, cx).placeholder("选择或保存一份 YAML 配置"));
         let mut app = Self {
             desktop: crate::desktop::DesktopIntegration::new(window),
             close_to_tray: false,
@@ -648,6 +672,13 @@ impl SwiftSubApp {
             custom_groups: Vec::new(),
             chains: Vec::new(),
             custom_templates: Vec::new(),
+            saved_configs: Vec::new(),
+            saved_config_id: None,
+            saved_config_name,
+            saved_config_yaml,
+            saved_config_error: None,
+            saved_config_delete_armed: false,
+            editing_saved_config: None,
             template_name,
             template_error: None,
             template_dialog_open: false,
@@ -775,6 +806,10 @@ impl SwiftSubApp {
             cx.observe_in(&app.template_member_search, window, |_, _, _, cx| {
                 cx.notify()
             });
+        let saved_yaml_obs =
+            cx.observe_in(&app.saved_config_yaml, window, |_, _, _, cx| cx.notify());
+        let saved_name_obs =
+            cx.observe_in(&app.saved_config_name, window, |_, _, _, cx| cx.notify());
         let template_rule_search_obs =
             cx.observe_in(&app.template_rule_search, window, |_, _, _, cx| cx.notify());
         app._subscriptions = vec![
@@ -784,6 +819,8 @@ impl SwiftSubApp {
             chain_search_obs,
             template_rule_search_obs,
             member_search_obs,
+            saved_yaml_obs,
+            saved_name_obs,
         ];
 
         let args: Vec<String> = std::env::args().collect();
@@ -804,7 +841,8 @@ impl SwiftSubApp {
             .ok()
             .flatten()
             .and_then(|v| serde_json::from_str::<TemplateSnapshot>(&v).ok());
-        if let Some(snapshot) = recovered {
+        if let Some(mut snapshot) = recovered {
+            snapshot.remove_legacy_regions();
             // Existing individual settings remain authoritative for legacy UI actions.
             app.options.test_url = snapshot.test_url;
             app.options.test_interval = snapshot.test_interval;
@@ -816,6 +854,7 @@ impl SwiftSubApp {
         }
         app.load_module_config();
         app.load_templates();
+        app.reload_saved_configs();
         app.restore_selected_profile(window, cx);
         app.reload_subscriptions(cx);
         if demo_mode {
@@ -829,6 +868,7 @@ impl SwiftSubApp {
             app.page = match page.as_str() {
                 "generator" => Page::Generator,
                 "templates" => Page::Templates,
+                "configs" => Page::SavedConfigs,
                 "settings" => Page::Settings,
                 _ => Page::Subscriptions,
             };
@@ -990,6 +1030,10 @@ impl SwiftSubApp {
     }
 
     pub fn set_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(e) = self.checkpoint_yaml_editor(cx) {
+            self.saved_config_error = Some(e);
+            return;
+        }
         if self.template_dialog_open && page != Page::Generator {
             self.request_close_template(window, cx);
         }
@@ -997,10 +1041,15 @@ impl SwiftSubApp {
             match page {
                 Page::Generator => self.preview_scroll.set_offset(point(px(0.0), px(0.0))),
                 Page::Settings => self.settings_scroll.set_offset(point(px(0.0), px(0.0))),
-                Page::Subscriptions | Page::Templates => {}
+                Page::Subscriptions | Page::Templates | Page::SavedConfigs => {}
             }
         }
         self.page = page;
+        if page == Page::SavedConfigs && self.saved_config_id.is_none() {
+            if let Some(config) = self.saved_configs.first() {
+                self.open_saved_config(config.id.clone(), window, cx);
+            }
+        }
         cx.notify();
     }
 
@@ -3157,9 +3206,12 @@ impl SwiftSubApp {
     }
 
     pub fn request_close_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.autosave_routing(window, cx).is_ok() {
-            self.close_template_dialog(window, cx);
-            return;
+        match self.autosave_routing(window, cx) {
+            Ok(()) => {
+                self.close_template_dialog(window, cx);
+                return;
+            }
+            Err(e) => self.template_error = Some(e),
         }
         if let Err(error) = self.checkpoint_draft(cx) {
             self.show_toast(format!("编辑内容保存失败：{error}"), cx);
@@ -3299,12 +3351,13 @@ impl SwiftSubApp {
 
     fn load_template_draft(
         &mut self,
-        snapshot: TemplateSnapshot,
+        mut snapshot: TemplateSnapshot,
         name: String,
         id: Option<i64>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        snapshot.remove_legacy_regions();
         self.open_template_dialog(window, cx);
         self.template_base_options = snapshot.generate_options(&self.options).ok();
         self.template_edit_id = id;

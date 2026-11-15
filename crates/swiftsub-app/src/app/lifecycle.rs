@@ -31,7 +31,10 @@ impl SwiftSubApp {
         let weak = cx.entity().downgrade();
         window.on_window_should_close(cx, move |_, cx| {
             weak.update(cx, |this, cx| {
-                if let Err(e) = this.checkpoint_draft(cx) {
+                if let Err(e) = this
+                    .checkpoint_yaml_editor(cx)
+                    .and_then(|_| this.checkpoint_draft(cx))
+                {
                     this.show_toast(format!("草稿保存失败，窗口保持打开：{e}"), cx);
                     return false;
                 }
@@ -59,6 +62,9 @@ impl SwiftSubApp {
                     this.update(cx, |this, cx| {
                         ticks += 1;
                         if ticks % 4 == 0 {
+                            if let Err(e) = this.checkpoint_yaml_editor(cx) {
+                                this.saved_config_error = Some(e);
+                            }
                             if let Err(e) = this.autosave_routing(window, cx) {
                                 this.template_error = Some(e);
                             }
@@ -72,7 +78,10 @@ impl SwiftSubApp {
                                 crate::desktop::DesktopAction::Copy => this.copy_server_url(cx),
                                 crate::desktop::DesktopAction::Refresh => this.refresh_all(cx),
                                 crate::desktop::DesktopAction::Exit => {
-                                    match this.checkpoint_draft(cx) {
+                                    match this
+                                        .checkpoint_yaml_editor(cx)
+                                        .and_then(|_| this.checkpoint_draft(cx))
+                                    {
                                         Ok(()) => cx.quit(),
                                         Err(e) => {
                                             this.desktop.show();

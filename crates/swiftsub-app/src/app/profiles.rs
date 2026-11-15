@@ -1,10 +1,10 @@
 use super::*;
 
 #[derive(Clone, Serialize, Deserialize)]
-struct ProfileConfig {
-    routing: TemplateSnapshot,
+pub(super) struct ProfileConfig {
+    pub(super) routing: TemplateSnapshot,
     #[serde(default)]
-    membership: Option<HashSet<i64>>,
+    pub(super) membership: Option<HashSet<i64>>,
     #[serde(default = "default_filename")]
     filename: String,
 }
@@ -64,7 +64,8 @@ impl SwiftSubApp {
             .and_then(|p| p.options_json.as_deref());
         if let Some(data) = data {
             match serde_json::from_str::<ProfileConfig>(data) {
-                Ok(config) => {
+                Ok(mut config) => {
+                    config.routing.remove_legacy_regions();
                     if let Ok(options) =
                         config.routing.generate_options(&GenerateOptions::default())
                     {
@@ -102,9 +103,12 @@ impl SwiftSubApp {
     }
 
     pub fn switch_profile(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.template_dialog_open {
-            self.show_toast("请先应用或放弃分流草稿".into(), cx);
-            return;
+        if self.template_session_active {
+            self.request_close_template(window, cx);
+            if self.template_session_active {
+                self.show_toast("未完成的分流输入已保存，请修正后再切换配置".into(), cx);
+                return;
+            }
         }
         if let Err(e) = self.save_active_profile() {
             self.show_toast(e, cx);
@@ -135,9 +139,12 @@ impl SwiftSubApp {
     }
 
     pub fn create_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.template_dialog_open {
-            self.show_toast("请先应用或放弃分流草稿".into(), cx);
-            return;
+        if self.template_session_active {
+            self.request_close_template(window, cx);
+            if self.template_session_active {
+                self.show_toast("未完成的分流输入已保存，请修正后再切换配置".into(), cx);
+                return;
+            }
         }
         let name = self.profile_name_input.read(cx).value().trim().to_string();
         if name.is_empty() || self.profiles.iter().any(|p| p.name == name) {
@@ -339,6 +346,19 @@ impl SwiftSubApp {
                     update_interval_hours: 24,
                 },
             );
+        }
+        // Saved YAMLs are snapshots: shared-source refresh must never regenerate them.
+        if let Ok(configs) = self.store.lock().unwrap().list_saved_configs() {
+            for config in configs {
+                published.insert(
+                    config.id,
+                    ProfileSnapshot {
+                        yaml: config.yaml,
+                        userinfo_header: None,
+                        update_interval_hours: 24,
+                    },
+                );
+            }
         }
         server.replace_profiles(published);
     }
