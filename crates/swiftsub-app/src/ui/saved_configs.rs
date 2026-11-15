@@ -63,8 +63,26 @@ impl SwiftSubApp {
             .into_any_element()
     }
     pub(super) fn saved_configs_page(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut list = v_flex().gap_2().p_2();
-        for config in &self.saved_configs {
+        let config_query = self
+            .saved_editor
+            .config_search
+            .read(cx)
+            .value()
+            .to_lowercase();
+        let visible_count = self
+            .saved_configs
+            .iter()
+            .filter(|config| {
+                config_query.is_empty() || config.name.to_lowercase().contains(&config_query)
+            })
+            .count();
+        let mut list = v_flex()
+            .gap_2()
+            .p_2()
+            .child(Input::new(&self.saved_editor.config_search).cleanable(true));
+        for config in self.saved_configs.iter().filter(|config| {
+            config_query.is_empty() || config.name.to_lowercase().contains(&config_query)
+        }) {
             let id = config.id.clone();
             let active = self.saved_config_id.as_ref() == Some(&id);
             list =
@@ -94,6 +112,15 @@ impl SwiftSubApp {
                             this.open_saved_config(id.clone(), w, cx)
                         })),
                 );
+        }
+        if visible_count == 0 {
+            list = list.child(
+                div()
+                    .p_2()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child("没有匹配的配置"),
+            );
         }
         let selected = self
             .saved_config_id
@@ -357,11 +384,10 @@ impl SwiftSubApp {
                                 cx.notify();
                             })),
                     )
-                    .child(
-                        div()
-                            .text_size(px(18.))
-                            .child(format!("我的配置 · {}", self.saved_configs.len())),
-                    )
+                    .child(div().text_size(px(18.)).child(format!(
+                        "我的配置 · {visible_count}/{}",
+                        self.saved_configs.len()
+                    )))
                     .child(div().flex_1())
                     .child(
                         Button::new("library-new")
@@ -874,10 +900,23 @@ impl SwiftSubApp {
                     .node_sources
                     .iter()
                     .any(|n| n.source_id == source_id);
+                let open = self.saved_editor.node_sources_open.contains(&source_id);
                 rows = rows.child(
                     h_flex()
                         .gap_2()
-                        .child(div().flex_1().text_size(px(12.)).child(source_name))
+                        .child(
+                            Button::new(format!("saved-node-source-expand-{source_id}"))
+                                .ghost()
+                                .small()
+                                .label(format!("{} {}", if open { "▾" } else { "▸" }, source_name))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if !this.saved_editor.node_sources_open.insert(source_id) {
+                                        this.saved_editor.node_sources_open.remove(&source_id);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(div().flex_1())
                         .child(
                             Button::new(format!("saved-source-refresh-{source_id}"))
                                 .ghost()
@@ -907,44 +946,45 @@ impl SwiftSubApp {
                                 })),
                         ),
                 );
-                for (i, node) in nodes.into_iter().enumerate() {
-                    if !node.name().to_lowercase().contains(&query) {
-                        continue;
+                if open {
+                    for (i, node) in nodes.into_iter().enumerate() {
+                        if !node.name().to_lowercase().contains(&query) {
+                            continue;
+                        }
+                        let present =
+                            doc.metadata.node_sources.iter().any(|n| {
+                                n.source_id == source_id && n.original_name == node.name()
+                            });
+                        let value = node.to_value();
+                        rows = rows.child(
+                            h_flex()
+                                .gap_2()
+                                .min_h(px(30.))
+                                .child(
+                                    Button::new(format!("saved-import-node-{source_id}-{i}"))
+                                        .ghost()
+                                        .small()
+                                        .label(if present { "已加入" } else { "加入" })
+                                        .disabled(present)
+                                        .on_click(cx.listener(move |this, _, w, cx| {
+                                            this.saved_import_source(
+                                                source_id,
+                                                vec![value.clone()],
+                                                false,
+                                                w,
+                                                cx,
+                                            )
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_size(px(12.))
+                                        .truncate()
+                                        .child(node.name().to_string()),
+                                ),
+                        );
                     }
-                    let present = doc
-                        .metadata
-                        .node_sources
-                        .iter()
-                        .any(|n| n.source_id == source_id && n.original_name == node.name());
-                    let value = node.to_value();
-                    rows = rows.child(
-                        h_flex()
-                            .gap_2()
-                            .min_h(px(30.))
-                            .child(
-                                Button::new(format!("saved-import-node-{source_id}-{i}"))
-                                    .ghost()
-                                    .small()
-                                    .label(if present { "已加入" } else { "加入" })
-                                    .disabled(present)
-                                    .on_click(cx.listener(move |this, _, w, cx| {
-                                        this.saved_import_source(
-                                            source_id,
-                                            vec![value.clone()],
-                                            false,
-                                            w,
-                                            cx,
-                                        )
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_size(px(12.))
-                                    .truncate()
-                                    .child(node.name().to_string()),
-                            ),
-                    );
                 }
             }
         } else {
@@ -1292,9 +1332,45 @@ impl SwiftSubApp {
                 } else {
                     Some(target)
                 };
+                this.saved_editor.rule_current_group_only = false;
                 cx.notify();
             },
         );
+        let current_group = self.saved_editor.selected_group.clone();
+        let current_group_only = self.saved_editor.rule_current_group_only;
+        let current_group_button = Button::new("saved-rule-current-group")
+            .ghost()
+            .small()
+            .label(if current_group_only {
+                "当前组 ✓"
+            } else {
+                "当前组"
+            })
+            .disabled(current_group.is_none())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if current_group_only {
+                    this.saved_editor.rule_scope = None;
+                    this.saved_editor.rule_current_group_only = false;
+                } else if let Some(group) = this.saved_editor.selected_group.clone() {
+                    this.saved_editor.rule_scope = Some(group);
+                    this.saved_editor.rule_current_group_only = true;
+                }
+                cx.notify();
+            }));
+        let only_enabled = self.saved_editor.rule_only_enabled;
+        let enabled_filter = h_flex()
+            .gap_1()
+            .items_center()
+            .child(
+                Switch::new("saved-rule-only-enabled")
+                    .small()
+                    .checked(only_enabled)
+                    .on_change(cx.listener(|this, checked, _, cx| {
+                        this.saved_editor.rule_only_enabled = *checked;
+                        cx.notify();
+                    })),
+            )
+            .child(div().text_size(px(11.)).child("只看已启用"));
         let mut rows = v_flex().gap_2();
         for (source_id, label, bindings) in self.saved_rule_bindings() {
             let count = bindings
@@ -1366,6 +1442,9 @@ impl SwiftSubApp {
                     let active = actual_target
                         .as_ref()
                         .is_some_and(|t| scope.as_ref().is_none_or(|s| s == t));
+                    if only_enabled && !active {
+                        continue;
+                    }
                     let chosen = binding.clone();
                     let name = binding.name.clone();
                     rows = rows.child(
@@ -1532,6 +1611,9 @@ impl SwiftSubApp {
             );
         }
         for (index, rule) in doc.metadata.disabled_rules.iter().enumerate() {
+            if only_enabled {
+                continue;
+            }
             if scope
                 .as_ref()
                 .is_some_and(|s| rule_target(&rule.line) != Some(s.as_str()))
@@ -1592,6 +1674,8 @@ impl SwiftSubApp {
                             .min_w(px(150.))
                             .child(Input::new(&self.saved_editor.search).cleanable(true)),
                     )
+                    .child(current_group_button)
+                    .child(enabled_filter)
                     .child(scope_picker),
             )
             .child(

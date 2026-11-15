@@ -14,6 +14,7 @@ pub struct SavedEditor {
     pub document: Option<SavedDocument>,
     pub tab: SavedEditorTab,
     pub search: Entity<InputState>,
+    pub config_search: Entity<InputState>,
     pub member_search: Entity<InputState>,
     pub selected_group: Option<String>,
     pub group_name: Entity<InputState>,
@@ -26,6 +27,8 @@ pub struct SavedEditor {
     pub node_port: Entity<InputState>,
     pub new_rule: Entity<InputState>,
     pub rule_scope: Option<String>,
+    pub rule_only_enabled: bool,
+    pub rule_current_group_only: bool,
     pub mixed_port: Entity<InputState>,
     pub mode: String,
     pub log_level: String,
@@ -35,6 +38,7 @@ pub struct SavedEditor {
     pub more: bool,
     pub list_collapsed: bool,
     pub node_import: bool,
+    pub node_sources_open: HashSet<i64>,
     pub sources_open: HashSet<String>,
     pub undo: Vec<SavedDocument>,
     pub redo: Vec<SavedDocument>,
@@ -62,6 +66,7 @@ impl SavedEditor {
             document: None,
             tab: SavedEditorTab::Groups,
             search: input("搜索节点 / 策略组 / 规则"),
+            config_search: input("搜索我的配置"),
             member_search: input("搜索可用成员"),
             selected_group: None,
             group_name: input("策略组名称"),
@@ -74,6 +79,8 @@ impl SavedEditor {
             node_port: input("端口"),
             new_rule: input("DOMAIN-SUFFIX,example.com,节点选择"),
             rule_scope: None,
+            rule_only_enabled: false,
+            rule_current_group_only: false,
             mixed_port: input("监听端口"),
             mode: "rule".into(),
             log_level: "info".into(),
@@ -83,6 +90,7 @@ impl SavedEditor {
             more: false,
             list_collapsed: false,
             node_import: false,
+            node_sources_open: HashSet::new(),
             sources_open: HashSet::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -113,6 +121,12 @@ impl SwiftSubApp {
                 self.saved_editor.undo.clear();
                 self.saved_editor.redo.clear();
                 self.saved_editor.rule_scope = None;
+                self.saved_editor.rule_only_enabled = false;
+                self.saved_editor.rule_current_group_only = false;
+                self.saved_editor.node_sources_open.clear();
+                self.saved_editor
+                    .config_search
+                    .update(cx, |s, cx| s.set_value("", window, cx));
                 self.saved_editor
                     .search
                     .update(cx, |s, cx| s.set_value("", window, cx));

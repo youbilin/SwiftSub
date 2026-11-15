@@ -90,7 +90,9 @@ impl Render for SwiftSubApp {
                     if this.page == Page::SavedConfigs
                         && this.saved_editor.tab != crate::app::SavedEditorTab::Yaml
                     {
-                        let input = if this.saved_editor.tab == crate::app::SavedEditorTab::Groups {
+                        let input = if !this.saved_editor.list_collapsed {
+                            &this.saved_editor.config_search
+                        } else if this.saved_editor.tab == crate::app::SavedEditorTab::Groups {
                             &this.saved_editor.member_search
                         } else {
                             &this.saved_editor.search
