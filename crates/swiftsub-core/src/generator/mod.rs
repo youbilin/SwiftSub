@@ -350,7 +350,7 @@ fn resolve_enabled_modules(options: &GenerateOptions) -> Vec<&'static Module> {
 
     catalog::MODULES
         .iter()
-        .filter(|module| ids.contains(module.id))
+        .filter(|module| ids.contains(module.id) && !matches!(module.kind, ModuleKind::Region(_)))
         .collect()
 }
 
@@ -358,7 +358,7 @@ fn build_groups(
     nodes: &[Node],
     modules: &[&'static Module],
     options: &GenerateOptions,
-    warnings: &mut Vec<String>,
+    _warnings: &mut Vec<String>,
 ) -> Vec<ProxyGroup> {
     let node_names: Vec<String> = nodes.iter().map(|node| node.name().to_string()).collect();
 
@@ -373,31 +373,7 @@ fn build_groups(
             .with_health_check(&options.test_url, options.test_interval),
     );
 
-    let mut region_groups = Vec::new();
-    for module in modules {
-        if let ModuleKind::Region(region) = module.kind {
-            let names: Vec<String> = nodes
-                .iter()
-                .filter(|node| node.region == region)
-                .map(|node| node.name().to_string())
-                .collect();
-            if names.is_empty() {
-                continue;
-            }
-            groups.push(
-                ProxyGroup::new(module.name, GroupKind::UrlTest, names)
-                    .with_health_check(&options.test_url, options.test_interval),
-            );
-            region_groups.push(module.name.to_string());
-        }
-    }
-
-    if region_groups.is_empty() {
-        warnings.push("未识别到地区分组，服务组将只包含节点选择与自动选择".to_string());
-    }
-
-    let mut service_members = vec![SELECT_GROUP.to_string(), AUTO_GROUP.to_string()];
-    service_members.extend(region_groups.iter().cloned());
+    let service_members = vec![SELECT_GROUP.to_string(), AUTO_GROUP.to_string()];
 
     for module in modules {
         match module.kind {

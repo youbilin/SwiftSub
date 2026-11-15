@@ -639,3 +639,35 @@ fn multi_hop_chain_listeners_dns_and_extra_yaml_are_validated() {
     invalid.extra_yaml = "rules: []".into();
     assert!(generate_profile(&nodes, &invalid).is_err());
 }
+
+#[test]
+fn presets_and_legacy_region_selection_do_not_create_region_groups() {
+    use swiftsub_core::catalog::{self, ModuleKind};
+    let region_names: HashSet<_> = catalog::MODULES
+        .iter()
+        .filter(|m| matches!(m.kind, ModuleKind::Region(_)))
+        .map(|m| m.name)
+        .collect();
+    for preset in [Preset::Minimal, Preset::Standard, Preset::Full] {
+        assert!(
+            catalog::modules_for_preset(preset)
+                .iter()
+                .all(|m| !matches!(m.kind, ModuleKind::Region(_)))
+        );
+        let options = GenerateOptions {
+            preset,
+            enabled_modules: Some(catalog::MODULES.iter().map(|m| m.id.to_string()).collect()),
+            ..Default::default()
+        };
+        let profile = generate_profile(&sample_nodes(), &options).unwrap();
+        for group in &profile.groups {
+            assert!(!region_names.contains(group.name.as_str()));
+            assert!(
+                group
+                    .proxies
+                    .iter()
+                    .all(|p| !region_names.contains(p.as_str()))
+            );
+        }
+    }
+}

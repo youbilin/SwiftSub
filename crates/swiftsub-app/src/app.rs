@@ -333,7 +333,8 @@ pub struct SwiftSubApp {
     pub template_error: Option<String>,
     pub template_dialog_open: bool,
     pub template_edit_id: Option<i64>,
-    pub template_discard_armed: bool,
+    pub template_session_active: bool,
+    template_advanced_saved: String,
     template_baseline: Option<TemplateSnapshot>,
     template_base_options: Option<GenerateOptions>,
     pub batch_rename_open: bool,
@@ -651,7 +652,8 @@ impl SwiftSubApp {
             template_error: None,
             template_dialog_open: false,
             template_edit_id: None,
-            template_discard_armed: false,
+            template_session_active: false,
+            template_advanced_saved: String::new(),
             template_baseline: None,
             template_base_options: None,
             batch_rename_open: false,
@@ -987,10 +989,9 @@ impl SwiftSubApp {
         cx.notify();
     }
 
-    pub fn set_page(&mut self, page: Page, cx: &mut Context<Self>) {
+    pub fn set_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         if self.template_dialog_open && page != Page::Generator {
-            self.show_toast("请先应用或取消当前分流草稿".into(), cx);
-            return;
+            self.request_close_template(window, cx);
         }
         if page != self.page {
             match page {
@@ -2293,10 +2294,15 @@ impl SwiftSubApp {
         if self.template_dialog_open {
             return;
         }
+        if self.template_session_active {
+            self.template_dialog_open = true;
+            cx.notify();
+            return;
+        }
         self.template_base_options = Some(self.options.clone());
         self.template_baseline = Some(self.active_template_snapshot());
         self.template_edit_id = None;
-        self.template_discard_armed = false;
+        self.template_session_active = true;
         self.template_dialog_open = true;
         self.reset_advanced_draft(window, cx);
         self.template_error = None;
@@ -2338,7 +2344,7 @@ impl SwiftSubApp {
         }
         self.template_base_options = None;
         self.template_edit_id = None;
-        self.template_discard_armed = false;
+        self.template_session_active = false;
         self.template_dialog_open = false;
         self.template_error = None;
         self.template_tab = TemplateTab::PolicyGroups;
@@ -2373,6 +2379,7 @@ impl SwiftSubApp {
             extra_yaml: base.extra_yaml.clone(),
         };
         if let Ok(text) = serde_json::to_string_pretty(&draft) {
+            self.template_advanced_saved = text.clone();
             self.advanced_draft
                 .update(cx, |s, cx| s.set_value(text, window, cx));
         }
@@ -2425,6 +2432,7 @@ impl SwiftSubApp {
         base.extra_yaml = draft.extra_yaml;
         self.chains = draft.chains;
         self.custom_groups = draft.custom_groups;
+        self.template_advanced_saved = self.advanced_draft.read(cx).value().to_string();
         self.template_error = None;
         cx.notify();
     }
@@ -2558,6 +2566,7 @@ impl SwiftSubApp {
         names.extend(
             catalog::MODULES
                 .iter()
+                .filter(|module| !matches!(module.kind, catalog::ModuleKind::Region(_)))
                 .map(|module| module.name.to_string()),
         );
         names.extend(
@@ -3054,6 +3063,7 @@ impl SwiftSubApp {
                 .enabled_modules
                 .iter()
                 .filter_map(|id| catalog::module(id))
+                .filter(|module| !matches!(module.kind, catalog::ModuleKind::Region(_)))
                 .map(|module| module.name.to_string()),
         );
         targets.extend(
@@ -3146,91 +3156,55 @@ impl SwiftSubApp {
         }
     }
 
-    pub fn template_change_summary(&self, cx: &Context<Self>) -> String {
-        match self.draft_generate_options(cx).and_then(|o| {
-            self.template_baseline
-                .as_ref()
-                .unwrap_or(&self.active_template_snapshot())
-                .generate_options(&self.options)
-                .map(|b| (o, b))
-        }) {
-            Ok((draft, base)) => {
-                let mut changes = Vec::new();
-                if draft
-                    .enabled_modules
-                    .as_ref()
-                    .map(|v| v.iter().collect::<HashSet<_>>())
-                    != base
-                        .enabled_modules
-                        .as_ref()
-                        .map(|v| v.iter().collect::<HashSet<_>>())
-                {
-                    changes.push("模块");
-                }
-                if draft.disabled_rule_sets != base.disabled_rule_sets
-                    || draft.custom_rule_sets != base.custom_rule_sets
-                {
-                    changes.push("规则集");
-                }
-                if draft.policy_groups != base.policy_groups {
-                    changes.push("策略组");
-                }
-                if draft.rule_set_targets != base.rule_set_targets {
-                    changes.push("规则目标");
-                }
-                if draft.custom_rules != base.custom_rules {
-                    changes.push("自定义规则");
-                }
-                if draft.rule_order != base.rule_order {
-                    changes.push("规则顺序");
-                }
-                if serde_json::to_string(&draft.custom_groups).ok()
-                    != serde_json::to_string(&base.custom_groups).ok()
-                {
-                    changes.push("筛选组");
-                }
-                if serde_json::to_string(&draft.chains).ok()
-                    != serde_json::to_string(&base.chains).ok()
-                {
-                    changes.push("链式代理");
-                }
-                if draft.dns != base.dns {
-                    changes.push("DNS");
-                }
-                if draft.listeners != base.listeners {
-                    changes.push("独立监听");
-                }
-                if draft.extra_yaml != base.extra_yaml {
-                    changes.push("扩展 YAML");
-                }
-                if draft.test_url != base.test_url || draft.test_interval != base.test_interval {
-                    changes.push("全局测速");
-                }
-                if draft.mixed_port != base.mixed_port || draft.allow_lan != base.allow_lan {
-                    changes.push("监听设置");
-                }
-                if draft.rule_provider_base_url != base.rule_provider_base_url {
-                    changes.push("规则镜像");
-                }
-                if changes.is_empty() {
-                    "配置与当前输出一致；名称及未更新的组详情不计入比较".into()
-                } else {
-                    format!("待应用变更：{}", changes.join("、"))
-                }
-            }
-            Err(e) => e,
-        }
-    }
-
     pub fn request_close_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.template_discard_armed {
-            self.template_discard_armed = true;
-            self.template_error =
-                Some("再点「放弃草稿」将丢弃本次编辑，也可继续编辑或应用。".into());
-            cx.notify();
+        if self.autosave_routing(window, cx).is_ok() {
+            self.close_template_dialog(window, cx);
             return;
         }
-        self.close_template_dialog(window, cx);
+        if let Err(error) = self.checkpoint_draft(cx) {
+            self.show_toast(format!("编辑内容保存失败：{error}"), cx);
+            return;
+        }
+        self.template_dialog_open = false;
+        self.template_target_picker = None;
+        cx.notify();
+    }
+
+    pub(super) fn autosave_routing(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if !self.template_session_active {
+            return Ok(());
+        }
+        if !self.finish_policy_details(window, cx) {
+            return Err(self
+                .template_error
+                .clone()
+                .unwrap_or_else(|| "策略组尚未填写完整".into()));
+        }
+        if self.advanced_draft.read(cx).value().as_ref() != self.template_advanced_saved {
+            self.update_advanced_draft(cx);
+            if let Some(error) = &self.template_error {
+                return Err(error.clone());
+            }
+        }
+        let snapshot = self.draft_template_snapshot(cx)?;
+        if serde_json::to_value(&snapshot).ok()
+            != serde_json::to_value(
+                self.template_baseline
+                    .clone()
+                    .unwrap_or_else(|| self.active_template_snapshot()),
+            )
+            .ok()
+        {
+            self.persist_and_commit_template(snapshot, None, window, cx)?;
+            self.template_baseline = Some(self.active_template_snapshot());
+            self.template_base_options = Some(self.options.clone());
+        }
+        self.template_error = None;
+        Ok(())
     }
 
     fn persist_and_commit_template(
@@ -3288,25 +3262,6 @@ impl SwiftSubApp {
             self.template_error.is_none()
         } else {
             true
-        }
-    }
-
-    pub fn apply_template_rule_sets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.finish_policy_details(window, cx) {
-            return;
-        }
-        let result = self
-            .draft_template_snapshot(cx)
-            .and_then(|snapshot| self.persist_and_commit_template(snapshot, None, window, cx));
-        match result {
-            Ok(()) => {
-                self.close_template_dialog(window, cx);
-                self.show_toast("分流配置已应用".into(), cx);
-            }
-            Err(e) => {
-                self.template_error = Some(e);
-                cx.notify();
-            }
         }
     }
 

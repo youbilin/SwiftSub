@@ -46,7 +46,7 @@ impl SwiftSubApp {
         if std::env::args().any(|a| a == "--background") {
             self.desktop.hide();
         }
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let mut ticks = 0;
             loop {
                 cx.background_executor()
@@ -55,30 +55,38 @@ impl SwiftSubApp {
                 let Some(this) = this.upgrade() else {
                     break;
                 };
-                this.update(cx, |this, cx| {
-                    ticks += 1;
-                    if ticks % 4 == 0 {
-                        if let Err(e) = this.checkpoint_draft(cx) {
-                            this.store_error = Some(format!("草稿自动保存失败：{e}"));
+                let result = cx.update(|window, cx| {
+                    this.update(cx, |this, cx| {
+                        ticks += 1;
+                        if ticks % 4 == 0 {
+                            if let Err(e) = this.autosave_routing(window, cx) {
+                                this.template_error = Some(e);
+                            }
+                            if let Err(e) = this.checkpoint_draft(cx) {
+                                this.store_error = Some(format!("草稿自动保存失败：{e}"));
+                            }
                         }
-                    }
-                    for action in this.desktop.actions() {
-                        match action {
-                            crate::desktop::DesktopAction::Show => this.desktop.show(),
-                            crate::desktop::DesktopAction::Copy => this.copy_server_url(cx),
-                            crate::desktop::DesktopAction::Refresh => this.refresh_all(cx),
-                            crate::desktop::DesktopAction::Exit => {
-                                match this.checkpoint_draft(cx) {
-                                    Ok(()) => cx.quit(),
-                                    Err(e) => {
-                                        this.desktop.show();
-                                        this.show_toast(format!("草稿保存失败：{e}"), cx);
+                        for action in this.desktop.actions() {
+                            match action {
+                                crate::desktop::DesktopAction::Show => this.desktop.show(),
+                                crate::desktop::DesktopAction::Copy => this.copy_server_url(cx),
+                                crate::desktop::DesktopAction::Refresh => this.refresh_all(cx),
+                                crate::desktop::DesktopAction::Exit => {
+                                    match this.checkpoint_draft(cx) {
+                                        Ok(()) => cx.quit(),
+                                        Err(e) => {
+                                            this.desktop.show();
+                                            this.show_toast(format!("草稿保存失败：{e}"), cx);
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
+                    })
                 });
+                if result.is_err() {
+                    break;
+                }
             }
         })
         .detach();
@@ -113,7 +121,7 @@ impl SwiftSubApp {
     }
 
     pub(super) fn checkpoint_draft(&self, cx: &Context<Self>) -> Result<(), String> {
-        if !self.template_dialog_open {
+        if !self.template_session_active {
             return Ok(());
         }
         let mut snapshot = self

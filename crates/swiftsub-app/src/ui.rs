@@ -281,7 +281,7 @@ impl SwiftSubApp {
             .text_color(rgb(if active { TEXT } else { MUTED }))
             .hover(|style| style.bg(rgb(SURFACE_2)).text_color(rgb(TEXT)))
             .child(label)
-            .on_click(cx.listener(move |this, _, _, cx| this.set_page(page, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| this.set_page(page, window, cx)))
             .into_any_element()
     }
 
@@ -1074,7 +1074,10 @@ impl SwiftSubApp {
             );
         }
         list = list.child(field_label("内置组"));
-        for module in catalog::MODULES {
+        for module in catalog::MODULES
+            .iter()
+            .filter(|m| !matches!(m.kind, ModuleKind::Region(_)))
+        {
             let id = module.id.to_string();
             let name = module.name.to_string();
             let enabled = self.template_enabled_modules.contains(module.id)
@@ -2019,7 +2022,7 @@ impl SwiftSubApp {
                     .flex_shrink_0()
                     .min_w_0()
                     .when(self.recovered_draft, |row| {
-                        row.child(tag("已恢复草稿", ACCENT))
+                        row.child(tag("已恢复编辑", ACCENT))
                     })
                     .child(
                         div()
@@ -2028,7 +2031,11 @@ impl SwiftSubApp {
                             .truncate()
                             .text_size(px(10.5))
                             .text_color(rgb(MUTED))
-                            .child(self.template_change_summary(cx)),
+                            .child(if self.template_error.is_some() {
+                                "编辑内容已保留，修正后自动更新输出".to_string()
+                            } else {
+                                "修改自动保存 · 可直接收起或切换页面".to_string()
+                            }),
                     ),
             )
             .child(tab_content)
@@ -2060,32 +2067,18 @@ impl SwiftSubApp {
                     .child(
                         Button::new("template-cancel")
                             .ghost()
-                            .label(if self.template_discard_armed {
-                                "放弃草稿"
-                            } else {
-                                "关闭编辑"
-                            })
+                            .label("收起编辑")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.request_close_template(window, cx)
                             })),
                     )
-                    .when(embedded, |row| {
-                        row.child(
-                            Button::new("template-apply")
-                                .primary()
-                                .label("应用配置")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.apply_template_rule_sets(window, cx)
-                                })),
-                        )
-                    })
                     .child(
                         Button::new("template-save")
                             .ghost()
                             .label(if self.template_edit_id.is_some() {
-                                "更新模板并应用"
+                                "更新模板"
                             } else {
-                                "存为模板并应用"
+                                "存为模板"
                             })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.save_current_template(window, cx)
@@ -2691,22 +2684,28 @@ impl SwiftSubApp {
                                 "{} · {}",
                                 profile_name,
                                 if self.template_dialog_open {
-                                    "编辑草稿"
+                                    "自动保存"
                                 } else {
                                     "当前输出"
                                 }
                             )),
                     )
-                    .when(!self.template_dialog_open, |bar| {
-                        bar.child(
-                            Button::new("workspace-edit")
-                                .ghost()
-                                .label("编辑分流")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_template_dialog(window, cx)
-                                })),
-                        )
-                    })
+                    .child(
+                        Button::new("workspace-edit")
+                            .ghost()
+                            .label(if self.template_dialog_open {
+                                "收起分流"
+                            } else {
+                                "编辑分流"
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if this.template_dialog_open {
+                                    this.request_close_template(window, cx);
+                                } else {
+                                    this.open_template_dialog(window, cx);
+                                }
+                            })),
+                    )
                     .child(
                         Button::new("workspace-preview")
                             .ghost()
@@ -3028,18 +3027,13 @@ impl SwiftSubApp {
             .iter()
             .filter(|module| matches!(module.id, "ad" | "private" | "cn" | "global"))
             .collect();
-        let regions: Vec<&Module> = catalog::MODULES
-            .iter()
-            .filter(|module| matches!(module.kind, ModuleKind::Region(_)))
-            .collect();
         let services: Vec<&Module> = catalog::MODULES
             .iter()
             .filter(|module| matches!(module.kind, ModuleKind::Service) && module.id != "global")
             .collect();
-        let total = core.len() + regions.len() + services.len();
+        let total = core.len() + services.len();
         let enabled = core
             .iter()
-            .chain(regions.iter())
             .chain(services.iter())
             .filter(|module| self.is_module_enabled(module.id))
             .count();
@@ -3099,7 +3093,6 @@ impl SwiftSubApp {
                 )
             })
             .child(self.module_category("core", "核心", &core, cx))
-            .child(self.module_category("region", "地区", &regions, cx))
             .child(self.module_category("service", "服务", &services, cx))
             .into_any_element()
     }

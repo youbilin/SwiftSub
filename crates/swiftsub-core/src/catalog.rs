@@ -448,7 +448,9 @@ pub fn module(id: &str) -> Option<&'static Module> {
 pub fn modules_for_preset(preset: Preset) -> Vec<&'static Module> {
     MODULES
         .iter()
-        .filter(|module| module.presets.contains(&preset))
+        .filter(|module| {
+            module.presets.contains(&preset) && !matches!(module.kind, ModuleKind::Region(_))
+        })
         .collect()
 }
 
