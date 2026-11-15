@@ -46,6 +46,10 @@ pub struct EditorMetadata {
     pub disabled_nodes: Vec<DisabledNode>,
     #[serde(default)]
     pub disabled_rules: Vec<DisabledRule>,
+    #[serde(default)]
+    pub disabled_groups: Vec<DisabledGroup>,
+    #[serde(default)]
+    pub node_sources: Vec<NodeSource>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DisabledNode {
@@ -58,6 +62,20 @@ pub struct DisabledNode {
 pub struct DisabledRule {
     pub index: usize,
     pub line: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DisabledGroup {
+    pub value: Value,
+    pub index: usize,
+    pub rules: Vec<(usize, String)>,
+    pub memberships: Vec<(String, Vec<String>, Vec<String>)>,
+    pub references: Vec<(String, String, String, String)>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct NodeSource {
+    pub source_id: i64,
+    pub original_name: String,
+    pub name: String,
 }
 #[derive(Clone, Debug)]
 pub struct SavedDocument {
@@ -147,6 +165,11 @@ impl SavedDocument {
             .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
             .filter(serde_json::Value::is_object)
             .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(map) = source.as_object_mut() {
+            map.remove("routing");
+            map.remove("membership");
+            map.remove("filename");
+        }
         source["visual_editor"] =
             serde_json::to_value(&self.metadata).map_err(|e| e.to_string())?;
         serde_json::to_string(&source).map_err(|e| e.to_string())
@@ -330,6 +353,11 @@ impl SavedDocument {
             || self.targets().iter().any(|n| n == new)
             || self
                 .metadata
+                .disabled_groups
+                .iter()
+                .any(|g| text(&g.value, "name") == new)
+            || self
+                .metadata
                 .disabled_nodes
                 .iter()
                 .any(|n| text(&n.value, "name") == new)
@@ -390,6 +418,45 @@ impl SavedDocument {
                 rule.line = retarget(&rule.line, new);
             }
         }
+        for origin in &mut self.metadata.node_sources {
+            if origin.name == old {
+                origin.name = new.into();
+            }
+        }
+        for disabled in &mut self.metadata.disabled_groups {
+            let mut members = strings(disabled.value.get("proxies"));
+            for m in &mut members {
+                if m == old {
+                    *m = new.into();
+                }
+            }
+            if disabled.value.get("proxies").is_some() {
+                put(&mut disabled.value, "proxies", values(members));
+            }
+            for (_, line) in &mut disabled.rules {
+                if rule_target(line) == Some(old) {
+                    *line = retarget(line, new);
+                }
+            }
+            for (name, before, after) in &mut disabled.memberships {
+                if name == old {
+                    *name = new.into();
+                }
+                for member in before.iter_mut().chain(after.iter_mut()) {
+                    if member == old {
+                        *member = new.into();
+                    }
+                }
+            }
+            for (_, name, _, replacement) in &mut disabled.references {
+                if name == old {
+                    *name = new.into();
+                }
+                if replacement == old {
+                    *replacement = new.into();
+                }
+            }
+        }
         Ok(())
     }
     pub fn update_group(
@@ -426,7 +493,19 @@ impl SavedDocument {
         Ok(())
     }
     pub fn unique_name(&self, base: &str) -> String {
-        let names = self.targets();
+        let mut names = self.targets();
+        names.extend(
+            self.metadata
+                .disabled_nodes
+                .iter()
+                .map(|n| text(&n.value, "name")),
+        );
+        names.extend(
+            self.metadata
+                .disabled_groups
+                .iter()
+                .map(|n| text(&n.value, "name")),
+        );
         let mut n = base.to_string();
         let mut i = 2;
         while names.contains(&n) {
@@ -584,6 +663,20 @@ impl SavedDocument {
                 }
             }
             self.set_items("proxy-groups", groups);
+            for disabled in &mut self.metadata.disabled_groups {
+                let group = &mut disabled.value;
+                let group_name = text(group, "name");
+                let mut members = strings(group.get("proxies"));
+                if let Some((_, index)) = saved.memberships.iter().find(|(n, _)| n == &group_name) {
+                    if saved.placeholders.contains(&group_name) && members == ["DIRECT"] {
+                        members.clear();
+                    }
+                    if !members.iter().any(|m| m == name) {
+                        members.insert((*index).min(members.len()), name.into());
+                    }
+                    put(group, "proxies", values(members));
+                }
+            }
         } else {
             if self.rules().iter().any(|r| rule_target(r) == Some(name))
                 || self
@@ -621,6 +714,20 @@ impl SavedDocument {
                 }
             }
             self.set_items("proxy-groups", groups);
+            for disabled in &mut self.metadata.disabled_groups {
+                let group = &mut disabled.value;
+                let group_name = text(group, "name");
+                let mut members = strings(group.get("proxies"));
+                if let Some(index) = members.iter().position(|m| m == name) {
+                    memberships.push((group_name.clone(), index));
+                    members.retain(|m| m != name);
+                    if members.is_empty() {
+                        members.push("DIRECT".into());
+                        placeholders.push(group_name);
+                    }
+                    put(group, "proxies", values(members));
+                }
+            }
             self.metadata.disabled_nodes.push(DisabledNode {
                 value,
                 index,
@@ -696,6 +803,50 @@ impl SavedDocument {
             p.first() == Some(&"RULE-SET") && p.get(1) == Some(&id)
         })
     }
+    pub fn catalog_rule_target(&self, id: &str) -> Option<String> {
+        self.rules().iter().find_map(|line| {
+            let p = rule_parts(line);
+            if p.first() == Some(&"RULE-SET") && p.get(1) == Some(&id) {
+                rule_target(line).map(str::to_string)
+            } else {
+                None
+            }
+        })
+    }
+    pub fn set_scoped_binding(
+        &mut self,
+        binding: &RuleSetBinding,
+        enabled: bool,
+        scope: Option<&str>,
+    ) -> Result<(), String> {
+        if !enabled && scope.is_some() {
+            let scope = scope.unwrap();
+            let rules = self
+                .rules()
+                .into_iter()
+                .filter(|line| {
+                    let p = rule_parts(line);
+                    !(p.first() == Some(&"RULE-SET")
+                        && p.get(1) == Some(&binding.id.as_str())
+                        && rule_target(line) == Some(scope))
+                })
+                .collect();
+            self.set_rules(rules);
+            return Ok(());
+        }
+        self.add_binding(binding, enabled)?;
+        if enabled && scope.is_some() {
+            let mut rules = self.rules();
+            for line in &mut rules {
+                let p = rule_parts(line);
+                if p.first() == Some(&"RULE-SET") && p.get(1) == Some(&binding.id.as_str()) {
+                    *line = retarget(line, scope.unwrap());
+                }
+            }
+            self.set_rules(rules);
+        }
+        Ok(())
+    }
     pub fn add_binding(&mut self, binding: &RuleSetBinding, enabled: bool) -> Result<(), String> {
         if !enabled {
             let mut rules = self.rules();
@@ -765,6 +916,14 @@ impl SavedDocument {
         Ok(())
     }
     fn ensure_target(&mut self, name: &str) -> Result<(), String> {
+        if self
+            .metadata
+            .disabled_groups
+            .iter()
+            .any(|g| text(&g.value, "name") == name)
+        {
+            return self.toggle_group(name, true);
+        }
         if self.targets().iter().any(|n| n == name) {
             return Ok(());
         }
@@ -855,13 +1014,222 @@ impl SavedDocument {
         self.set_items("proxies", nodes);
         Ok(())
     }
-    pub fn add_nodes(&mut self, nodes: Vec<Value>) -> Result<(), String> {
-        let mut current = self.items("proxies");
+    pub fn toggle_group(&mut self, name: &str, enabled: bool) -> Result<(), String> {
+        if enabled {
+            let index = self
+                .metadata
+                .disabled_groups
+                .iter()
+                .position(|g| text(&g.value, "name") == name)
+                .ok_or("没有这份停用策略组")?;
+            let saved = self.metadata.disabled_groups.remove(index);
+            let mut groups = self.items("proxy-groups");
+            if self.targets().iter().any(|n| n == name) {
+                return Err("同名组或节点已存在".into());
+            }
+            groups.insert(saved.index.min(groups.len()), saved.value);
+            for (group, before, after) in &saved.memberships {
+                if let Some(g) = groups.iter_mut().find(|g| text(g, "name") == *group) {
+                    let current = strings(g.get("proxies"));
+                    if &current == after {
+                        put(g, "proxies", values(before.clone()));
+                    } else if !current.iter().any(|n| n == name) {
+                        let mut current = current;
+                        current.push(name.into());
+                        put(g, "proxies", values(current));
+                    }
+                }
+            }
+            self.set_items("proxy-groups", groups);
+            let mut rules = self.rules();
+            for (index, line) in saved.rules {
+                if !rules.contains(&line) {
+                    let pos = index.min(
+                        rules
+                            .iter()
+                            .position(|r| {
+                                matches!(rule_parts(r).first(), Some(&"MATCH" | &"FINAL"))
+                            })
+                            .unwrap_or(rules.len()),
+                    );
+                    rules.insert(pos, line);
+                }
+            }
+            self.set_rules(rules);
+            for (section, entry, field, replacement) in saved.references {
+                let mut items = self.items(&section);
+                for item in &mut items {
+                    if text(item, "name") == entry && text(item, &field) == replacement {
+                        put(item, &field, name);
+                    }
+                }
+                self.set_items(&section, items);
+            }
+        } else {
+            if ["节点选择", "自动选择", "漏网之鱼"].contains(&name)
+                || self.rules().iter().any(|r| {
+                    matches!(rule_parts(r).first(), Some(&"MATCH" | &"FINAL"))
+                        && rule_target(r) == Some(name)
+                })
+            {
+                return Err("基础与最终兜底策略组需要保留".into());
+            }
+            let groups = self.items("proxy-groups");
+            let index = groups
+                .iter()
+                .position(|g| text(g, "name") == name)
+                .ok_or("策略组不存在")?;
+            let value = groups[index].clone();
+            let rules = self
+                .rules()
+                .into_iter()
+                .enumerate()
+                .filter(|(_, r)| rule_target(r) == Some(name))
+                .collect();
+            let before = groups
+                .iter()
+                .filter_map(|g| {
+                    let members = strings(g.get("proxies"));
+                    members
+                        .iter()
+                        .any(|m| m == name)
+                        .then(|| (text(g, "name"), members))
+                })
+                .collect::<Vec<_>>();
+            let fallback = if self.group("节点选择").is_some() {
+                "节点选择"
+            } else {
+                "DIRECT"
+            }
+            .to_string();
+            let mut references = Vec::new();
+            for section in ["proxies", "listeners"] {
+                for item in self.items(section) {
+                    for field in ["dialer-proxy", "proxy"] {
+                        if text(&item, field) == name {
+                            references.push((
+                                section.into(),
+                                text(&item, "name"),
+                                field.into(),
+                                fallback.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+            self.remove_group(name)?;
+            let memberships = before
+                .into_iter()
+                .map(|(name, prior)| {
+                    let after = self.members(&name);
+                    (name, prior, after)
+                })
+                .collect();
+            self.metadata.disabled_groups.push(DisabledGroup {
+                value,
+                index,
+                rules,
+                memberships,
+                references,
+            });
+        }
+        Ok(())
+    }
+    pub fn sync_source_nodes(
+        &mut self,
+        source_id: i64,
+        nodes: Vec<Value>,
+        replace: bool,
+    ) -> Result<(), String> {
+        let incoming: HashSet<_> = nodes.iter().map(|n| text(n, "name")).collect();
+        if replace {
+            let missing = self
+                .metadata
+                .node_sources
+                .iter()
+                .filter(|s| s.source_id == source_id && !incoming.contains(&s.original_name))
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>();
+            for name in &missing {
+                if self.names("proxies").contains(name) {
+                    self.toggle_node(name, false)?;
+                }
+                self.metadata
+                    .disabled_nodes
+                    .retain(|n| text(&n.value, "name") != *name);
+            }
+            self.metadata
+                .node_sources
+                .retain(|s| !(s.source_id == source_id && missing.contains(&s.name)));
+        }
         for mut node in nodes {
-            let name = self.unique_name(&text(&node, "name"));
-            put(&mut node, "name", name);
-            current.push(node);
-            self.set_items("proxies", current.clone());
+            let original = text(&node, "name");
+            if let Some(origin) = self
+                .metadata
+                .node_sources
+                .iter()
+                .find(|s| s.source_id == source_id && s.original_name == original)
+                .cloned()
+            {
+                put(&mut node, "name", origin.name.clone());
+                if let Some(disabled) = self
+                    .metadata
+                    .disabled_nodes
+                    .iter_mut()
+                    .find(|n| text(&n.value, "name") == origin.name)
+                {
+                    disabled.value = node;
+                } else {
+                    let mut proxies = self.items("proxies");
+                    if let Some(existing) =
+                        proxies.iter_mut().find(|p| text(p, "name") == origin.name)
+                    {
+                        *existing = node;
+                    } else {
+                        proxies.push(node);
+                    }
+                    self.set_items("proxies", proxies);
+                }
+            } else {
+                let identity = swiftsub_core::model::Proxy::from_value(node.clone())
+                    .ok()
+                    .map(|p| p.identity_key());
+                let existing = self.items("proxies").into_iter().find(|candidate| {
+                    text(candidate, "name") == original
+                        && !self
+                            .metadata
+                            .node_sources
+                            .iter()
+                            .any(|s| s.name == original)
+                        && identity.as_ref().is_some_and(|id| {
+                            swiftsub_core::model::Proxy::from_value(candidate.clone())
+                                .is_ok_and(|p| p.identity_key() == *id)
+                        })
+                });
+                if existing.is_some() {
+                    self.metadata.node_sources.push(NodeSource {
+                        source_id,
+                        original_name: original.clone(),
+                        name: original,
+                    });
+                    continue;
+                }
+                let name = self.unique_name(&original);
+                put(&mut node, "name", name.clone());
+                let mut proxies = self.items("proxies");
+                proxies.push(node);
+                self.set_items("proxies", proxies);
+                self.metadata.node_sources.push(NodeSource {
+                    source_id,
+                    original_name: original,
+                    name: name.clone(),
+                });
+                for group in ["节点选择", "自动选择"] {
+                    if self.group(group).is_some() {
+                        self.member(group, &name, true)?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1090,5 +1458,260 @@ future-top-level: {nested: [a,b,c]}
         assert_eq!(d.root["dns"]["future-dns"], original["dns"]["future-dns"]);
         assert_eq!(d.root["dns"]["nameserver"], original["dns"]["nameserver"]);
         assert_eq!(d.root["tun"], original["tun"]);
+    }
+    #[test]
+    fn disabling_group_restores_members_rules_and_listener_after_reopen() {
+        let mut doc = fixture();
+        doc.transaction(|d| d.member("节点选择", "Video", true))
+            .unwrap_err();
+        let before = doc.root.clone();
+        doc.transaction(|d| d.toggle_group("Video", false)).unwrap();
+        assert!(doc.group("Video").is_none());
+        assert!(doc.rules().iter().all(|r| rule_target(r) != Some("Video")));
+        assert_eq!(text(&doc.items("listeners")[0], "proxy"), "节点选择");
+        let source = doc.source_json(None).unwrap();
+        let mut restored = SavedDocument::parse(&doc.yaml().unwrap(), Some(&source)).unwrap();
+        restored
+            .transaction(|d| d.toggle_group("Video", true))
+            .unwrap();
+        assert_eq!(restored.root, before);
+        assert!(
+            restored
+                .transaction(|d| d.toggle_group("漏网之鱼", false))
+                .is_err()
+        );
+    }
+    #[test]
+    fn disabled_group_members_follow_node_renames() {
+        let mut doc = fixture();
+        doc.transaction(|d| d.member("Video", "node-a", true))
+            .unwrap();
+        doc.transaction(|d| d.toggle_group("Video", false)).unwrap();
+        doc.transaction(|d| d.rename("node-a", "Renamed")).unwrap();
+        doc.transaction(|d| d.toggle_group("Video", true)).unwrap();
+        assert!(doc.members("Video").contains(&"Renamed".into()));
+    }
+    #[test]
+    fn source_sync_updates_only_its_nodes_and_keeps_local_aliases() {
+        let mut doc = fixture();
+        let other = doc.items("proxies")[0].clone();
+        let incoming = |name: &str, port: u16| {
+            let mut n = other.clone();
+            put(&mut n, "name", name);
+            put(&mut n, "port", Value::from(port));
+            n
+        };
+        doc.transaction(|d| {
+            d.sync_source_nodes(
+                42,
+                vec![incoming("remote-a", 1234), incoming("remote-b", 1235)],
+                true,
+            )
+        })
+        .unwrap();
+        doc.transaction(|d| d.rename("remote-a", "Local Alias"))
+            .unwrap();
+        doc.transaction(|d| {
+            d.sync_source_nodes(
+                42,
+                vec![incoming("remote-a", 4321), incoming("remote-c", 4322)],
+                true,
+            )
+        })
+        .unwrap();
+        assert_eq!(doc.items("proxies")[0], other);
+        assert!(!doc.names("proxies").contains(&"remote-b".into()));
+        let updated = doc
+            .items("proxies")
+            .into_iter()
+            .find(|n| text(n, "name") == "Local Alias")
+            .unwrap();
+        assert_eq!(updated["port"], Value::from(4321));
+        assert!(doc.members("自动选择").contains(&"remote-c".into()));
+        let before = doc.names("proxies").len();
+        doc.transaction(|d| d.sync_source_nodes(42, vec![incoming("remote-a", 4321)], false))
+            .unwrap();
+        assert_eq!(doc.names("proxies").len(), before);
+    }
+    #[test]
+    fn source_sync_preserves_disabled_node_and_is_independent_of_another_source() {
+        let mut doc = fixture();
+        let value = doc.items("proxies")[0].clone();
+        doc.transaction(|d| d.sync_source_nodes(1, vec![value.clone()], true))
+            .unwrap();
+        doc.transaction(|d| d.sync_source_nodes(2, vec![value.clone()], true))
+            .unwrap();
+        let first = doc
+            .metadata
+            .node_sources
+            .iter()
+            .find(|n| n.source_id == 1)
+            .unwrap()
+            .name
+            .clone();
+        let second = doc
+            .metadata
+            .node_sources
+            .iter()
+            .find(|n| n.source_id == 2)
+            .unwrap()
+            .name
+            .clone();
+        assert_ne!(first, second);
+        doc.transaction(|d| d.toggle_node(&first, false)).unwrap();
+        doc.transaction(|d| d.sync_source_nodes(1, vec![value], true))
+            .unwrap();
+        assert!(!doc.names("proxies").contains(&first));
+        assert!(doc.names("proxies").contains(&second));
+        assert!(
+            doc.metadata
+                .disabled_nodes
+                .iter()
+                .any(|n| text(&n.value, "name") == first)
+        );
+    }
+    #[test]
+    fn scoped_rule_selection_moves_target_and_clears_only_current_group() {
+        let mut doc = fixture();
+        let b = RuleSetBinding {
+            id: "source-list".into(),
+            name: "source".into(),
+            url: "https://example.com/source.yaml".into(),
+            behavior: "domain".into(),
+            format: "yaml".into(),
+            target: "Video".into(),
+            no_resolve: false,
+        };
+        doc.transaction(|d| d.set_scoped_binding(&b, true, Some("Video")))
+            .unwrap();
+        doc.transaction(|d| d.set_scoped_binding(&b, false, Some("DIRECT")))
+            .unwrap();
+        assert!(doc.catalog_rule_enabled(&b.id));
+        let mut direct = b.clone();
+        direct.target = "DIRECT".into();
+        doc.transaction(|d| d.set_scoped_binding(&direct, true, Some("DIRECT")))
+            .unwrap();
+        assert_eq!(doc.catalog_rule_target(&b.id), Some("DIRECT".into()));
+        doc.transaction(|d| d.set_scoped_binding(&b, false, Some("Video")))
+            .unwrap();
+        assert!(doc.catalog_rule_enabled(&b.id));
+        doc.transaction(|d| d.set_scoped_binding(&direct, false, Some("DIRECT")))
+            .unwrap();
+        assert!(!doc.catalog_rule_enabled(&b.id));
+    }
+    #[test]
+    fn source_metadata_replaces_stale_generator_recipe_and_keeps_extension_data() {
+        let doc = fixture();
+        let source=doc.source_json(Some(r#"{"routing":{"old":"recipe"},"membership":[1],"filename":"old.yaml","external":{"keep":true}}"#)).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&source).unwrap();
+        assert!(json.get("routing").is_none());
+        assert_eq!(json["external"]["keep"], true);
+        assert!(json.get("visual_editor").is_some());
+    }
+    #[test]
+    fn toggling_group_and_node_in_either_order_keeps_valid_memberships() {
+        let mut doc = fixture();
+        doc.transaction(|d| d.member("Video", "node-a", true))
+            .unwrap();
+        doc.transaction(|d| d.toggle_group("Video", false)).unwrap();
+        doc.transaction(|d| d.toggle_node("node-a", false)).unwrap();
+        doc.transaction(|d| d.toggle_group("Video", true)).unwrap();
+        assert!(!doc.members("Video").contains(&"node-a".into()));
+        doc.transaction(|d| d.toggle_node("node-a", true)).unwrap();
+        assert!(doc.members("Video").contains(&"node-a".into()));
+        doc.transaction(|d| d.toggle_group("Video", false)).unwrap();
+        doc.transaction(|d| d.toggle_node("node-a", false)).unwrap();
+        doc.transaction(|d| d.toggle_node("node-a", true)).unwrap();
+        doc.transaction(|d| d.toggle_group("Video", true)).unwrap();
+        assert!(doc.members("Video").contains(&"node-a".into()));
+    }
+    #[test]
+    fn visual_edit_persists_to_same_file_and_survives_database_reopen() {
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        use swiftsub_store::Store;
+        let directory = std::env::temp_dir().join(format!(
+            "swiftsub-visual-store-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let files = directory.join("configs");
+        let db_path = directory.join("test.db");
+        fs::create_dir_all(&directory).unwrap();
+        let store = Store::open(&db_path).unwrap();
+        let doc = fixture();
+        let yaml = doc.yaml().unwrap();
+        let first = store
+            .save_yaml_config(&files, None, "First", &yaml, None)
+            .unwrap();
+        let second = store
+            .save_yaml_config(&files, None, "Second", &yaml, None)
+            .unwrap();
+        let mut changed = SavedDocument::parse(&first.yaml, None).unwrap();
+        changed
+            .transaction(|d| {
+                d.toggle_group("Video", false)?;
+                d.toggle_node("node-a", false)
+            })
+            .unwrap();
+        let source = changed.source_json(None).unwrap();
+        let edited = changed.yaml().unwrap();
+        let saved = store
+            .save_yaml_config(&files, Some(&first.id), "Renamed", &edited, Some(&source))
+            .unwrap();
+        assert_eq!(saved.id, first.id);
+        assert_eq!(saved.path(&files), first.path(&files));
+        assert_eq!(
+            fs::read_to_string(second.path(&files)).unwrap(),
+            second.yaml
+        );
+        drop(store);
+        let reopened = Store::open(&db_path).unwrap();
+        let all = reopened.list_saved_configs().unwrap();
+        assert_eq!(all.len(), 2);
+        let current = all.iter().find(|c| c.id == first.id).unwrap();
+        assert_eq!(current.name, "Renamed");
+        assert_eq!(
+            fs::read_to_string(current.path(&files)).unwrap(),
+            current.yaml
+        );
+        let mut restored =
+            SavedDocument::parse(&current.yaml, current.source_json.as_deref()).unwrap();
+        restored
+            .transaction(|d| {
+                d.toggle_node("node-a", true)?;
+                d.toggle_group("Video", true)
+            })
+            .unwrap();
+        restored.validate().unwrap();
+        assert!(restored.group("Video").is_some());
+        assert!(restored.names("proxies").contains(&"node-a".into()));
+        drop(reopened);
+        for record in all {
+            fs::remove_file(record.path(&files)).unwrap();
+        }
+        fs::remove_dir(&files).unwrap();
+        for name in ["test.db", "test.db-wal", "test.db-shm"] {
+            let file = directory.join(name);
+            if file.exists() {
+                fs::remove_file(file).unwrap();
+            }
+        }
+        fs::remove_dir(&directory).unwrap();
+    }
+    #[test]
+    fn source_import_adopts_matching_existing_nodes_without_duplicates() {
+        let mut doc = fixture();
+        let original = doc.items("proxies")[0].clone();
+        let count = doc.items("proxies").len();
+        doc.transaction(|d| d.sync_source_nodes(7, vec![original], false))
+            .unwrap();
+        assert_eq!(doc.items("proxies").len(), count);
+        assert_eq!(doc.metadata.node_sources[0].name, "node-a");
     }
 }

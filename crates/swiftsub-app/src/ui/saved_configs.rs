@@ -29,17 +29,20 @@ impl SwiftSubApp {
             .small()
             .label(format!("{label} ▾"))
             .dropdown_menu(move |mut menu, _, _| {
-                menu = menu.max_h(px(320.));
+                menu = menu.max_h(px(320.)).scrollable(true);
                 for value in &options {
                     let value = value.clone();
                     let owner = owner.clone();
                     let handler = handler.clone();
-                    menu = menu.item(PopupMenuItem::new(value.clone()).on_click(
-                        move |_, window, cx| {
-                            let _ = owner
-                                .update(cx, |this, cx| handler(this, value.clone(), window, cx));
-                        },
-                    ));
+                    menu = menu.item(
+                        PopupMenuItem::new(value.clone())
+                            .checked(value == label)
+                            .on_click(move |_, window, cx| {
+                                let _ = owner.update(cx, |this, cx| {
+                                    handler(this, value.clone(), window, cx)
+                                });
+                            }),
+                    );
                 }
                 menu
             })
@@ -248,7 +251,7 @@ impl SwiftSubApp {
                             .child(self.saved_tab("节点", SavedEditorTab::Nodes, cx))
                             .child(self.saved_tab("策略组", SavedEditorTab::Groups, cx))
                             .child(self.saved_tab("分流规则", SavedEditorTab::Rules, cx))
-                            .child(self.saved_tab("基础设置", SavedEditorTab::Settings, cx))
+                            .child(self.saved_tab("Mihomo", SavedEditorTab::Settings, cx))
                             .child(self.saved_tab("YAML", SavedEditorTab::Yaml, cx))
                             .child(div().flex_1())
                             .when(self.saved_editor.tab != SavedEditorTab::Yaml, |bar| {
@@ -400,6 +403,12 @@ impl SwiftSubApp {
             }
             let active = self.saved_editor.selected_group.as_ref() == Some(&name);
             let selected = name.clone();
+            let toggle_name = name.clone();
+            let required = ["节点选择", "自动选择", "漏网之鱼"].contains(&name.as_str())
+                || doc.rules().iter().any(|r| {
+                    matches!(rule_parts(r).first(), Some(&"MATCH" | &"FINAL"))
+                        && rule_target(r) == Some(name.as_str())
+                });
             let members = doc.members(&name).len();
             let rules = doc
                 .rules()
@@ -415,7 +424,32 @@ impl SwiftSubApp {
                     .cursor_pointer()
                     .bg(rgb(if active { ACCENT_SOFT } else { SURFACE }))
                     .hover(|s| s.bg(rgb(SURFACE_2)))
-                    .child(div().text_size(px(12.5)).truncate().child(name))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(12.5))
+                                    .truncate()
+                                    .child(name.clone()),
+                            )
+                            .child(
+                                Switch::new(format!("saved-group-enabled-{name}"))
+                                    .small()
+                                    .checked(true)
+                                    .disabled(required)
+                                    .on_change(cx.listener(move |this, checked, w, cx| {
+                                        this.saved_toggle_group(
+                                            toggle_name.clone(),
+                                            *checked,
+                                            w,
+                                            cx,
+                                        )
+                                    })),
+                            ),
+                    )
                     .child(
                         div()
                             .text_size(px(10.5))
@@ -428,6 +462,37 @@ impl SwiftSubApp {
                     .on_click(cx.listener(move |this, _, w, cx| {
                         this.select_saved_group(selected.clone(), w, cx)
                     })),
+            );
+        }
+        for disabled in &doc.metadata.disabled_groups {
+            let name = text(&disabled.value, "name");
+            if !name.to_lowercase().contains(&query) {
+                continue;
+            }
+            let target = name.clone();
+            list = list.child(
+                h_flex()
+                    .gap_1()
+                    .p_2()
+                    .rounded(px(7.))
+                    .bg(rgb(SURFACE))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(12.))
+                            .text_color(rgb(MUTED))
+                            .truncate()
+                            .child(name.clone()),
+                    )
+                    .child(
+                        Switch::new(format!("saved-group-disabled-{name}"))
+                            .small()
+                            .checked(false)
+                            .on_change(cx.listener(move |this, checked, w, cx| {
+                                this.saved_toggle_group(target.clone(), *checked, w, cx)
+                            })),
+                    ),
             );
         }
         let list = v_flex()
@@ -663,7 +728,7 @@ impl SwiftSubApp {
                                 .label("恢复默认")
                                 .on_click(cx.listener(move |this, _, w, cx| {
                                     let name = reset.clone();
-                                    this.edit_saved_document(w, cx, |d| d.reset_group(&name));
+                                    this.saved_reset_group(name, w, cx);
                                 })),
                         )
                     })
@@ -709,9 +774,9 @@ impl SwiftSubApp {
                                 .child(Input::new(&self.saved_editor.group_url)),
                         )
                         .child(
-                            div()
-                                .w(px(100.))
-                                .child(Input::new(&self.saved_editor.group_interval)),
+                            div().w(px(100.)).child(
+                                Input::new(&self.saved_editor.group_interval).cleanable(true),
+                            ),
                         ),
                 )
             })
@@ -803,23 +868,42 @@ impl SwiftSubApp {
         let mut rows = v_flex().gap_2();
         if self.saved_editor.node_import {
             for (source_id, source_name, nodes) in self.saved_library_nodes() {
-                let batch = nodes
+                let batch = nodes.iter().map(|p| p.to_value()).collect::<Vec<_>>();
+                let linked = doc
+                    .metadata
+                    .node_sources
                     .iter()
-                    .filter(|p| !doc.names("proxies").contains(&p.name().to_string()))
-                    .map(|p| p.to_value())
-                    .collect::<Vec<_>>();
+                    .any(|n| n.source_id == source_id);
                 rows = rows.child(
                     h_flex()
-                        .justify_between()
-                        .child(div().text_size(px(12.)).child(source_name))
+                        .gap_2()
+                        .child(div().flex_1().text_size(px(12.)).child(source_name))
+                        .child(
+                            Button::new(format!("saved-source-refresh-{source_id}"))
+                                .ghost()
+                                .small()
+                                .label(if self.refreshing.contains(&source_id) {
+                                    "刷新中…"
+                                } else {
+                                    "刷新订阅"
+                                })
+                                .disabled(self.refreshing.contains(&source_id))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.refresh_subscription(source_id, cx)
+                                })),
+                        )
                         .child(
                             Button::new(format!("saved-import-source-{source_id}"))
                                 .ghost()
                                 .small()
-                                .label("加入此订阅")
+                                .label(if linked {
+                                    "同步到此配置"
+                                } else {
+                                    "加入此订阅"
+                                })
                                 .disabled(batch.is_empty())
                                 .on_click(cx.listener(move |this, _, w, cx| {
-                                    this.saved_import_nodes(batch.clone(), w, cx)
+                                    this.saved_import_source(source_id, batch.clone(), true, w, cx)
                                 })),
                         ),
                 );
@@ -827,7 +911,11 @@ impl SwiftSubApp {
                     if !node.name().to_lowercase().contains(&query) {
                         continue;
                     }
-                    let present = doc.names("proxies").contains(&node.name().to_string());
+                    let present = doc
+                        .metadata
+                        .node_sources
+                        .iter()
+                        .any(|n| n.source_id == source_id && n.original_name == node.name());
                     let value = node.to_value();
                     rows = rows.child(
                         h_flex()
@@ -840,7 +928,13 @@ impl SwiftSubApp {
                                     .label(if present { "已加入" } else { "加入" })
                                     .disabled(present)
                                     .on_click(cx.listener(move |this, _, w, cx| {
-                                        this.saved_import_nodes(vec![value.clone()], w, cx)
+                                        this.saved_import_source(
+                                            source_id,
+                                            vec![value.clone()],
+                                            false,
+                                            w,
+                                            cx,
+                                        )
                                     })),
                             )
                             .child(
@@ -1099,23 +1193,15 @@ impl SwiftSubApp {
                                 h_flex()
                                     .gap_2()
                                     .flex_wrap()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(120.))
-                                            .child(Input::new(&self.saved_editor.node_name)),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(120.))
-                                            .child(Input::new(&self.saved_editor.node_server)),
-                                    )
-                                    .child(
-                                        div()
-                                            .w(px(85.))
-                                            .child(Input::new(&self.saved_editor.node_port)),
-                                    )
+                                    .child(div().flex_1().min_w(px(120.)).child(
+                                        Input::new(&self.saved_editor.node_name).cleanable(true),
+                                    ))
+                                    .child(div().flex_1().min_w(px(120.)).child(
+                                        Input::new(&self.saved_editor.node_server).cleanable(true),
+                                    ))
+                                    .child(div().w(px(85.)).child(
+                                        Input::new(&self.saved_editor.node_port).cleanable(true),
+                                    ))
                                     .child(
                                         Button::new("saved-node-close-detail")
                                             .ghost()
@@ -1213,7 +1299,10 @@ impl SwiftSubApp {
         for (source_id, label, bindings) in self.saved_rule_bindings() {
             let count = bindings
                 .iter()
-                .filter(|b| doc.catalog_rule_enabled(&b.id))
+                .filter(|b| {
+                    doc.catalog_rule_target(&b.id)
+                        .is_some_and(|t| scope.as_ref().is_none_or(|s| s == &t))
+                })
                 .count();
             let total = bindings.len();
             let forced_open = !query.is_empty();
@@ -1255,9 +1344,10 @@ impl SwiftSubApp {
                             .checked(count > 0)
                             .on_change(cx.listener(move |this, checked, w, cx| {
                                 let bindings = all.clone();
+                                let scope = this.saved_editor.rule_scope.clone();
                                 this.edit_saved_document(w, cx, |doc| {
                                     for b in &bindings {
-                                        doc.add_binding(b, *checked)?;
+                                        doc.set_scoped_binding(b, *checked, scope.as_deref())?;
                                     }
                                     Ok(())
                                 });
@@ -1272,7 +1362,10 @@ impl SwiftSubApp {
                     {
                         continue;
                     }
-                    let active = doc.catalog_rule_enabled(&binding.id);
+                    let actual_target = doc.catalog_rule_target(&binding.id);
+                    let active = actual_target
+                        .as_ref()
+                        .is_some_and(|t| scope.as_ref().is_none_or(|s| s == t));
                     let chosen = binding.clone();
                     let name = binding.name.clone();
                     rows = rows.child(
@@ -1302,7 +1395,7 @@ impl SwiftSubApp {
                                 div()
                                     .text_size(px(10.5))
                                     .text_color(rgb(MUTED))
-                                    .child(binding.target),
+                                    .child(actual_target.unwrap_or(binding.target)),
                             ),
                     );
                 }
@@ -1531,19 +1624,20 @@ impl SwiftSubApp {
     }
     fn saved_settings_view(&self, cx: &mut Context<Self>) -> AnyElement {
         v_flex()
+            .child(field_label("Mihomo 运行参数"))
             .size_full()
             .min_h_0()
             .gap_3()
-            .child(field_label("混合监听端口"))
+            .child(field_label("Mihomo 混合监听端口"))
             .child(
                 div()
                     .w(px(180.))
-                    .child(Input::new(&self.saved_editor.mixed_port)),
+                    .child(Input::new(&self.saved_editor.mixed_port).cleanable(true)),
             )
             .child(
                 h_flex()
                     .gap_2()
-                    .child(field_label("运行模式"))
+                    .child(field_label("Mihomo 路由模式"))
                     .child(self.saved_choice(
                         "saved-mode",
                         self.saved_editor.mode.clone(),
@@ -1554,22 +1648,6 @@ impl SwiftSubApp {
                             cx.notify();
                         },
                     )),
-            )
-            .child(
-                h_flex().gap_2().child(field_label("日志级别")).child(
-                    self.saved_choice(
-                        "saved-log-level",
-                        self.saved_editor.log_level.clone(),
-                        ["silent", "error", "warning", "info", "debug"]
-                            .map(str::to_string)
-                            .to_vec(),
-                        cx,
-                        |this, value, _, cx| {
-                            this.saved_editor.log_level = value;
-                            cx.notify();
-                        },
-                    ),
-                ),
             )
             .child(
                 h_flex()
@@ -1583,7 +1661,7 @@ impl SwiftSubApp {
                                 cx.notify();
                             })),
                     )
-                    .child(field_label("允许局域网")),
+                    .child(field_label("允许局域网访问")),
             )
             .child(
                 h_flex()
@@ -1597,7 +1675,7 @@ impl SwiftSubApp {
                                 cx.notify();
                             })),
                     )
-                    .child(field_label("DNS")),
+                    .child(field_label("DNS 开关")),
             )
             .into_any_element()
     }

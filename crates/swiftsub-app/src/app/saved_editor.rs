@@ -98,6 +98,7 @@ impl SwiftSubApp {
             .saved_config_id
             .as_ref()
             .and_then(|id| self.saved_configs.iter().find(|c| &c.id == id))
+            .filter(|c| c.yaml == self.saved_config_yaml.read(cx).value().as_ref())
             .and_then(|c| c.source_json.as_deref());
         match SavedDocument::parse(self.saved_config_yaml.read(cx).value().as_ref(), source) {
             Ok(doc) => {
@@ -172,6 +173,15 @@ impl SwiftSubApp {
                     self.saved_editor.undo.remove(0);
                 }
                 self.saved_editor.redo.clear();
+                if self
+                    .saved_editor
+                    .selected_node
+                    .as_ref()
+                    .is_some_and(|name| !doc.names("proxies").contains(name))
+                {
+                    self.saved_editor.selected_node = None;
+                    self.saved_editor.node_baseline = None;
+                }
                 self.write_saved_visual(window, cx)?;
             }
             Ok::<_, String>(())
@@ -395,6 +405,9 @@ impl SwiftSubApp {
         self.saved_editor.undo.push(before);
         self.saved_editor.redo.clear();
         if group_changed {
+            if self.saved_editor.rule_scope == old_group {
+                self.saved_editor.rule_scope = Some(group.0.clone());
+            }
             self.saved_editor.selected_group = Some(group.0.clone());
             self.saved_editor.group_baseline = Some(group);
         }
@@ -413,14 +426,30 @@ impl SwiftSubApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let previous_tab = self.saved_editor.tab;
+        if tab == SavedEditorTab::Yaml && self.saved_editor.tab != SavedEditorTab::Yaml {
+            if let Err(e) = self.autosave_saved_editor(window, cx) {
+                self.saved_config_error = Some(e);
+                cx.notify();
+                return;
+            }
+        }
+
         if self.saved_editor.tab == SavedEditorTab::Yaml && tab != SavedEditorTab::Yaml {
             let source = self
                 .saved_config_id
                 .as_ref()
                 .and_then(|id| self.saved_configs.iter().find(|c| &c.id == id))
+                .filter(|c| c.yaml == self.saved_config_yaml.read(cx).value().as_ref())
                 .and_then(|c| c.source_json.as_deref());
             match SavedDocument::parse(self.saved_config_yaml.read(cx).value().as_ref(), source) {
                 Ok(doc) => {
+                    if let Err(e) = doc.validate() {
+                        self.saved_config_error = Some(e);
+                        cx.notify();
+                        return;
+                    }
+
                     self.saved_editor.document = Some(doc);
                     self.saved_editor.undo.clear();
                     self.saved_editor.redo.clear();
@@ -448,6 +477,18 @@ impl SwiftSubApp {
             self.saved_config_error = Some(e);
             cx.notify();
             return;
+        }
+        if tab == SavedEditorTab::Groups {
+            if let Some(group) = self.saved_editor.selected_group.clone().filter(|name| {
+                self.saved_editor
+                    .document
+                    .as_ref()
+                    .is_some_and(|doc| doc.group(name).is_some())
+            }) {
+                self.populate_saved_group(group, window, cx);
+            }
+        } else if tab == SavedEditorTab::Rules && previous_tab == SavedEditorTab::Groups {
+            self.saved_editor.rule_scope = self.saved_editor.selected_group.clone();
         }
         self.saved_editor.tab = tab;
         self.saved_editor.more = false;
@@ -515,6 +556,35 @@ impl SwiftSubApp {
         } else {
             String::new()
         };
+        let meta_key = format!("visual-meta:{id}");
+        let meta = if e.pending && e.tab != SavedEditorTab::Yaml {
+            e.document
+                .as_ref()
+                .map(|d| {
+                    serde_json::to_string(&(
+                        self.saved_config_yaml.read(cx).value().to_string(),
+                        &d.metadata,
+                    ))
+                })
+                .transpose()
+                .map_err(|e| e.to_string())?
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        {
+            let store = self.store.lock().unwrap();
+            if store
+                .get_setting(&meta_key)
+                .map_err(|e| e.to_string())?
+                .as_deref()
+                != Some(meta.as_str())
+            {
+                store
+                    .set_setting(&meta_key, &meta)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         let key = format!("visual-form:{id}");
         let store = self.store.lock().unwrap();
         if store
@@ -533,6 +603,24 @@ impl SwiftSubApp {
         let Some(id) = &self.saved_config_id else {
             return;
         };
+        if let Some((yaml, metadata)) = self
+            .store
+            .lock()
+            .unwrap()
+            .get_setting(&format!("visual-meta:{id}"))
+            .ok()
+            .flatten()
+            .and_then(|s| {
+                serde_json::from_str::<(String, crate::saved_document::EditorMetadata)>(&s).ok()
+            })
+        {
+            if yaml == self.saved_config_yaml.read(cx).value().as_ref() {
+                if let Some(doc) = self.saved_editor.document.as_mut() {
+                    doc.metadata = metadata;
+                    self.saved_editor.pending = true;
+                }
+            }
+        }
         let saved = self
             .store
             .lock()
@@ -631,6 +719,11 @@ impl SwiftSubApp {
         }
         self.saved_editor.pending = false;
         self.saved_config_error = None;
+        self.store
+            .lock()
+            .unwrap()
+            .set_setting(&format!("visual-meta:{id}"), "")
+            .map_err(|e| e.to_string())?;
         self.store
             .lock()
             .unwrap()
@@ -746,7 +839,13 @@ impl SwiftSubApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.edit_saved_document(window, cx, |doc| doc.add_binding(&binding, enabled));
+        let scope = self.saved_editor.rule_scope.clone();
+        self.edit_saved_document(window, cx, |doc| {
+            doc.set_scoped_binding(&binding, enabled, scope.as_deref())
+        });
+        if self.saved_config_error.is_none() && self.saved_editor.tab == SavedEditorTab::Rules {
+            self.saved_editor.rule_scope = scope;
+        }
     }
     pub fn saved_add_rule(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let line = self.saved_editor.new_rule.read(cx).value().to_string();
@@ -778,13 +877,46 @@ impl SwiftSubApp {
             })
             .collect()
     }
-    pub fn saved_import_nodes(
+    pub fn saved_import_source(
         &mut self,
+        id: i64,
         nodes: Vec<Value>,
+        replace: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.edit_saved_document(window, cx, |doc| doc.add_nodes(nodes));
+        self.edit_saved_document(window, cx, |doc| doc.sync_source_nodes(id, nodes, replace));
+    }
+    pub fn saved_toggle_group(
+        &mut self,
+        name: String,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.edit_saved_document(window, cx, |d| d.toggle_group(&name, enabled));
+        if self.saved_config_error.is_none() {
+            if enabled {
+                self.populate_saved_group(name, window, cx);
+            } else if self.saved_editor.selected_group.as_ref() == Some(&name) {
+                self.saved_editor.group_baseline = None;
+                self.saved_editor.selected_group = None;
+                if let Some(first) = self
+                    .saved_editor
+                    .document
+                    .as_ref()
+                    .and_then(|d| d.names("proxy-groups").first().cloned())
+                {
+                    self.populate_saved_group(first, window, cx);
+                }
+            }
+        }
+    }
+    pub fn saved_reset_group(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_saved_document(window, cx, |doc| doc.reset_group(&name));
+        if self.saved_config_error.is_none() {
+            self.populate_saved_group(name, window, cx);
+        }
     }
     pub fn saved_set_rule_target(
         &mut self,

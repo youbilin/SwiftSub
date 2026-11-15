@@ -87,6 +87,19 @@ impl Render for SwiftSubApp {
             .id("swiftsub-root")
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.modifiers.control && event.keystroke.key == "f" {
+                    if this.page == Page::SavedConfigs
+                        && this.saved_editor.tab != crate::app::SavedEditorTab::Yaml
+                    {
+                        let input = if this.saved_editor.tab == crate::app::SavedEditorTab::Groups {
+                            &this.saved_editor.member_search
+                        } else {
+                            &this.saved_editor.search
+                        };
+                        let handle = input.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
                     if this.template_dialog_open {
                         this.set_template_tab(TemplateTab::RuleSets, cx);
                     } else if this.page != Page::Generator {
