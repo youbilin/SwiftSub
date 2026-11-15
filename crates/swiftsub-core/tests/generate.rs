@@ -117,7 +117,7 @@ fn generates_a_referentially_valid_standard_profile() {
 }
 
 #[test]
-fn minimal_preset_has_no_service_groups() {
+fn minimal_preset_keeps_china_and_non_china_routing() {
     let options = GenerateOptions {
         preset: Preset::Minimal,
         ..Default::default()
@@ -128,6 +128,16 @@ fn minimal_preset_has_no_service_groups() {
     assert!(profile.yaml.contains("国内直连"));
     assert!(!profile.yaml.contains("name: AI 服务"));
     assert!(profile.stats.groups < 15);
+    assert!(profile.yaml.contains("geolocation-!cn"));
+    assert!(profile.yaml.contains("RULE-SET,geolocation-cn,国内直连"));
+    assert!(profile.yaml.contains("RULE-SET,geolocation-!cn,全球代理"));
+    assert_eq!(profile.rules.last().unwrap().to_line(), "MATCH,漏网之鱼");
+    let selected = profile
+        .groups
+        .iter()
+        .find(|g| g.name == "节点选择")
+        .unwrap();
+    assert!(selected.proxies.contains(&"自动选择".to_string()));
 }
 
 #[test]
@@ -692,4 +702,49 @@ fn retired_region_targets_migrate_but_authored_groups_survive() {
     let profile = generate_profile(&sample_nodes(), &options).unwrap();
     assert!(profile.groups.iter().any(|g| g.name == "香港"));
     assert!(profile.yaml.contains("DOMAIN-SUFFIX,example.test,香港"));
+}
+
+#[test]
+fn mixed_source_broad_rules_follow_service_rules_and_precede_final() {
+    use swiftsub_core::generator::RuleSetBinding;
+    let mut options = GenerateOptions {
+        preset: Preset::Full,
+        ..Default::default()
+    };
+    for (id, target, behavior, no_resolve) in [
+        ("loy-cn", "国内直连", "ipcidr", true),
+        ("acl-global", "全球代理", "classical", false),
+        ("bm-youtube", "YouTube", "classical", false),
+    ] {
+        options.custom_rule_sets.push(RuleSetBinding {
+            id: id.into(),
+            name: id.into(),
+            url: format!("https://example.com/{id}.yaml"),
+            target: target.into(),
+            behavior: behavior.into(),
+            format: "yaml".into(),
+            no_resolve,
+        });
+    }
+    let profile = generate_profile(&sample_nodes(), &options).unwrap();
+    let lines: Vec<_> = profile.rules.iter().map(Rule::to_line).collect();
+    let at = |id: &str| {
+        lines
+            .iter()
+            .position(|r| r.starts_with(&format!("RULE-SET,{id},")))
+            .unwrap()
+    };
+    assert!(at("bm-youtube") < at("acl-global"));
+    assert!(at("acl-global") < at("loy-cn"));
+    assert_eq!(lines.last().unwrap(), "MATCH,漏网之鱼");
+    for module in swiftsub_core::catalog::modules_for_preset(Preset::Full) {
+        assert!(
+            profile.groups.iter().any(|g| g.name == module.name),
+            "missing {}",
+            module.name
+        );
+        for set in module.rule_sets {
+            assert!(profile.yaml.contains(&format!("RULE-SET,{},", set.id)));
+        }
+    }
 }

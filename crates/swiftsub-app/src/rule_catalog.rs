@@ -39,7 +39,6 @@ pub struct SourceRuleSet {
 pub struct RuleSetSource {
     pub id: &'static str,
     pub name: &'static str,
-    pub description: &'static str,
     pub kind: SourceKind,
     pub owner: &'static str,
     pub repo: &'static str,
@@ -722,7 +721,6 @@ pub static SOURCES: &[RuleSetSource] = &[
     RuleSetSource {
         id: "mcx",
         name: "MetaCubeX meta-rules-dat",
-        description: "GeoSite / GeoIP MRS，跟随设置中的 MetaCubeX 镜像",
         kind: SourceKind::MetaCube,
         owner: "MetaCubeX",
         repo: "meta-rules-dat",
@@ -732,7 +730,6 @@ pub static SOURCES: &[RuleSetSource] = &[
     RuleSetSource {
         id: "bm",
         name: "blackmatrix7 ios_rule_script",
-        description: "常用服务的 Clash 规则，更新及时、覆盖面广",
         kind: SourceKind::GitHub,
         owner: "blackmatrix7",
         repo: "ios_rule_script",
@@ -742,7 +739,6 @@ pub static SOURCES: &[RuleSetSource] = &[
     RuleSetSource {
         id: "loy",
         name: "Loyalsoldier clash-rules",
-        description: "域名 / IP 分流列表，适合直连与拦截规则",
         kind: SourceKind::GitHub,
         owner: "Loyalsoldier",
         repo: "clash-rules",
@@ -752,7 +748,6 @@ pub static SOURCES: &[RuleSetSource] = &[
     RuleSetSource {
         id: "acl",
         name: "ACL4SSR Rules",
-        description: "经典 Clash 文本规则，含国内域名与广告拦截",
         kind: SourceKind::GitHub,
         owner: "ACL4SSR",
         repo: "ACL4SSR",

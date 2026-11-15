@@ -420,14 +420,21 @@ fn build_groups(
     groups.push(ProxyGroup::new(
         SELECT_GROUP,
         GroupKind::Select,
-        node_names.clone(),
+        std::iter::once(AUTO_GROUP.to_string())
+            .chain(node_names.clone())
+            .chain(std::iter::once("DIRECT".to_string()))
+            .collect(),
     ));
     groups.push(
         ProxyGroup::new(AUTO_GROUP, GroupKind::UrlTest, node_names.clone())
             .with_health_check(&options.test_url, options.test_interval),
     );
 
-    let service_members = vec![SELECT_GROUP.to_string(), AUTO_GROUP.to_string()];
+    let service_members = vec![
+        SELECT_GROUP.to_string(),
+        AUTO_GROUP.to_string(),
+        "DIRECT".to_string(),
+    ];
 
     for module in modules {
         match module.kind {
@@ -457,7 +464,11 @@ fn build_groups(
     groups.push(ProxyGroup::new(
         FINAL_GROUP,
         GroupKind::Select,
-        vec![SELECT_GROUP.to_string(), "DIRECT".to_string()],
+        vec![
+            SELECT_GROUP.to_string(),
+            AUTO_GROUP.to_string(),
+            "DIRECT".to_string(),
+        ],
     ));
 
     groups
@@ -711,11 +722,21 @@ fn build_rules(
             format,
             url: binding.url.clone(),
         });
-        high_priority.push(Rule::rule_set(
+        let rule = Rule::rule_set(
             binding.id.clone(),
             binding.target.clone(),
             binding.no_resolve,
-        ));
+        );
+        let priority = catalog::MODULES
+            .iter()
+            .find(|m| m.name == binding.target)
+            .map(catalog::rule_priority)
+            .unwrap_or(400);
+        if priority >= 800 {
+            low_priority.push(rule);
+        } else {
+            high_priority.push(rule);
+        }
     }
 
     let mut custom = Vec::with_capacity(options.custom_rules.len());
@@ -732,6 +753,20 @@ fn build_rules(
         custom.push(rule.clone());
     }
 
+    let priority = |rule: &Rule| {
+        let rank = catalog::MODULES
+            .iter()
+            .find(|m| m.name == rule.target)
+            .map(catalog::rule_priority)
+            .unwrap_or(400);
+        if rank == 800 && rule.no_resolve {
+            900
+        } else {
+            rank
+        }
+    };
+    high_priority.sort_by_key(priority);
+    low_priority.sort_by_key(priority);
     let mut rules = Vec::with_capacity(high_priority.len() + custom.len() + low_priority.len() + 1);
     rules.extend(high_priority);
     rules.extend(custom);

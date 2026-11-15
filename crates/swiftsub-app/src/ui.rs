@@ -871,6 +871,71 @@ impl SwiftSubApp {
             .into_any_element()
     }
 
+    fn template_rule_source_choices(&self, cx: &mut Context<Self>) -> AnyElement {
+        let builtin_ids: Vec<String> = catalog::MODULES
+            .iter()
+            .filter(|m| !matches!(m.kind, ModuleKind::Region(_)))
+            .flat_map(|m| m.rule_sets.iter().map(|r| r.id.to_string()))
+            .collect();
+        let builtin_selected = catalog::MODULES
+            .iter()
+            .filter(|m| self.template_enabled_modules.contains(m.id))
+            .flat_map(|m| m.rule_sets)
+            .filter(|r| !self.template_disabled_rule_sets.contains(r.id))
+            .count();
+        let mut sources = vec![("builtin", "内置", builtin_ids, builtin_selected)];
+        for source in rule_catalog::SOURCES {
+            let selected = source
+                .entries
+                .iter()
+                .filter(|entry| {
+                    self.template_custom_rule_sets
+                        .iter()
+                        .any(|b| b.id == format!("{}-{}", source.id, entry.id))
+                })
+                .count();
+            let label = match source.id {
+                "mcx" => "MetaCubeX 扩展",
+                "bm" => "blackmatrix7",
+                "loy" => "Loyalsoldier",
+                _ => "ACL4SSR",
+            };
+            sources.push((
+                source.id,
+                label,
+                source.entries.iter().map(|r| r.id.to_string()).collect(),
+                selected,
+            ));
+        }
+        h_flex()
+            .flex_wrap()
+            .gap_2()
+            .flex_shrink_0()
+            .children(sources.into_iter().map(|(id, label, ids, selected)| {
+                let total = ids.len();
+                h_flex()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .rounded(px(6.))
+                    .bg(rgb(SURFACE_2))
+                    .child(
+                        Switch::new(format!("source-choice-{id}"))
+                            .small()
+                            .checked(selected > 0)
+                            .on_change(cx.listener(move |this, checked, _, cx| {
+                                this.set_template_source_rules(id.into(), ids.clone(), *checked, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .child(format!("{label} {selected}/{total}")),
+                    )
+            }))
+            .into_any_element()
+    }
+
     fn template_rule_source_header(
         &self,
         source_id: &str,
@@ -910,6 +975,23 @@ impl SwiftSubApp {
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_template_rule_source(id.clone(), cx);
+                    })),
+            )
+            .child(
+                Switch::new(format!("rule-source-switch-{source_id}"))
+                    .small()
+                    .checked(selected > 0)
+                    .on_change(cx.listener({
+                        let source_id = source_id.to_string();
+                        let ids = entry_ids.clone();
+                        move |this, checked, _, cx| {
+                            this.set_template_source_rules(
+                                source_id.clone(),
+                                ids.clone(),
+                                *checked,
+                                cx,
+                            );
+                        }
                     })),
             )
             .child(
@@ -1536,13 +1618,11 @@ impl SwiftSubApp {
 
         let builtin_ids: Vec<String> = catalog::MODULES
             .iter()
-            .filter(|module| {
-                self.template_enabled_modules.contains(module.id)
-                    || matches!(module.id, "select" | "auto" | "final")
-            })
+            .filter(|module| !matches!(module.kind, ModuleKind::Region(_)))
             .flat_map(|module| module.rule_sets.iter().map(move |spec| (module, spec)))
             .filter(|(module, spec)| {
-                let enabled = !self.template_disabled_rule_sets.contains(spec.id);
+                let enabled = self.template_enabled_modules.contains(module.id)
+                    && !self.template_disabled_rule_sets.contains(spec.id);
                 let target = self
                     .template_rule_set_targets
                     .get(spec.id)
@@ -1566,19 +1646,16 @@ impl SwiftSubApp {
             .collect();
         let builtin_selected = catalog::MODULES
             .iter()
-            .filter(|module| {
+            .filter(|module| !matches!(module.kind, ModuleKind::Region(_)))
+            .flat_map(|module| module.rule_sets.iter().map(move |spec| (module, spec)))
+            .filter(|(module, spec)| {
                 self.template_enabled_modules.contains(module.id)
-                    || matches!(module.id, "select" | "auto" | "final")
+                    && !self.template_disabled_rule_sets.contains(spec.id)
             })
-            .flat_map(|module| module.rule_sets)
-            .filter(|spec| !self.template_disabled_rule_sets.contains(spec.id))
             .count();
         let builtin_total = catalog::MODULES
             .iter()
-            .filter(|module| {
-                self.template_enabled_modules.contains(module.id)
-                    || matches!(module.id, "select" | "auto" | "final")
-            })
+            .filter(|module| !matches!(module.kind, ModuleKind::Region(_)))
             .map(|module| module.rule_sets.len())
             .sum();
         if !builtin_ids.is_empty() {
@@ -1601,14 +1678,13 @@ impl SwiftSubApp {
             || !self.template_rule_sources_collapsed.contains("builtin");
 
         for module in catalog::MODULES.iter().filter(|module| {
-            !module.rule_sets.is_empty()
-                && (self.template_enabled_modules.contains(module.id)
-                    || matches!(module.id, "select" | "auto" | "final"))
+            !module.rule_sets.is_empty() && (!matches!(module.kind, ModuleKind::Region(_)))
         }) {
             let mut visible = Vec::new();
             for spec in module.rule_sets {
                 total_count += 1;
-                let enabled = !self.template_disabled_rule_sets.contains(spec.id);
+                let enabled = self.template_enabled_modules.contains(module.id)
+                    && !self.template_disabled_rule_sets.contains(spec.id);
                 if enabled {
                     selected_count += 1;
                 }
@@ -1774,13 +1850,6 @@ impl SwiftSubApp {
             {
                 continue;
             }
-            rule_rows = rule_rows.child(
-                div()
-                    .pb(px(2.))
-                    .text_size(px(10.5))
-                    .text_color(rgb(MUTED))
-                    .child(source.description),
-            );
 
             for (entry, selected, target, binding_id) in entries {
                 let source_id = source.id.to_string();
@@ -1839,7 +1908,6 @@ impl SwiftSubApp {
             );
         }
 
-        let source = rule_provider_source_label(&self.options.rule_provider_base_url);
         let custom_rule_count = self
             .template_custom_rules
             .read(cx)
@@ -1908,6 +1976,7 @@ impl SwiftSubApp {
             TemplateTab::PolicyGroups => self.template_policy_groups_panel(cx),
             TemplateTab::RuleSets => v_flex()
                 .flex_1().min_h_0().gap_2()
+                .child(self.template_rule_source_choices(cx))
                 .child(h_flex().gap_2().flex_wrap().flex_shrink_0()
                     .child(div().flex_1().min_w(px(160.)).child(Input::new(&self.template_rule_search).cleanable(true)))
                     .child(Button::new("rules-selected-only").ghost().small()
@@ -1947,12 +2016,7 @@ impl SwiftSubApp {
                         .overflow_y_scrollbar()
                         .child(rule_rows),
                 )
-                .child(
-                    div()
-                        .text_size(px(11.5))
-                        .text_color(rgb(MUTED))
-                        .child(format!("可同时勾选多个来源 · 点击蓝色目标绑定策略组 · MetaCubeX 镜像：{source}")),
-                )
+
                 .into_any_element(),
             TemplateTab::CustomRules => v_flex()
                 .flex_1()
@@ -3077,17 +3141,36 @@ impl SwiftSubApp {
                 ),
             )
             .child(
-                h_flex().gap_2().child(section_label("常开组")).child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(rgb(MUTED))
-                        .child("节点选择 · 自动选择 · 漏网之鱼"),
+                h_flex().gap_1().flex_wrap().children(
+                    ["节点选择", "自动选择", "漏网之鱼"]
+                        .into_iter()
+                        .map(|name| {
+                            Button::new(format!("core-group-{name}"))
+                                .ghost()
+                                .small()
+                                .label(name)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_template_dialog(window, cx);
+                                    this.template_tab = TemplateTab::PolicyGroups;
+                                    this.edit_builtin_policy_group(name.to_string(), window, cx);
+                                }))
+                        }),
                 ),
             )
             .child(
                 h_flex()
                     .justify_between()
                     .child(section_label("分流代理组"))
+                    .child(
+                        Button::new("open-rule-sources")
+                            .ghost()
+                            .small()
+                            .label("规则来源 · 多选")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_template_dialog(window, cx);
+                                this.set_template_tab(TemplateTab::RuleSets, cx);
+                            })),
+                    )
                     .child(
                         div()
                             .text_size(px(11.5))
@@ -3237,24 +3320,13 @@ impl SwiftSubApp {
             .border_color(rgb(BORDER))
             .hover(|style| style.bg(rgb(0x11151b)))
             .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_size(px(12.5))
-                            .font_weight(FontWeight::MEDIUM)
-                            .truncate()
-                            .child(module.name),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.5))
-                            .text_color(rgb(MUTED))
-                            .truncate()
-                            .child(module.description),
-                    ),
+                v_flex().flex_1().min_w_0().gap_1().child(
+                    div()
+                        .text_size(px(12.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .truncate()
+                        .child(module.name),
+                ),
             )
             .child(div().text_size(px(11.5)).text_color(rgb(MUTED)).child(meta))
             .child(
@@ -4398,7 +4470,7 @@ impl SwiftSubApp {
             vec![
                 v_flex()
                     .gap_2()
-                    .child(field_label("MetaCubeX 规则集镜像"))
+                    .child(field_label("规则下载镜像"))
                     .child(Input::new(&self.rule_provider_input).cleanable(true))
                     .child(
                         div()
@@ -4643,16 +4715,6 @@ fn rule_set_label(id: &str) -> String {
         _ => return id.to_string(),
     };
     label.to_string()
-}
-
-fn rule_provider_source_label(base: &str) -> &'static str {
-    if base.contains("jsdelivr") {
-        "jsDelivr"
-    } else if base.contains("github.com") {
-        "GitHub"
-    } else {
-        "自定义"
-    }
 }
 
 fn icon_action(

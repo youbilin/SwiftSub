@@ -2493,12 +2493,7 @@ impl SwiftSubApp {
     }
 
     pub fn toggle_template_rule_set(&mut self, id: String, enabled: bool, cx: &mut Context<Self>) {
-        if enabled {
-            self.template_disabled_rule_sets.remove(&id);
-        } else {
-            self.template_disabled_rule_sets.insert(id);
-        }
-        cx.notify();
+        self.set_template_source_rules("builtin".into(), vec![id], enabled, cx);
     }
 
     pub fn toggle_template_source_rule_set(
@@ -2529,6 +2524,12 @@ impl SwiftSubApp {
             for id in entry_ids {
                 if enabled {
                     self.template_disabled_rule_sets.remove(&id);
+                    if let Some(module) = catalog::MODULES
+                        .iter()
+                        .find(|module| module.rule_sets.iter().any(|spec| spec.id == id))
+                    {
+                        self.template_enabled_modules.insert(module.id.to_string());
+                    }
                 } else {
                     self.template_disabled_rule_sets.insert(id);
                 }
