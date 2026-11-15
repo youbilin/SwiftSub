@@ -3,6 +3,7 @@
 mod app;
 mod desktop;
 mod rule_catalog;
+mod saved_document;
 mod ui;
 
 use app::SwiftSubApp;

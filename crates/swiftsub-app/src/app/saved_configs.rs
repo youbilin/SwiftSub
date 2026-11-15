@@ -9,7 +9,7 @@ fn clash_import_uri(subscription_url: &str, name: &str) -> String {
     uri.into()
 }
 
-fn validate_yaml(yaml: &str) -> Result<(), String> {
+pub(super) fn validate_yaml(yaml: &str) -> Result<(), String> {
     let value: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(yaml).map_err(|e| format!("YAML 格式错误：{e}"))?;
     let map = value.as_mapping().ok_or("配置必须是 YAML 对象")?;
@@ -84,6 +84,14 @@ impl SwiftSubApp {
             })
     }
     pub fn open_saved_config(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saved_config_id.as_deref() == Some(&id) {
+            self.page = Page::SavedConfigs;
+            cx.notify();
+            return;
+        }
+        if let Err(e) = self.autosave_saved_editor(window, cx) {
+            self.saved_config_error = Some(e);
+        }
         // Keep unfinished text when moving between entries; switching never silently loses edits.
         if let Err(e) = self.checkpoint_yaml_editor(cx) {
             self.saved_config_error = Some(e);
@@ -108,10 +116,12 @@ impl SwiftSubApp {
             .update(cx, |s, cx| s.set_value(name, window, cx));
         self.saved_config_yaml
             .update(cx, |s, cx| s.set_value(yaml, window, cx));
+        self.load_saved_visual(window, cx);
         self.page = Page::SavedConfigs;
         cx.notify();
     }
     pub(super) fn checkpoint_yaml_editor(&self, cx: &Context<Self>) -> Result<(), String> {
+        self.checkpoint_saved_form(cx)?;
         if let Some(id) = &self.saved_config_id {
             let key = format!("yaml-editor:{id}");
             let text = if self.saved_config_dirty(cx) {
@@ -245,6 +255,11 @@ impl SwiftSubApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if let Err(e) = self.autosave_saved_editor(window, cx) {
+            self.saved_config_error = Some(e);
+            cx.notify();
+            return false;
+        }
         let name = self.saved_config_name.read(cx).value().trim().to_string();
         let yaml = self.saved_config_yaml.read(cx).value().to_string();
         let Some(config) = self
@@ -298,52 +313,10 @@ impl SwiftSubApp {
             }
         }
     }
-    pub fn load_saved_generator(
-        &mut self,
-        id: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(config) = self.saved_configs.iter().find(|c| c.id == id).cloned() else {
-            return;
-        };
-        let result = config
-            .source_json
-            .as_deref()
-            .ok_or("这份配置没有原生成设置，可直接编辑 YAML".to_string())
-            .and_then(|s| {
-                serde_json::from_str::<super::profiles::ProfileConfig>(s).map_err(|e| e.to_string())
-            });
-        match result {
-            Ok(source) => {
-                if let Err(e) = self.checkpoint_yaml_editor(cx) {
-                    self.saved_config_error = Some(e);
-                    return;
-                }
-                if self.template_session_active {
-                    self.request_close_template(window, cx);
-                }
-                if self.template_session_active {
-                    self.show_toast("请先修正未完成的分流配置，编辑内容已保留".into(), cx);
-                    return;
-                }
-                self.profile_membership = source.membership;
-                self.load_template_draft(source.routing, config.name, None, window, cx);
-                self.editing_saved_config = Some(id);
-                self.refresh_profile_nodes(cx);
-                if let Err(e) = self.autosave_routing(window, cx) {
-                    self.template_error = Some(e);
-                }
-                self.show_toast(
-                    "已载入原生成设置，修改后可更新原配置或保存为新配置".into(),
-                    cx,
-                );
-            }
-            Err(e) => self.show_toast(e, cx),
-        }
-    }
     pub fn import_saved_to_clash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.saved_config_dirty(cx) && !self.save_yaml_editor(false, window, cx) {
+        if let Err(e) = self.autosave_saved_editor(window, cx) {
+            self.saved_config_error = Some(e);
+            cx.notify();
             return;
         }
         let Some(config) = self

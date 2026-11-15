@@ -1,6 +1,8 @@
 mod lifecycle;
 mod profiles;
 mod saved_configs;
+mod saved_editor;
+pub use saved_editor::{SavedEditor, SavedEditorTab};
 mod sharing;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -346,6 +348,7 @@ pub struct SwiftSubApp {
     pub saved_configs: Vec<swiftsub_store::SavedConfig>,
     pub saved_config_id: Option<String>,
     pub saved_config_name: Entity<InputState>,
+    pub saved_editor: SavedEditor,
     pub generated_config_name: Entity<InputState>,
     pub generated_save_open: bool,
     pub generated_save_update: bool,
@@ -631,6 +634,7 @@ impl SwiftSubApp {
         let profile_name_input = cx.new(|cx| InputState::new(window, cx).placeholder("配置名称"));
         let generated_config_name =
             cx.new(|cx| InputState::new(window, cx).placeholder("配置名称"));
+        let saved_editor = SavedEditor::new(window, cx);
         let saved_config_name = cx.new(|cx| InputState::new(window, cx).placeholder("配置名称"));
         let saved_config_yaml =
             cx.new(|cx| TextareaState::new(window, cx).placeholder("选择或保存一份 YAML 配置"));
@@ -680,6 +684,7 @@ impl SwiftSubApp {
             saved_configs: Vec::new(),
             saved_config_id: None,
             saved_config_name,
+            saved_editor,
             generated_config_name,
             generated_save_open: false,
             generated_save_update: false,
@@ -824,6 +829,22 @@ impl SwiftSubApp {
             cx.observe_in(&app.saved_config_name, window, |_, _, _, cx| cx.notify());
         let template_rule_search_obs =
             cx.observe_in(&app.template_rule_search, window, |_, _, _, cx| cx.notify());
+        let visual_inputs = [
+            app.saved_editor.search.clone(),
+            app.saved_editor.member_search.clone(),
+            app.saved_editor.group_name.clone(),
+            app.saved_editor.group_url.clone(),
+            app.saved_editor.group_interval.clone(),
+            app.saved_editor.node_name.clone(),
+            app.saved_editor.node_server.clone(),
+            app.saved_editor.node_port.clone(),
+            app.saved_editor.new_rule.clone(),
+            app.saved_editor.mixed_port.clone(),
+        ];
+        let visual_observers: Vec<_> = visual_inputs
+            .iter()
+            .map(|input| cx.observe_in(input, window, |_, _, _, cx| cx.notify()))
+            .collect();
         app._subscriptions = vec![
             add_url_sub,
             add_name_sub,
@@ -835,6 +856,7 @@ impl SwiftSubApp {
             saved_name_obs,
             generated_name_obs,
         ];
+        app._subscriptions.extend(visual_observers);
 
         let args: Vec<String> = std::env::args().collect();
         let demo_mode = args.iter().any(|arg| arg == "--demo");
@@ -928,6 +950,11 @@ impl SwiftSubApp {
         app.recount_manual_nodes();
         app.start_server();
         app.start_scheduler(cx);
+        if app.page == Page::SavedConfigs && app.saved_config_id.is_none() {
+            if let Some(config) = app.saved_configs.first() {
+                app.open_saved_config(config.id.clone(), window, cx);
+            }
+        }
         app.start_desktop_lifecycle(window, cx);
         app.restore_draft(window, cx);
         app
@@ -1043,6 +1070,9 @@ impl SwiftSubApp {
     }
 
     pub fn set_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(e) = self.autosave_saved_editor(window, cx) {
+            self.saved_config_error = Some(e);
+        }
         if let Err(e) = self.checkpoint_yaml_editor(cx) {
             self.saved_config_error = Some(e);
             return;
