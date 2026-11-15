@@ -144,10 +144,7 @@ const META_RULES: &[RuleSetSpec] = &[
     domain("facebook", "geosite/facebook.mrs"),
     domain("instagram", "geosite/instagram.mrs"),
 ];
-const STEAM_RULES: &[RuleSetSpec] = &[
-    domain("steam", "geosite/steam.mrs"),
-    ipcidr("steam-ip", "geoip/steam.mrs"),
-];
+const STEAM_RULES: &[RuleSetSpec] = &[domain("steam", "geosite/steam.mrs")];
 const PAYPAL_RULES: &[RuleSetSpec] = &[domain("paypal", "geosite/paypal.mrs")];
 
 pub static MODULES: &[Module] = &[
@@ -655,6 +652,9 @@ pub fn rule_priority(module: &Module) -> u16 {
     match module.id {
         "ad" => 10,
         "private" => 20,
+        // Specific products precede their broad vendor / category lists.
+        "gemini" | "youtube" | "onedrive" | "xbox" => 100,
+        "google" | "microsoft" | "apple" | "meta" => 600,
         "final" => 1000,
         "cn" => 800,
         "global" => 850,

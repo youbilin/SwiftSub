@@ -194,3 +194,59 @@ pub fn set_autostart(enabled: bool) -> Result<(), String> {
         Err("当前平台暂不支持开机自启".into())
     }
 }
+
+/// Open the registered Verge handler, with support for its legacy Clash scheme.
+pub fn open_clash_verge(uri: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut std::ffi::c_void,
+                operation: *const u16,
+                file: *const u16,
+                params: *const u16,
+                directory: *const u16,
+                show: i32,
+            ) -> isize;
+        }
+        let operation: Vec<u16> = "open\0".encode_utf16().collect();
+        for candidate in [
+            uri.replacen("clash://", "clash-verge://", 1),
+            uri.to_string(),
+        ] {
+            let scheme = candidate.split_once("://").map(|p| p.0).unwrap_or("clash");
+            if !registry_command()
+                .args([
+                    "query",
+                    &format!(r"HKCR\{scheme}\shell\open\command"),
+                    "/ve",
+                ])
+                .output()
+                .is_ok_and(|output| output.status.success())
+            {
+                continue;
+            }
+            let file: Vec<u16> = candidate.encode_utf16().chain(std::iter::once(0)).collect();
+            let result = unsafe {
+                ShellExecuteW(
+                    std::ptr::null_mut(),
+                    operation.as_ptr(),
+                    file.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1,
+                )
+            };
+            if result > 32 {
+                return Ok(());
+            }
+        }
+        Err("未能打开 Clash Verge，请先启动客户端并启用链接关联".into())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = uri;
+        Err("当前平台暂不支持直接导入，请复制订阅地址".into())
+    }
+}

@@ -248,13 +248,14 @@ impl SwiftSubApp {
                                     .child(status_text),
                             ),
                     )
-                    .child(icon_action(
-                        "theme-toggle",
-                        if self.light_theme { "☾" } else { "☀" },
-                        MUTED,
-                        cx,
-                        |this, _, cx| this.set_theme(!this.light_theme, cx),
-                    ))
+                    .child(Button::new("theme-toggle").ghost().small()
+                        .icon(gpui_kit::component::Icon::default().data(if self.light_theme {
+                            br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.8 13A9 9 0 0 1 11 3.2 9 9 0 1 0 20.8 13Z"/></svg>"#
+                        } else {
+                            br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></svg>"#
+                        }))
+                        .tooltip(if self.light_theme {"切换深色"} else {"切换浅色"})
+                        .on_click(cx.listener(|this,_,_,cx| this.set_theme(!this.light_theme,cx))))
                     .when(self.server_url.is_some(), |this| {
                         this.child(text_action(
                             "copy-server-header",
@@ -760,14 +761,14 @@ impl SwiftSubApp {
                             .gap_2()
                             .child(text_action(
                                 "import-clipboard",
-                                "从剪贴板导入",
+                                "粘贴节点",
                                 ACCENT,
                                 cx,
                                 |this, window, cx| this.import_from_clipboard(window, cx),
                             ))
                             .child(text_action(
                                 "import-file",
-                                "导入 YAML 文件",
+                                "从 YAML 提取节点",
                                 MUTED,
                                 cx,
                                 |this, window, cx| this.import_file(window, cx),
@@ -1173,6 +1174,7 @@ impl SwiftSubApp {
                     .child(
                         Switch::new(format!("module-{id}"))
                             .small()
+                            .disabled(matches!(module.id, "select" | "auto" | "final"))
                             .checked(enabled)
                             .on_change(cx.listener(move |this, checked, _, cx| {
                                 this.toggle_template_module(id.clone(), *checked, cx)
@@ -2083,28 +2085,6 @@ impl SwiftSubApp {
                     .child(self.template_tab_pill("高级配置", TemplateTab::Advanced, cx))
                     .child(self.template_tab_pill("变更预览", TemplateTab::Changes, cx)),
             )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .flex_shrink_0()
-                    .min_w_0()
-                    .when(self.recovered_draft, |row| {
-                        row.child(tag("已恢复编辑", ACCENT))
-                    })
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(10.5))
-                            .text_color(rgb(MUTED))
-                            .child(if self.template_error.is_some() {
-                                "编辑内容已保留，修正后自动更新输出".to_string()
-                            } else {
-                                "修改自动保存 · 可直接收起或切换页面".to_string()
-                            }),
-                    ),
-            )
             .child(tab_content)
             .when_some(self.template_error.clone(), |this, error| {
                 this.child(
@@ -2804,7 +2784,7 @@ impl SwiftSubApp {
                                 .ghost()
                                 .label("更新原配置")
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.save_generated_config(true, window, cx)
+                                    this.begin_save_generated(true, window, cx)
                                 })),
                         )
                     })
@@ -2813,7 +2793,7 @@ impl SwiftSubApp {
                             .primary()
                             .label("保存新配置")
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.save_generated_config(false, window, cx)
+                                this.begin_save_generated(false, window, cx)
                             })),
                     )
                     .child(
@@ -2823,6 +2803,55 @@ impl SwiftSubApp {
                             .on_click(cx.listener(|this, _, _, cx| this.export_preview(cx))),
                     ),
             )
+            .when(self.generated_save_open, |column| {
+                column.child(
+                    h_flex()
+                        .gap_2()
+                        .flex_wrap()
+                        .flex_shrink_0()
+                        .px_3()
+                        .py_2()
+                        .rounded(px(8.))
+                        .bg(rgb(SURFACE))
+                        .child(div().text_size(px(12.)).child("配置名称"))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(180.))
+                                .child(Input::new(&self.generated_config_name).cleanable(true)),
+                        )
+                        .child(
+                            Button::new("confirm-generated-save")
+                                .primary()
+                                .label(if self.generated_save_update {
+                                    "更新配置"
+                                } else {
+                                    "保存到我的配置"
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.save_generated_config(
+                                        this.generated_save_update,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
+                            Button::new("save-import-clash")
+                                .ghost()
+                                .label("保存并导入 Clash Verge")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    if this.save_generated_config(
+                                        this.generated_save_update,
+                                        window,
+                                        cx,
+                                    ) {
+                                        this.import_saved_to_clash(window, cx);
+                                    }
+                                })),
+                        ),
+                )
+            })
             .child(div().flex_1().min_h_0().child(panels))
             .into_any_element()
     }
@@ -3120,7 +3149,12 @@ impl SwiftSubApp {
             .collect();
         let services: Vec<&Module> = catalog::MODULES
             .iter()
-            .filter(|module| matches!(module.kind, ModuleKind::Service) && module.id != "global")
+            .filter(|module| {
+                matches!(
+                    module.kind,
+                    ModuleKind::Service | ModuleKind::DirectFirst | ModuleKind::RejectFirst
+                ) && !matches!(module.id, "ad" | "private" | "cn" | "global")
+            })
             .collect();
         let total = core.len() + services.len();
         let enabled = core
@@ -4392,7 +4426,7 @@ impl SwiftSubApp {
             );
         }
         settings_section(
-            "多配置管理",
+            "生成工作区",
             vec![rows.into_any_element()],
             Button::new("subscription-qr")
                 .ghost()
@@ -4578,7 +4612,7 @@ impl SwiftSubApp {
             .when(compact, |nav| nav.flex_row().flex_wrap())
             .when(!compact, |nav| nav.flex_col().w(px(160.)).flex_shrink_0());
         for (tab, label) in [
-            (SettingsTab::Profiles, "配置管理"),
+            (SettingsTab::Profiles, "生成工作区"),
             (SettingsTab::Service, "本地订阅"),
             (SettingsTab::Generation, "规则与生成"),
             (SettingsTab::Desktop, "桌面与编辑"),

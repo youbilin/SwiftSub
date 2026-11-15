@@ -734,6 +734,11 @@ fn mixed_source_broad_rules_follow_service_rules_and_precede_final() {
             .position(|r| r.starts_with(&format!("RULE-SET,{id},")))
             .unwrap()
     };
+    assert!(at("google-gemini") < at("google"));
+    assert!(at("google-gemini") < at("category-ai-chat-!cn"));
+    assert!(at("youtube") < at("google"));
+    assert!(at("onedrive") < at("microsoft"));
+    assert!(at("xbox") < at("microsoft"));
     assert!(at("bm-youtube") < at("acl-global"));
     assert!(at("acl-global") < at("loy-cn"));
     assert_eq!(lines.last().unwrap(), "MATCH,漏网之鱼");

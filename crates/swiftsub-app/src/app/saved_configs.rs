@@ -1,5 +1,14 @@
 use super::*;
 
+fn clash_import_uri(subscription_url: &str, name: &str) -> String {
+    let mut uri = url::Url::parse("clash://install-config").expect("static URI");
+    // Verge reads all remaining text after url= as the nested URL. Keep url last.
+    uri.query_pairs_mut()
+        .append_pair("name", name)
+        .append_pair("url", subscription_url);
+    uri.into()
+}
+
 fn validate_yaml(yaml: &str) -> Result<(), String> {
     let value: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(yaml).map_err(|e| format!("YAML 格式错误：{e}"))?;
@@ -126,19 +135,40 @@ impl SwiftSubApp {
         }
         Ok(())
     }
-    pub fn save_generated_config(
+    pub fn begin_save_generated(
         &mut self,
         update: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let name = if update {
+            self.editing_saved_config
+                .as_ref()
+                .and_then(|id| self.saved_configs.iter().find(|c| &c.id == id))
+                .map(|c| c.name.clone())
+        } else {
+            None
+        }
+        .unwrap_or_else(|| format!("配置 {}", Local::now().format("%m-%d %H:%M")));
+        self.generated_config_name
+            .update(cx, |input, cx| input.set_value(name, window, cx));
+        self.generated_save_update = update;
+        self.generated_save_open = true;
+        cx.notify();
+    }
+    pub fn save_generated_config(
+        &mut self,
+        update: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if let Err(e) = self.autosave_routing(window, cx) {
             self.show_toast(format!("请先修正分流配置：{e}"), cx);
-            return;
+            return false;
         }
         if let Err(e) = validate_yaml(&self.preview) {
             self.show_toast(e, cx);
-            return;
+            return false;
         }
         let existing = if update {
             self.editing_saved_config
@@ -150,12 +180,18 @@ impl SwiftSubApp {
         };
         if update && existing.is_none() {
             self.show_toast("原配置已删除，请保存为新配置".into(), cx);
-            return;
+            return false;
         }
-        let name = existing
-            .as_ref()
-            .map(|c| c.name.clone())
-            .unwrap_or_else(|| format!("我的配置 {}", Local::now().format("%Y-%m-%d %H:%M:%S")));
+        let name = self
+            .generated_config_name
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            self.show_toast("请输入配置名称".into(), cx);
+            return false;
+        }
         let result = self
             .profile_snapshot_json(self.active_template_snapshot())
             .and_then(|source| {
@@ -173,6 +209,7 @@ impl SwiftSubApp {
             });
         match result {
             Ok(config) => {
+                self.generated_save_open = false;
                 self.editing_saved_config = None;
                 if self.saved_config_id.as_ref() == Some(&config.id) {
                     self.saved_config_id = None;
@@ -194,11 +231,20 @@ impl SwiftSubApp {
                     .into(),
                     cx,
                 );
+                true
             }
-            Err(e) => self.show_toast(format!("保存失败：{e}"), cx),
+            Err(e) => {
+                self.show_toast(format!("保存失败：{e}"), cx);
+                false
+            }
         }
     }
-    pub fn save_yaml_editor(&mut self, copy: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn save_yaml_editor(
+        &mut self,
+        copy: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let name = self.saved_config_name.read(cx).value().trim().to_string();
         let yaml = self.saved_config_yaml.read(cx).value().to_string();
         let Some(config) = self
@@ -207,7 +253,7 @@ impl SwiftSubApp {
             .and_then(|id| self.saved_configs.iter().find(|c| &c.id == id))
             .cloned()
         else {
-            return;
+            return false;
         };
         let result = validate_yaml(&yaml).and_then(|_| {
             self.store
@@ -243,10 +289,12 @@ impl SwiftSubApp {
                     .into(),
                     cx,
                 );
+                true
             }
             Err(e) => {
                 self.saved_config_error = Some(e);
                 cx.notify();
+                false
             }
         }
     }
@@ -292,6 +340,57 @@ impl SwiftSubApp {
                 );
             }
             Err(e) => self.show_toast(e, cx),
+        }
+    }
+    pub fn import_saved_to_clash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saved_config_dirty(cx) && !self.save_yaml_editor(false, window, cx) {
+            return;
+        }
+        let Some(config) = self
+            .saved_config_id
+            .as_ref()
+            .and_then(|id| self.saved_configs.iter().find(|c| &c.id == id))
+        else {
+            return;
+        };
+        let Some(server) = &self.server else {
+            self.show_toast("本地订阅服务未启动".into(), cx);
+            return;
+        };
+        let uri = clash_import_uri(&server.profile_url(&config.id, "config.yaml"), &config.name);
+        match crate::desktop::open_clash_verge(&uri) {
+            Ok(()) => self.show_toast("已发送到 Clash Verge".into(), cx),
+            Err(e) => self.show_toast(e, cx),
+        }
+    }
+    pub fn import_yaml_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("YAML", &["yaml", "yml"])
+            .pick_file()
+        else {
+            return;
+        };
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("导入配置");
+        let result = std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|yaml| {
+                validate_yaml(&yaml)?;
+                self.store
+                    .lock()
+                    .unwrap()
+                    .save_yaml_config(&self.data_dir.join("configs"), None, name, &yaml, None)
+                    .map_err(|e| e.to_string())
+            });
+        match result {
+            Ok(config) => {
+                self.reload_saved_configs();
+                self.open_saved_config(config.id, window, cx);
+                self.show_toast("已导入 YAML".into(), cx);
+            }
+            Err(e) => self.show_toast(format!("导入失败：{e}"), cx),
         }
     }
     pub fn export_saved_yaml(&mut self, cx: &mut Context<Self>) {
@@ -359,6 +458,26 @@ impl SwiftSubApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn verge_import_preserves_unicode_name_and_nested_subscription_url() {
+        let name = "工作 & 游戏 + 100% #1";
+        let nested = "http://127.0.0.1:8765/p/id/config.yaml?token=a+b%2Fc&x=1#section";
+        let uri = clash_import_uri(nested, name);
+        let parsed = url::Url::parse(&uri).unwrap();
+        let pairs: Vec<_> = parsed.query_pairs().collect();
+        assert_eq!(parsed.scheme(), "clash");
+        assert_eq!(parsed.host_str(), Some("install-config"));
+        assert_eq!(pairs[0].0, "name");
+        assert_eq!(pairs[0].1, name);
+        assert_eq!(pairs[1].0, "url");
+        assert_eq!(pairs[1].1, nested);
+        assert_eq!(pairs.len(), 2);
+        // The raw tail must be one encoded URL, with no outer parameters after it.
+        let raw_tail = parsed.query().unwrap().split_once("url=").unwrap().1;
+        assert!(!raw_tail.contains('&'));
+        assert!(!raw_tail.contains('+'));
+    }
+
     #[test]
     fn validates_yaml_before_saving_without_reformatting_it() {
         for text in [

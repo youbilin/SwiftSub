@@ -17,6 +17,7 @@ rfd = "0.18"
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
+url.workspace = true
 swiftsub-core = { path = "../swiftsub-core" }
 swiftsub-fetch = { path = "../swiftsub-fetch" }
 swiftsub-server = { path = "../swiftsub-server" }

@@ -346,6 +346,9 @@ pub struct SwiftSubApp {
     pub saved_configs: Vec<swiftsub_store::SavedConfig>,
     pub saved_config_id: Option<String>,
     pub saved_config_name: Entity<InputState>,
+    pub generated_config_name: Entity<InputState>,
+    pub generated_save_open: bool,
+    pub generated_save_update: bool,
     pub saved_config_yaml: Entity<TextareaState>,
     pub saved_config_error: Option<String>,
     pub saved_config_delete_armed: bool,
@@ -626,6 +629,8 @@ impl SwiftSubApp {
             .list_profiles()
             .unwrap_or_default();
         let profile_name_input = cx.new(|cx| InputState::new(window, cx).placeholder("配置名称"));
+        let generated_config_name =
+            cx.new(|cx| InputState::new(window, cx).placeholder("配置名称"));
         let saved_config_name = cx.new(|cx| InputState::new(window, cx).placeholder("配置名称"));
         let saved_config_yaml =
             cx.new(|cx| TextareaState::new(window, cx).placeholder("选择或保存一份 YAML 配置"));
@@ -675,6 +680,9 @@ impl SwiftSubApp {
             saved_configs: Vec::new(),
             saved_config_id: None,
             saved_config_name,
+            generated_config_name,
+            generated_save_open: false,
+            generated_save_update: false,
             saved_config_yaml,
             saved_config_error: None,
             saved_config_delete_armed: false,
@@ -731,7 +739,7 @@ impl SwiftSubApp {
             advanced_draft,
             template_tab: TemplateTab::RuleSets,
             template_rule_link_open: false,
-            settings_tab: SettingsTab::Profiles,
+            settings_tab: SettingsTab::Service,
             template_rule_sources_collapsed: rule_catalog::SOURCES
                 .iter()
                 .map(|source| source.id.to_string())
@@ -808,6 +816,10 @@ impl SwiftSubApp {
             });
         let saved_yaml_obs =
             cx.observe_in(&app.saved_config_yaml, window, |_, _, _, cx| cx.notify());
+        let generated_name_obs =
+            cx.observe_in(&app.generated_config_name, window, |_, _, _, cx| {
+                cx.notify()
+            });
         let saved_name_obs =
             cx.observe_in(&app.saved_config_name, window, |_, _, _, cx| cx.notify());
         let template_rule_search_obs =
@@ -821,6 +833,7 @@ impl SwiftSubApp {
             member_search_obs,
             saved_yaml_obs,
             saved_name_obs,
+            generated_name_obs,
         ];
 
         let args: Vec<String> = std::env::args().collect();

@@ -43,7 +43,7 @@ impl SwiftSubApp {
                     .p_3()
                     .text_size(px(12.))
                     .text_color(rgb(MUTED))
-                    .child("还没有保存的配置。生成后点击「保存新配置」，每次都会新增一份。"),
+                    .child("暂无配置"),
             );
         }
         let selected = self
@@ -71,9 +71,17 @@ impl SwiftSubApp {
                         .child(
                             Button::new("saved-update")
                                 .primary()
-                                .label("更新此配置")
+                                .label("保存修改")
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.save_yaml_editor(false, window, cx)
+                                    this.save_yaml_editor(false, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("saved-clash-verge")
+                                .ghost()
+                                .label("导入 Clash Verge")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.import_saved_to_clash(window, cx)
                                 })),
                         )
                         .child(
@@ -81,7 +89,7 @@ impl SwiftSubApp {
                                 .ghost()
                                 .label("另存一份")
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.save_yaml_editor(true, window, cx)
+                                    this.save_yaml_editor(true, window, cx);
                                 })),
                         ),
                 )
@@ -101,9 +109,9 @@ impl SwiftSubApp {
                                     MUTED
                                 }))
                                 .child(if self.saved_config_dirty(cx) {
-                                    "有修改 · 点击更新写入当前文件，或另存一份"
+                                    "未保存"
                                 } else {
-                                    "已保存 · 重新生成不会覆盖这份 YAML"
+                                    "已保存"
                                 }),
                         )
                         .when(config.source_json.is_some(), |row| {
@@ -111,7 +119,7 @@ impl SwiftSubApp {
                                 Button::new("saved-generator")
                                     .ghost()
                                     .small()
-                                    .label("原生成设置")
+                                    .label("调整生成选项")
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.load_saved_generator(id.clone(), window, cx)
                                     })),
@@ -173,18 +181,6 @@ impl SwiftSubApp {
                         .min_h_0()
                         .child(Textarea::new(&self.saved_config_yaml).h_full()),
                 )
-                .child(
-                    div()
-                        .text_size(px(10.5))
-                        .text_color(rgb(MUTED))
-                        .truncate()
-                        .child(
-                            config
-                                .path(&self.data_dir.join("configs"))
-                                .display()
-                                .to_string(),
-                        ),
-                )
                 .into_any_element()
         } else {
             v_flex()
@@ -198,7 +194,7 @@ impl SwiftSubApp {
                     div()
                         .text_size(px(12.))
                         .text_color(rgb(MUTED))
-                        .child("保存生成的 YAML 后，在这里独立命名、编辑、更新和导出。"),
+                        .child("生成或导入 YAML，开始编辑。"),
                 )
                 .child(
                     Button::new("saved-go-generator")
@@ -228,10 +224,24 @@ impl SwiftSubApp {
                             .child(format!("我的配置 · {}", self.saved_configs.len())),
                     )
                     .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(MUTED))
-                            .child("每份配置独立保存为 YAML 文件"),
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("library-new")
+                                    .ghost()
+                                    .label("生成配置")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.set_page(Page::Generator, window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("library-import-yaml")
+                                    .primary()
+                                    .label("导入 YAML")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.import_yaml_config(window, cx)
+                                    })),
+                            ),
                     ),
             )
             .child(
