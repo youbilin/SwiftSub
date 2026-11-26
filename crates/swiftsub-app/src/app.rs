@@ -474,7 +474,14 @@ impl SwiftSubApp {
         let store = Arc::new(Mutex::new(store));
         let light_theme = {
             let guard = lock_store(&store);
-            guard.get_setting("theme").ok().flatten().as_deref() != Some("dark")
+            let mode = crate::ui::AppThemeMode::from_setting(
+                guard.get_setting("theme").ok().flatten().as_deref(),
+            );
+            let system_is_light = matches!(
+                window.appearance(),
+                WindowAppearance::Light | WindowAppearance::VibrantLight
+            );
+            mode.resolve_light(system_is_light)
         };
         let (server_bind_lan, server_lan_host, update_repo) = {
             let guard = lock_store(&store);
@@ -1055,6 +1062,11 @@ impl SwiftSubApp {
             return;
         }
         self.light_theme = light;
+        self.p1.theme_mode = if light {
+            crate::ui::AppThemeMode::Light
+        } else {
+            crate::ui::AppThemeMode::Dark
+        };
         {
             let store = lock_store(&self.store);
             let _ = store.set_setting("theme", if light { "light" } else { "dark" });

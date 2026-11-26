@@ -341,16 +341,22 @@ impl SwiftSubApp {
         }
     }
     pub(super) fn refresh_config_summaries(&mut self) {
-        self.workspace.config_summaries = self
-            .saved_configs
-            .iter()
-            .map(|config| {
-                (
-                    config.id.clone(),
-                    workspace::ConfigSummary::from_config(config),
-                )
-            })
-            .collect();
+        let mut next_cache = HashMap::with_capacity(self.saved_configs.len());
+        let mut next_summaries = HashMap::with_capacity(self.saved_configs.len());
+        for config in &self.saved_configs {
+            let fingerprint = (config.updated_at, config.yaml.len());
+            let summary = self
+                .p1
+                .summary_cache
+                .get(&config.id)
+                .filter(|(cached_fp, _)| *cached_fp == fingerprint)
+                .map(|(_, summary)| summary.clone())
+                .unwrap_or_else(|| workspace::ConfigSummary::from_config(config));
+            next_cache.insert(config.id.clone(), (fingerprint, summary.clone()));
+            next_summaries.insert(config.id.clone(), summary);
+        }
+        self.p1.summary_cache = next_cache;
+        self.workspace.config_summaries = next_summaries;
     }
     pub fn saved_config_dirty(&self, cx: &Context<Self>) -> bool {
         self.saved_config_id

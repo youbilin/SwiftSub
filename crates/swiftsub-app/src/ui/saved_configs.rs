@@ -1,7 +1,7 @@
-use super::layout::{
-    configuration_icon, disclosure_icon, grip_icon, lan_icon, link_icon, swap_icon,
+use super::icons::{
+    configuration_icon, disclosure_icon, grip_icon, history_icon, lan_icon, link_icon, qr_icon,
+    swap_icon,
 };
-use super::phase2::{history_icon, qr_icon};
 use super::*;
 use crate::app::SavedEditorTab;
 use crate::saved_document::{SavedDocument, rule_target, text};

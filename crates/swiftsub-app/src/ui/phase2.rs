@@ -9,44 +9,63 @@
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 
-use super::layout::{close_icon, object_action};
+use super::icons::{batch_icon, close_icon, qr_icon};
+use super::layout::object_action;
 use super::*;
 use crate::app::phase2::format_bytes_human;
 
-pub(super) fn qr_icon() -> gpui_kit::component::Icon {
-    gpui_kit::component::Icon::default().data(
-        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM17 17h4v4h-4zM14 20h1M20 14h1"/></svg>"#,
-    )
-}
-
-pub(super) fn history_icon() -> gpui_kit::component::Icon {
-    gpui_kit::component::Icon::default().data(
-        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/></svg>"#,
-    )
-}
-
-pub(super) fn rotate_icon() -> gpui_kit::component::Icon {
-    gpui_kit::component::Icon::default().data(
-        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>"#,
-    )
-}
-
-pub(super) fn logs_icon() -> gpui_kit::component::Icon {
-    gpui_kit::component::Icon::default().data(
-        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>"#,
-    )
-}
-
-pub(super) fn batch_icon() -> gpui_kit::component::Icon {
-    gpui_kit::component::Icon::default().data(
-        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 11 3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>"#,
-    )
-}
-
 impl SwiftSubApp {
-    /// Extra rows for Settings -> Application Behavior: silent auto-start + backup/restore.
+    /// Extra rows for Settings -> Application Behavior: appearance mode, silent auto-start, backup/restore.
     pub(super) fn app_behavior_p1_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let theme_mode = self.p1.theme_mode;
         let mut rows = vec![
+            h_flex()
+                .min_w_0()
+                .py(px(6.))
+                .gap_4()
+                .child(
+                    div()
+                        .w(px(110.))
+                        .flex_shrink_0()
+                        .text_size(px(12.))
+                        .text_color(rgb(MUTED))
+                        .child("外观主题"),
+                )
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            Button::new("theme-mode-system")
+                                .ghost()
+                                .label("跟随系统")
+                                .when(theme_mode == AppThemeMode::System, |b| b.primary())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_theme_mode(AppThemeMode::System, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("theme-mode-light")
+                                .ghost()
+                                .label("浅色")
+                                .when(theme_mode == AppThemeMode::Light, |b| b.primary())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_theme_mode(AppThemeMode::Light, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("theme-mode-dark")
+                                .ghost()
+                                .label("深色")
+                                .when(theme_mode == AppThemeMode::Dark, |b| b.primary())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_theme_mode(AppThemeMode::Dark, window, cx)
+                                })),
+                        ),
+                )
+                .into_any_element(),
             h_flex()
                 .min_w_0()
                 .py(px(6.))

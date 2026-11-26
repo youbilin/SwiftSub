@@ -1,4 +1,7 @@
-use super::phase2::{history_icon, logs_icon, qr_icon, rotate_icon};
+pub(super) use super::icons::{
+    close_icon, configuration_icon, disclosure_icon, edit_icon, grip_icon, history_icon, lan_icon,
+    link_icon, logs_icon, plus_icon, qr_icon, rotate_icon, swap_icon,
+};
 use super::*;
 use crate::app::{WorkspaceNodeKind, chain_order_key};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -17,46 +20,6 @@ struct ObjectOrderDrag {
     key: String,
     name: String,
     position: usize,
-}
-
-pub(super) fn grip_icon() -> gpui_kit::component::Icon {
-    gpui_kit::component::Icon::default().data(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6" r="1.5"/><circle cx="15" cy="6" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="18" r="1.5"/><circle cx="15" cy="18" r="1.5"/></svg>"#)
-}
-
-pub(super) fn disclosure_icon(open: bool) -> gpui_kit::component::Icon {
-    gpui_kit::component::Icon::default().data(if open {
-        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>"#
-    } else {
-        br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>"#
-    })
-}
-
-pub(super) fn configuration_icon() -> gpui_kit::component::Icon {
-    gpui_kit::component::Icon::default().data(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z"/><path d="M14 3v6h6M8 13h8M8 17h5"/></svg>"#)
-}
-
-pub(super) fn link_icon() -> gpui_kit::component::Icon {
-    gpui_kit::component::Icon::default().data(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="m10 13 4-4M8 15l-1 1a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0M16 9l1-1a4 4 0 0 1 6 6l-4 4a4 4 0 0 1-6 0"/></svg>"#)
-}
-
-pub(super) fn lan_icon() -> gpui_kit::component::Icon {
-    gpui_kit::component::Icon::default().data(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>"#)
-}
-
-pub(super) fn swap_icon() -> gpui_kit::component::Icon {
-    gpui_kit::component::Icon::default().data(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14m-4-4 4 4-4 4"/></svg>"#)
-}
-
-pub(super) fn edit_icon() -> gpui_kit::component::Icon {
-    gpui_kit::component::Icon::default().data(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m16 3 5 5-12 12-6 1 1-6Z"/><path d="m13 6 5 5"/></svg>"#)
-}
-
-pub(super) fn plus_icon() -> gpui_kit::component::Icon {
-    gpui_kit::component::Icon::default().data(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>"#)
-}
-
-pub(super) fn close_icon() -> gpui_kit::component::Icon {
-    gpui_kit::component::Icon::default().data(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="m6 6 12 12M6 18 18 6"/></svg>"#)
 }
 
 fn order_drop_target<E: InteractiveElement>(

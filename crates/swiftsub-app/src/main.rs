@@ -41,6 +41,36 @@ fn main() {
     });
 }
 
+fn platform_ui_font() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "Microsoft YaHei UI"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        ".AppleSystemUIFont"
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        "Noto Sans CJK SC"
+    }
+}
+
+fn platform_mono_font() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "Consolas"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "Menlo"
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        "JetBrains Mono"
+    }
+}
+
 pub(crate) fn configure_theme(cx: &mut App, light: bool) {
     let (primary, hover, active) = if light {
         (rgb(0x3b6ef5), rgb(0x2f5ee0), rgb(0x254fc7))
@@ -48,9 +78,9 @@ pub(crate) fn configure_theme(cx: &mut App, light: bool) {
         (rgb(0x5b8cff), rgb(0x4a7bf0), rgb(0x3d6de0))
     };
     Theme::update(cx, |theme| {
-        theme.font_family = "Microsoft YaHei UI".into();
+        theme.font_family = platform_ui_font().into();
         theme.font_size = px(14.0);
-        theme.mono_font_family = "Consolas".into();
+        theme.mono_font_family = platform_mono_font().into();
         theme.mono_font_size = px(13.0);
         theme.primary = Hsla::from(primary);
         theme.primary_foreground = Hsla::from(rgb(0xffffff));

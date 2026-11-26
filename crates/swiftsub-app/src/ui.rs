@@ -1,6 +1,8 @@
+pub mod icons;
 mod layout;
 mod phase2;
 mod saved_configs;
+pub mod theme;
 mod workspace;
 
 use gpui_kit::base::Disableable as _;
@@ -20,72 +22,11 @@ use crate::app::{
     ChainSide, CustomDialog, Page, SettingsTab, SwiftSubApp, TemplateTab, format_timestamp,
 };
 use crate::rule_catalog;
-use layout::{close_icon, danger_action, edit_icon, object_action, object_row, plus_icon};
-
-mod colors {
-    pub const BG: u32 = 0x0e1014;
-    pub const SURFACE: u32 = 0x14171d;
-    pub const SURFACE_2: u32 = 0x191d25;
-    pub const SURFACE_3: u32 = 0x202633;
-    pub const BORDER: u32 = 0x262b36;
-    pub const BORDER_ITEM: u32 = 0x354052;
-    pub const BORDER_STRONG: u32 = 0x45536b;
-    pub const SURFACE_INSET: u32 = 0x10141b;
-    pub const TEXT: u32 = 0xe6e8ee;
-    pub const MUTED: u32 = 0x8a93a6;
-    pub const ACCENT: u32 = 0x5b8cff;
-    pub const ACCENT_SOFT: u32 = 0x17233d;
-    pub const WARNING: u32 = 0xffb020;
-    pub const DANGER: u32 = 0xff5c5c;
-    pub const DANGER_SOFT: u32 = 0x2a171a;
-}
-
-use colors::*;
-
+use icons::{close_icon, delete_icon, edit_icon, plus_icon};
+use layout::{danger_action, object_action, object_row};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-static LIGHT_THEME: AtomicBool = AtomicBool::new(false);
-
-pub fn set_light_theme(light: bool) {
-    LIGHT_THEME.store(light, Ordering::Relaxed);
-}
-
-fn theme_color(color: u32) -> u32 {
-    if !LIGHT_THEME.load(Ordering::Relaxed) {
-        return color;
-    }
-    match color {
-        BG => 0xf7f8fa,
-        SURFACE => 0xffffff,
-        SURFACE_2 => 0xf7f8fa,
-        SURFACE_3 => 0xe8edf5,
-        BORDER => 0xe1e4ea,
-        BORDER_ITEM => 0xcdd5e1,
-        BORDER_STRONG => 0xb4c1d5,
-        SURFACE_INSET => 0xf0f3f8,
-        TEXT => 0x1f2937,
-        MUTED => 0x5f6c82,
-        ACCENT => 0x3b6ef5,
-        ACCENT_SOFT => 0xe8efff,
-        WARNING => 0xb45309,
-        DANGER => 0xd92d2d,
-        DANGER_SOFT => 0xfdecec,
-        0x05070bcc => 0x1f29374d,
-        0x2a2110 => 0xfff7e6,
-        0x5b4316 => 0xf0d49a,
-        0x5b2328 => 0xf3c6c6,
-        other => other,
-    }
-}
-
-fn rgb(color: u32) -> Rgba {
-    gpui_kit::rgb(theme_color(color))
-}
-
-fn rgba(color: u32) -> Rgba {
-    gpui_kit::rgba(theme_color(color))
-}
+pub use theme::{AppThemeMode, set_light_theme};
+use theme::{rgb, rgba, tokens::*};
 
 impl SwiftSubApp {
     fn has_blocking_modal(&self) -> bool {
@@ -1097,10 +1038,6 @@ fn micro_badge(label: impl Into<String>, accent: bool) -> Div {
 
 fn field_label(label: &'static str) -> Div {
     div().text_size(px(12.)).text_color(rgb(MUTED)).child(label)
-}
-
-fn delete_icon() -> gpui_kit::component::Icon {
-    gpui_kit::component::Icon::default().data(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M9 6V4h6v2M5 6l1 14h12l1-14M10 10v6M14 10v6"/></svg>"#)
 }
 
 fn banner(message: String, color: u32) -> AnyElement {

@@ -65,6 +65,8 @@ pub struct Phase2State {
     pub batch_rename_error: Option<String>,
     pub sub_logs_open: bool,
     pub refresh_logs: Vec<RefreshLog>,
+    pub theme_mode: crate::ui::AppThemeMode,
+    pub summary_cache: HashMap<String, ((i64, usize), workspace::ConfigSummary)>,
 }
 
 impl Phase2State {
@@ -73,7 +75,7 @@ impl Phase2State {
         window: &mut Window,
         cx: &mut Context<SwiftSubApp>,
     ) -> Self {
-        let (fixed_port, lan_private_only, proxy_mode, proxy_url) = {
+        let (fixed_port, lan_private_only, proxy_mode, proxy_url, theme_mode) = {
             let guard = lock_store(store);
             let fixed = guard
                 .get_setting("server_fixed_port")
@@ -98,7 +100,10 @@ impl Phase2State {
                 .ok()
                 .flatten()
                 .unwrap_or_default();
-            (fixed, private_only, mode, url)
+            let theme = crate::ui::AppThemeMode::from_setting(
+                guard.get_setting("theme").ok().flatten().as_deref(),
+            );
+            (fixed, private_only, mode, url, theme)
         };
         let fixed_port_text = fixed_port.map(|p| p.to_string()).unwrap_or_default();
         let server_fixed_port_input = cx.new(|cx| {
@@ -137,6 +142,8 @@ impl Phase2State {
             batch_rename_error: None,
             sub_logs_open: false,
             refresh_logs: Vec::new(),
+            theme_mode,
+            summary_cache: HashMap::new(),
         }
     }
 
@@ -903,6 +910,39 @@ impl SwiftSubApp {
             .recent_refresh_logs(40)
             .unwrap_or_default();
         self.p1.sub_logs_open = true;
+        cx.notify();
+    }
+
+    pub fn set_theme_mode(
+        &mut self,
+        mode: crate::ui::AppThemeMode,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.p1.theme_mode = mode;
+        let _ = lock_store(&self.store).set_setting("theme", mode.as_str());
+        let system_is_light = matches!(
+            window.appearance(),
+            WindowAppearance::Light | WindowAppearance::VibrantLight
+        );
+        let light = mode.resolve_light(system_is_light);
+        self.light_theme = light;
+        Theme::change(
+            if light {
+                ThemeMode::Light
+            } else {
+                ThemeMode::Dark
+            },
+            None,
+            cx,
+        );
+        crate::configure_theme(cx, light);
+        crate::ui::set_light_theme(light);
+        cx.set_window_appearance(Some(if light {
+            WindowAppearance::Light
+        } else {
+            WindowAppearance::Dark
+        }));
         cx.notify();
     }
 }
