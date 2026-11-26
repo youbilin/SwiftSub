@@ -1,0 +1,27 @@
+dns:
+  enable: true
+  listen: "127.0.0.1:1053"
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-range6: "fdfe:dcba:9876::1/64"
+  fake-ip-filter-mode: blacklist
+  prefer-h3: true
+  respect-rules: true
+  use-hosts: true
+  use-system-hosts: false
+  direct-nameserver-follow-policy: false
+  default-nameserver: [223.5.5.5, 119.29.29.29, "2400:3200::1"]
+  proxy-server-nameserver: ["https://doh.pub/dns-query", "https://dns.alidns.com/dns-query"]
+  direct-nameserver: []
+  nameserver: ["https://cloudflare-dns.com/dns-query", "https://dns.google/dns-query"]
+  nameserver-policy:
+    "+.wbu.edu.cn": [218.199.208.8]
+    "geosite:cn,private": ["https://doh.pub/dns-query", "https://dns.alidns.com/dns-query"]
+  fallback: []
+  fake-ip-filter: ["*.lan", "*.local", twp.vpsnat.com, "*.arpa", "time.*.com", "ntp.*.com", "+.pool.ntp.org", "+.market.xiaomi.com", localhost.ptlogin2.qq.com, "+.msftncsi.com", "+.msftconnecttest.com", "stun.*.*", "stun.*.*.*", "geosite:private", "geosite:connectivity-check"]
+  cache-algorithm: arc
+  proxy-server-nameserver-policy: {"+.example.com": [223.5.5.5]}
+  fallback-filter: {geoip: true, geoip-code: CN}
+  fake-ip-ttl: 1
+hosts: {"example.local": 192.168.1.2}

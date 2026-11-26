@@ -49,6 +49,15 @@ impl Proxy {
             .to_lowercase();
         fields.insert("type".to_string(), Value::String(kind.clone()));
 
+        if matches!(kind.as_str(), "direct" | "dns" | "reject" | "rematch")
+            || kind == "wireguard" && fields.contains_key("peers")
+        {
+            fields
+                .entry("name".into())
+                .or_insert_with(|| Value::String(kind.clone()));
+            return Ok(Self { fields });
+        }
+
         let server = fields
             .get("server")
             .and_then(Value::as_str)
@@ -108,7 +117,13 @@ impl Proxy {
                 Value::String(text) => text.parse::<u64>().ok(),
                 _ => None,
             })
-            .unwrap_or_default() as u16
+            .and_then(|port| u16::try_from(port).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn uses_server_port(&self) -> bool {
+        !matches!(self.kind(), "direct" | "dns" | "reject" | "rematch")
+            && !(self.kind() == "wireguard" && self.contains("peers"))
     }
 
     pub fn get_str(&self, key: &str) -> Option<&str> {
@@ -186,6 +201,15 @@ impl Proxy {
 
     pub fn warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
+        if !self.uses_server_port() {
+            if self.name().trim().is_empty() {
+                warnings.push("缺少节点名称".into());
+            }
+            if let Some(issue) = self.fatal_issue() {
+                warnings.push(issue);
+            }
+            return warnings;
+        }
         if self.kind().is_empty() {
             warnings.push("缺少代理类型".to_string());
         }
@@ -202,6 +226,40 @@ impl Proxy {
     }
 
     pub fn fatal_issue(&self) -> Option<String> {
+        if matches!(self.kind(), "direct" | "dns" | "reject" | "rematch") {
+            return None;
+        }
+        if self.kind() == "wireguard" && self.contains("peers") {
+            if self.get_str("private-key").unwrap_or_default().is_empty() {
+                return Some("WireGuard 缺少 private-key".into());
+            }
+            let Some(peers) = self
+                .fields
+                .get("peers")
+                .and_then(Value::as_sequence)
+                .filter(|peers| !peers.is_empty())
+            else {
+                return Some("WireGuard peers 必须是非空节点列表".into());
+            };
+            for (index, peer) in peers.iter().enumerate() {
+                if peer
+                    .get("server")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                    || parse_yaml_port(peer.get("port")).is_none()
+                    || peer
+                        .get("public-key")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                {
+                    return Some(format!(
+                        "WireGuard 第 {} 个 peer 缺少服务器、有效端口或公钥",
+                        index + 1
+                    ));
+                }
+            }
+            return None;
+        }
         if self.kind().is_empty() {
             return Some("缺少代理类型".to_string());
         }
@@ -265,8 +323,10 @@ impl Proxy {
                 return Some("SSR 缺少必填字段".into());
             }
             "tuic" => {
-                if self.get_str("uuid").unwrap_or_default().is_empty() {
-                    return Some("TUIC 缺少 uuid".to_string());
+                if self.get_str("uuid").unwrap_or_default().is_empty()
+                    && self.get_str("token").unwrap_or_default().is_empty()
+                {
+                    return Some("TUIC 缺少 uuid 或 token".to_string());
                 }
             }
             "ss" if (self.get_str("cipher").unwrap_or_default().is_empty()
@@ -347,6 +407,40 @@ fn render_value(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_ports_cannot_wrap_and_local_and_peer_proxies_roundtrip() {
+        for value in [Value::from(65537), Value::from("65537")] {
+            let mut proxy = Proxy::new("http", "test", "example.org", 1);
+            proxy.insert("port", value);
+            assert_eq!(proxy.port(), 0);
+            assert!(proxy.fatal_issue().is_some());
+            assert!(Proxy::from_value(proxy.to_value()).is_err());
+        }
+        for kind in ["direct", "dns", "reject", "rematch"] {
+            let value: Value = serde_yaml_ng::from_str(&format!(
+                "name: named-{kind}\ntype: {kind}\ninterface-name: Ethernet\n"
+            ))
+            .unwrap();
+            let proxy = Proxy::from_value(value.clone()).unwrap();
+            assert!(!proxy.uses_server_port());
+            assert!(proxy.fatal_issue().is_none());
+            assert_eq!(proxy.to_value(), value);
+        }
+        let value: Value = serde_yaml_ng::from_str("name: multi-wg\ntype: wireguard\nprivate-key: private\nip: 172.16.0.2\npeers:\n  - {server: example.org, port: 2480, public-key: public, allowed-ips: ['0.0.0.0/0']}\n").unwrap();
+        let proxy = Proxy::from_value(value.clone()).unwrap();
+        assert!(proxy.fatal_issue().is_none());
+        assert_eq!(proxy.to_value(), value);
+        let mut invalid = value;
+        invalid["peers"][0]["port"] = Value::from(65537);
+        assert!(
+            Proxy::from_value(invalid)
+                .unwrap()
+                .fatal_issue()
+                .unwrap()
+                .contains("peer")
+        );
+    }
 
     #[test]
     fn validates_reality_keys() {

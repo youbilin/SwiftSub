@@ -21,6 +21,325 @@ fn sample_nodes() -> Vec<Node> {
 }
 
 #[test]
+fn deleted_builtin_groups_stay_absent_and_match_falls_back_to_direct() {
+    use swiftsub_core::model::PolicyGroupSpec;
+    let mut options = GenerateOptions::default();
+    for name in ["节点选择", "自动选择", "漏网之鱼"] {
+        options.policy_groups.push(PolicyGroupSpec {
+            name: name.into(),
+            builtin: true,
+            disabled: true,
+            removed: true,
+            ..Default::default()
+        });
+    }
+    let profile = generate_profile(&sample_nodes(), &options).unwrap();
+    for name in ["节点选择", "自动选择", "漏网之鱼"] {
+        assert!(!profile.groups.iter().any(|group| group.name == name));
+    }
+    assert_eq!(profile.rules.last().unwrap().to_line(), "MATCH,DIRECT");
+    assert!(options.policy_groups.iter().all(|group| group.removed));
+}
+
+#[test]
+fn disabled_chains_filters_and_nodes_are_dormant_and_enabled_chains_join_all_node_groups() {
+    use swiftsub_core::model::PolicyGroupSpec;
+    let mut nodes = sample_nodes();
+    let mut options = GenerateOptions::default();
+    let mut chain = ChainSpec::new(
+        "Chain",
+        nodes[0].source_key.clone(),
+        nodes[0].name(),
+        nodes[1].source_key.clone(),
+        nodes[1].name(),
+    );
+    chain.disabled = true;
+    options.chains.push(chain);
+    let mut filter = CustomGroupSpec::new("Filtered", NodeFilter::default());
+    filter.disabled = true;
+    options.custom_groups.push(filter);
+    options.policy_groups.push(PolicyGroupSpec {
+        name: "All".into(),
+        members: vec!["Chain".into(), "Filtered".into(), nodes[2].name().into()],
+        include_all_nodes: true,
+        ..Default::default()
+    });
+    options
+        .custom_rules
+        .push(Rule::new("DOMAIN", "chain.example.org", "Chain"));
+    options
+        .custom_rules
+        .push(Rule::new("DOMAIN", "node.example.org", nodes[2].name()));
+    nodes[2].enabled = false;
+    let profile = generate_profile(&nodes, &options).unwrap();
+    assert!(
+        !profile
+            .groups
+            .iter()
+            .any(|group| matches!(group.name.as_str(), "Chain" | "Filtered"))
+    );
+    assert!(!profile.rules.iter().any(|rule| matches!(
+        rule.payload.as_deref(),
+        Some("chain.example.org" | "node.example.org")
+    )));
+    options.chains[0].disabled = false;
+    let enabled = generate_profile(&nodes, &options).unwrap();
+    assert!(
+        enabled
+            .groups
+            .iter()
+            .find(|group| group.name == "All")
+            .unwrap()
+            .proxies
+            .iter()
+            .any(|name| name == "Chain")
+    );
+    assert!(
+        enabled
+            .groups
+            .iter()
+            .find(|group| group.name == "节点选择")
+            .unwrap()
+            .proxies
+            .iter()
+            .any(|name| name == "Chain")
+    );
+    assert!(options.custom_groups[0].disabled);
+}
+
+#[test]
+fn dns_defaults_and_invalid_authored_groups_and_providers_do_not_produce_broken_output() {
+    let nodes = sample_nodes();
+    let mut options = GenerateOptions::default();
+    options.dns.domestic.clear();
+    options.dns.fake_ip_range = "invalid".into();
+    let profile = generate_profile(&nodes, &options).unwrap();
+    let root: Value = serde_yaml_ng::from_str(&profile.yaml).unwrap();
+    assert_eq!(root["dns"]["fake-ip-range"].as_str(), Some("198.18.0.1/16"));
+    assert!(!root["dns"]["nameserver"].as_sequence().unwrap().is_empty());
+    options.dns_override = true;
+    assert!(
+        generate_profile(&nodes, &options)
+            .unwrap_err()
+            .to_string()
+            .contains("Fake IP")
+    );
+    options = GenerateOptions::default();
+    options.test_url = "http://".into();
+    assert!(generate_profile(&nodes, &options).is_err());
+    options = GenerateOptions::default();
+    for name in ["节点选择", "DIRECT", "duplicate,comma", " trailing "] {
+        options.custom_groups = vec![CustomGroupSpec::new(name, NodeFilter::default())];
+        let error = generate_profile(&nodes, &options).unwrap_err().to_string();
+        assert!(error.contains(name), "{error}");
+    }
+    options.custom_groups = vec![CustomGroupSpec::new(nodes[0].name(), NodeFilter::default())];
+    assert!(
+        generate_profile(&nodes, &options)
+            .unwrap_err()
+            .to_string()
+            .contains("重复")
+    );
+    options.custom_groups.clear();
+    options.custom_rule_sets = vec![RuleSetBinding {
+        id: "invalid-provider".into(),
+        name: "Invalid provider".into(),
+        url: "https://example.org/rules".into(),
+        behavior: "aaa".into(),
+        format: "yaml".into(),
+        target: "DIRECT".into(),
+        no_resolve: false,
+    }];
+    assert!(
+        generate_profile(&nodes, &options)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid-provider")
+    );
+    options.custom_rule_sets.clear();
+    options.custom_rules = vec![Rule::new("aaa", "example.org", "DIRECT")];
+    let error = generate_profile(&nodes, &options).unwrap_err().to_string();
+    assert!(error.contains("AAA,example.org,DIRECT"), "{error}");
+}
+
+#[test]
+fn corrupt_manual_cache_is_preserved_instead_of_replaced() {
+    let corrupt = "proxies: [unfinished";
+    let nodes = sample_nodes()
+        .into_iter()
+        .map(|node| node.proxy)
+        .collect::<Vec<_>>();
+    assert!(merge_manual_proxies_yaml(Some(corrupt), nodes).is_err());
+}
+
+#[test]
+fn edited_rule_sets_generate_inline_content_and_restore_original_sources() {
+    let nodes = sample_nodes();
+    let mut options = GenerateOptions::default();
+    options.rule_set_overrides.insert(
+        "openai".into(),
+        vec!["+.example.org".into(), "api.example.net".into()],
+    );
+    let generated = generate_profile(&nodes, &options).unwrap();
+    let yaml: Value = serde_yaml_ng::from_str(&generated.yaml).unwrap();
+    let provider = &yaml["rule-providers"]["openai"];
+    assert_eq!(provider["type"].as_str(), Some("inline"));
+    assert_eq!(provider["format"].as_str(), Some("yaml"));
+    assert_eq!(provider["payload"].as_sequence().unwrap().len(), 2);
+    assert!(provider.get("url").is_none());
+    assert!(
+        generated
+            .rules
+            .iter()
+            .any(|rule| rule.payload.as_deref() == Some("openai"))
+    );
+    options.rule_set_overrides.clear();
+    let restored: Value =
+        serde_yaml_ng::from_str(&generate_profile(&nodes, &options).unwrap().yaml).unwrap();
+    assert_eq!(
+        restored["rule-providers"]["openai"]["type"].as_str(),
+        Some("http")
+    );
+    assert!(
+        restored["rule-providers"]["openai"]["url"]
+            .as_str()
+            .unwrap()
+            .ends_with(".mrs")
+    );
+    options.rule_set_overrides.insert(
+        "openai".into(),
+        vec!["DOMAIN-SUFFIX,example.org,REJECT".into()],
+    );
+    assert!(generate_profile(&nodes, &options).is_err());
+}
+
+#[test]
+fn dormant_workspace_groups_and_rules_restore_after_roundtrip_with_hundred_nodes() {
+    use swiftsub_core::model::PolicyGroupSpec;
+    let links = (0..100)
+        .map(|i| format!("trojan://test@node-{i}.example.org:443#HK-{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let nodes = build_nodes(parse_content(&links).unwrap().proxies, "test", "100 nodes");
+    let mut options = GenerateOptions {
+        policy_groups: vec![
+            PolicyGroupSpec {
+                id: "outlet-id".into(),
+                name: "出口".into(),
+                description: "保留编辑说明".into(),
+                members: vec!["HK-0".into()],
+                ..Default::default()
+            },
+            PolicyGroupSpec {
+                name: "上层".into(),
+                members: vec!["出口".into(), "DIRECT".into()],
+                ..Default::default()
+            },
+        ],
+        custom_rules: vec![Rule::new("DOMAIN-SUFFIX", "example.org", "出口")],
+        custom_rule_sets: vec![RuleSetBinding {
+            id: "external".into(),
+            name: "外部".into(),
+            url: "https://example.org/rules.list".into(),
+            behavior: "classical".into(),
+            format: "text".into(),
+            target: "出口".into(),
+            no_resolve: false,
+        }],
+        rule_set_targets: [("openai".into(), "出口".into())].into(),
+        ..Default::default()
+    };
+    let original = generate_profile(&nodes, &options).unwrap();
+    options.policy_groups[0].disabled = true;
+    let dormant = generate_profile(&nodes, &options).unwrap();
+    assert_eq!(dormant.stats.proxies, 100);
+    assert!(!dormant.groups.iter().any(|group| group.name == "出口"));
+    assert!(!dormant.rules.iter().any(|rule| rule.target == "出口"));
+    assert_eq!(
+        dormant
+            .groups
+            .iter()
+            .find(|group| group.name == "上层")
+            .unwrap()
+            .proxies,
+        ["DIRECT"]
+    );
+    assert_eq!(options.policy_groups[1].members, ["出口", "DIRECT"]);
+    let mut restored = options.clone();
+    restored.policy_groups =
+        serde_json::from_str(&serde_json::to_string(&options.policy_groups).unwrap()).unwrap();
+    restored.policy_groups[0].disabled = false;
+    assert_eq!(restored.policy_groups[0].id, "outlet-id");
+    assert_eq!(restored.policy_groups[0].description, "保留编辑说明");
+    assert_eq!(
+        generate_profile(&nodes, &restored).unwrap().yaml,
+        original.yaml
+    );
+    restored.disabled_rule_sets.push("external".into());
+    assert!(
+        !generate_profile(&nodes, &restored)
+            .unwrap()
+            .yaml
+            .contains("RULE-SET,external,")
+    );
+}
+
+#[test]
+fn workspace_health_parameters_and_disabled_builtin_override_generate_correctly() {
+    use swiftsub_core::model::PolicyGroupSpec;
+    let mut options = GenerateOptions {
+        policy_groups: vec![
+            PolicyGroupSpec {
+                name: "测速出口".into(),
+                kind: GroupKind::UrlTest,
+                members: vec!["DIRECT".into()],
+                tolerance: Some(65),
+                test_interval: Some(90),
+                ..Default::default()
+            },
+            PolicyGroupSpec {
+                name: "均衡出口".into(),
+                kind: GroupKind::LoadBalance,
+                members: vec!["DIRECT".into()],
+                strategy: Some("round-robin".into()),
+                ..Default::default()
+            },
+            PolicyGroupSpec {
+                name: "OpenAI".into(),
+                builtin: true,
+                members: vec!["DIRECT".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    // Use the catalog's actual localized service name for the override.
+    options.policy_groups[2].name = swiftsub_core::catalog::module("ai").unwrap().name.into();
+    let profile = generate_profile(&sample_nodes(), &options).unwrap();
+    assert!(profile.yaml.contains("tolerance: 65"));
+    assert!(profile.yaml.contains("strategy: round-robin"));
+    assert!(profile.yaml.contains("interval: 90"));
+    let modules = swiftsub_core::catalog::MODULES
+        .iter()
+        .filter(|module| {
+            module.id != "ai"
+                && !matches!(module.kind, swiftsub_core::catalog::ModuleKind::Region(_))
+        })
+        .map(|module| module.id.to_string())
+        .collect();
+    options.enabled_modules = Some(modules);
+    let profile = generate_profile(&sample_nodes(), &options).unwrap();
+    assert!(
+        !profile
+            .groups
+            .iter()
+            .any(|group| group.name == options.policy_groups[2].name)
+    );
+    options.policy_groups[1].strategy = Some("invalid".into());
+    assert!(generate_profile(&sample_nodes(), &options).is_err());
+}
+
+#[test]
 fn generates_a_referentially_valid_standard_profile() {
     let profile = generate_profile(&sample_nodes(), &GenerateOptions::default()).unwrap();
     assert_eq!(profile.stats.proxies, 5);
@@ -192,6 +511,7 @@ fn invalid_reality_node_is_skipped_with_warning() {
 fn custom_filter_groups_and_chains_are_generated() {
     let mut options = GenerateOptions::default();
     options.custom_groups.push(CustomGroupSpec {
+        disabled: false,
         name: "美国节点".into(),
         kind: GroupKind::Select,
         filter: NodeFilter {
@@ -752,4 +1072,78 @@ fn mixed_source_broad_rules_follow_service_rules_and_precede_final() {
             assert!(profile.yaml.contains(&format!("RULE-SET,{},", set.id)));
         }
     }
+}
+
+#[test]
+fn picked_rules_and_metadata_are_independent_of_their_original_service_group() {
+    use swiftsub_core::generator::RuleSetBinding;
+    use swiftsub_core::model::PolicyGroupSpec;
+    let mut options = GenerateOptions {
+        preset: Preset::Minimal,
+        enabled_modules: Some(vec!["select".into(), "auto".into(), "final".into()]),
+        policy_groups: vec![PolicyGroupSpec {
+            name: "Media".into(),
+            members: vec!["DIRECT".into()],
+            ..Default::default()
+        }],
+        rule_set_targets: [("openai".into(), "Media".into())].into(),
+        test_tolerance: 120,
+        ..Default::default()
+    };
+    let generated = generate_profile(&sample_nodes(), &options).unwrap();
+    assert!(
+        generated
+            .rules
+            .iter()
+            .any(|rule| rule.to_line() == "RULE-SET,openai,Media")
+    );
+    assert!(!generated.groups.iter().any(|group| group.name == "AI 服务"));
+    assert!(
+        !generated
+            .rules
+            .iter()
+            .any(|rule| rule.payload.as_deref() == Some("category-ai-chat-!cn"))
+    );
+    assert_eq!(
+        generated
+            .groups
+            .iter()
+            .find(|group| group.name == "自动选择")
+            .unwrap()
+            .tolerance,
+        Some(120)
+    );
+    options.custom_rule_sets.push(RuleSetBinding {
+        id: "openai".into(),
+        name: "Edited source".into(),
+        url: "https://example.org/edited.yaml".into(),
+        behavior: "classical".into(),
+        format: "yaml".into(),
+        target: "Media".into(),
+        no_resolve: false,
+    });
+    let generated = generate_profile(&sample_nodes(), &options).unwrap();
+    assert_eq!(
+        generated
+            .rules
+            .iter()
+            .filter(|rule| rule.payload.as_deref() == Some("openai"))
+            .count(),
+        1
+    );
+    assert!(generated.yaml.contains("https://example.org/edited.yaml"));
+    options.policy_groups[0].disabled = true;
+    assert!(
+        !generate_profile(&sample_nodes(), &options)
+            .unwrap()
+            .yaml
+            .contains("RULE-SET,openai,")
+    );
+    options.policy_groups[0].disabled = false;
+    assert!(
+        generate_profile(&sample_nodes(), &options)
+            .unwrap()
+            .yaml
+            .contains("RULE-SET,openai,Media")
+    );
 }

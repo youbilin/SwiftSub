@@ -167,11 +167,7 @@ fn parse_extended_proxy(scheme: &str, rest: &str) -> Result<Proxy> {
         query.map(|_| "?").unwrap_or(""),
         query.unwrap_or_default()
     ))?;
-    let server = url
-        .host_str()
-        .ok_or(Error::MissingField("server"))?
-        .trim_matches(['[', ']'])
-        .to_string();
+    let server = url_host(&url)?;
     let port = url.port().unwrap_or(if kind == "ssh" {
         22
     } else if kind == "wireguard" {
@@ -207,6 +203,7 @@ fn parse_extended_proxy(scheme: &str, rest: &str) -> Result<Proxy> {
             }
             proxy.insert("password", credential);
             proxy.insert("tls", true);
+            proxy.insert("udp", true);
             if let Some(v) = query_value(&q, &["sni", "peer", "servername"]) {
                 proxy.insert("sni", v);
             }
@@ -215,7 +212,7 @@ fn parse_extended_proxy(scheme: &str, rest: &str) -> Result<Proxy> {
             {
                 proxy.insert("skip-cert-verify", v);
             }
-            if let Some(v) = query_value(&q, &["fp", "client-fingerprint"]) {
+            if let Some(v) = query_value(&q, &["fp", "fingerprint", "client-fingerprint"]) {
                 proxy.insert("client-fingerprint", v);
             }
             if let Some(v) = query_value(&q, &["alpn"]) {
@@ -233,6 +230,7 @@ fn parse_extended_proxy(scheme: &str, rest: &str) -> Result<Proxy> {
                     proxy.insert(field, n);
                 }
             }
+            apply_common_opts(&mut proxy, &q)?;
         }
         "snell" => {
             let psk = if credential.is_empty() {
@@ -384,11 +382,19 @@ fn parse_ss(rest: &str) -> Result<Proxy> {
     proxy.insert("udp", true);
 
     if let Some(query) = query {
+        let mut params = HashMap::new();
         for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-            if key == "plugin" {
+            let normalized = key.to_lowercase().replace('_', "-");
+            if normalized == "plugin" {
                 apply_ss_plugin(&mut proxy, &value);
+            } else {
+                params.insert(normalized, value.into_owned());
             }
         }
+        if let Some(uot) = query_optional_bool(&params, &["uot", "udp-over-tcp"])? {
+            proxy.insert("udp-over-tcp", uot);
+        }
+        apply_common_opts(&mut proxy, &params)?;
     }
 
     Ok(proxy)
@@ -404,9 +410,12 @@ fn apply_ss_plugin(proxy: &mut Proxy, raw: &str) {
             continue;
         }
         if let Some((key, value)) = part.split_once('=') {
-            options.insert(key.trim().to_lowercase(), value.trim().to_string());
+            options.insert(
+                key.trim().to_lowercase().replace('_', "-"),
+                value.trim().to_string(),
+            );
         } else {
-            options.insert(part.to_lowercase(), "true".to_string());
+            options.insert(part.to_lowercase().replace('_', "-"), "true".to_string());
         }
     }
 
@@ -442,13 +451,78 @@ fn apply_ss_plugin(proxy: &mut Proxy, raw: &str) {
                     plugin_opts.insert(Value::String(key.into()), Value::String(value));
                 }
             }
-            if let Some(mux) = options.remove("mux")
-                && let Ok(value) = mux.parse::<u64>()
+            if let Some(mux) = options.remove("mux") {
+                let enabled = !matches!(mux.trim().to_lowercase().as_str(), "0" | "false" | "no");
+                plugin_opts.insert(Value::String("mux".into()), Value::Bool(enabled));
+            }
+            if options
+                .get("skip-cert-verify")
+                .or_else(|| options.get("insecure"))
+                .or_else(|| options.get("allowinsecure"))
+                .is_some_and(|v| {
+                    matches!(
+                        v.trim().to_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+            {
+                plugin_opts.insert(Value::String("skip-cert-verify".into()), Value::Bool(true));
+            }
+            if let Some(fp) = options
+                .remove("fingerprint")
+                .or_else(|| options.remove("fp"))
+                && !fp.is_empty()
+            {
+                plugin_opts.insert(Value::String("fingerprint".into()), Value::String(fp));
+            }
+            proxy.insert("plugin-opts", Value::Mapping(plugin_opts));
+        }
+        "shadow-tls" => {
+            proxy.insert("plugin", "shadow-tls");
+            let mut plugin_opts = Mapping::new();
+            for (src, dst) in [
+                ("host", "host"),
+                ("sni", "host"),
+                ("password", "password"),
+                ("passwd", "password"),
+                ("fp", "client-fingerprint"),
+                ("client-fingerprint", "client-fingerprint"),
+            ] {
+                if let Some(value) = options.remove(src)
+                    && !value.is_empty()
+                    && !plugin_opts.contains_key(Value::String(dst.into()))
+                {
+                    plugin_opts.insert(Value::String(dst.into()), Value::String(value));
+                }
+            }
+            if let Some(version) = options.remove("version")
+                && let Ok(num) = version.parse::<u64>()
             {
                 plugin_opts.insert(
-                    Value::String("mux".into()),
-                    Value::Number(serde_yaml_ng::Number::from(value)),
+                    Value::String("version".into()),
+                    Value::Number(serde_yaml_ng::Number::from(num)),
                 );
+            }
+            proxy.insert("plugin-opts", Value::Mapping(plugin_opts));
+        }
+        "restls" => {
+            proxy.insert("plugin", "restls");
+            let mut plugin_opts = Mapping::new();
+            for (src, dst) in [
+                ("host", "host"),
+                ("sni", "host"),
+                ("password", "password"),
+                ("version-hint", "version-hint"),
+                ("restls-script", "restls-script"),
+                ("fp", "client-fingerprint"),
+                ("client-fingerprint", "client-fingerprint"),
+            ] {
+                if let Some(value) = options.remove(src)
+                    && !value.is_empty()
+                    && !plugin_opts.contains_key(Value::String(dst.into()))
+                {
+                    plugin_opts.insert(Value::String(dst.into()), Value::String(value));
+                }
             }
             proxy.insert("plugin-opts", Value::Mapping(plugin_opts));
         }
@@ -458,24 +532,36 @@ fn apply_ss_plugin(proxy: &mut Proxy, raw: &str) {
 
 fn parse_vmess(rest: &str) -> Result<Proxy> {
     let (body, fragment_name) = split_fragment(rest);
-    let decoded = decode_base64_text(body)?;
-    let json: serde_json::Value = serde_json::from_str(&decoded)?;
+    let (encoded_body, query_str) = split_query(body);
+    let decoded = decode_base64_text(encoded_body)?;
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&decoded)
+        && json.is_object()
+    {
+        return parse_vmess_json(&json, fragment_name);
+    }
+    // Fallback: Shadowrocket URI style `vmess://base64(cipher:uuid@host:port)?remarks=...&obfs=...`
+    parse_vmess_shadowrocket(&decoded, query_str, fragment_name)
+}
 
-    let server = json_string(&json, &["add"]).ok_or(Error::MissingField("add"))?;
-    let port = json_u64(&json, &["port"]).ok_or(Error::MissingField("port"))?;
+fn parse_vmess_json(json: &serde_json::Value, fragment_name: Option<String>) -> Result<Proxy> {
+    let server = json_string(json, &["add"])
+        .ok_or(Error::MissingField("add"))?
+        .trim_matches(['[', ']'])
+        .to_string();
+    let port = json_u64(json, &["port"]).ok_or(Error::MissingField("port"))?;
     let port = u16::try_from(port).map_err(|_| Error::InvalidPort(port.to_string()))?;
     if port == 0 {
         return Err(Error::InvalidPort(port.to_string()));
     }
 
-    let name = json_string(&json, &["ps"])
+    let name = json_string(json, &["ps"])
         .or(fragment_name)
         .unwrap_or_else(|| format!("VMess-{server}:{port}"));
-    let mut proxy = Proxy::new("vmess", name, server.clone(), port);
+    let mut proxy = Proxy::new("vmess", name, server, port);
 
-    let uuid = json_string(&json, &["id"]).ok_or(Error::MissingField("id"))?;
-    let alter_id = json_u64(&json, &["aid"]).unwrap_or(0);
-    let cipher = json_string(&json, &["scy"]).unwrap_or_else(|| "auto".into());
+    let uuid = json_string(json, &["id"]).ok_or(Error::MissingField("id"))?;
+    let alter_id = json_u64(json, &["aid"]).unwrap_or(0);
+    let cipher = json_string(json, &["scy"]).unwrap_or_else(|| "auto".into());
 
     proxy.insert("uuid", uuid);
     proxy.insert(
@@ -485,47 +571,155 @@ fn parse_vmess(rest: &str) -> Result<Proxy> {
     proxy.insert("cipher", cipher);
     proxy.insert("udp", true);
 
-    let tls = json_string(&json, &["tls"])
-        .map(|value| value.eq_ignore_ascii_case("tls"))
+    let tls = json_string(json, &["tls"])
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "tls" | "1" | "true"
+            )
+        })
         .unwrap_or(false);
     if tls {
         proxy.insert("tls", true);
-        if let Some(sni) = json_string(&json, &["sni", "serverName"]) {
+        if let Some(sni) = json_string(json, &["sni", "serverName", "servername"]) {
             proxy.insert("servername", sni);
         }
-        if let Some(alpn) = json_string(&json, &["alpn"]) {
+        if let Some(alpn) = json_string(json, &["alpn"]) {
             insert_alpn(&mut proxy, &alpn);
         }
-        if let Some(fingerprint) = json_string(&json, &["fp"]) {
+        if let Some(fingerprint) = json_string(json, &["fp", "fingerprint", "client-fingerprint"]) {
             proxy.insert("client-fingerprint", fingerprint);
         }
     }
 
-    if json_boolish(&json, &["allowInsecure"]) {
+    if json_boolish(json, &["allowInsecure", "insecure", "skip-cert-verify"]) {
         proxy.insert("skip-cert-verify", true);
     }
+    if let Some(pe) = json_string(json, &["packetEncoding", "packet-encoding"]) {
+        proxy.insert("packet-encoding", pe);
+    }
+    if json_boolish(json, &["tfo", "tcp-fast-open"]) {
+        proxy.insert("tfo", true);
+    }
+    if let Some(ech) = json_string(json, &["ech", "ech-config"]) {
+        insert_ech(&mut proxy, &ech);
+    }
+    if let Some(udp_val) = json.get("udp") {
+        if let Some(b) = udp_val.as_bool() {
+            proxy.insert("udp", b);
+        } else if let Some(s) = udp_val.as_str()
+            && matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false")
+        {
+            proxy.insert("udp", false);
+        }
+    }
 
-    let network = json_string(&json, &["net"]).unwrap_or_else(|| "tcp".into());
-    let header_type = json_string(&json, &["type"]).unwrap_or_default();
-    let host = json_string(&json, &["host"]).unwrap_or_default();
-    let path = json_string(&json, &["path"]).unwrap_or_default();
-    let service_name = json_string(&json, &["serviceName"]).unwrap_or_default();
+    let network = json_string(json, &["net"]).unwrap_or_else(|| "tcp".into());
+    let header_type = json_string(json, &["type"]).unwrap_or_default();
+    let host = json_string(json, &["host"]).unwrap_or_default();
+    let path = json_string(json, &["path"]).unwrap_or_default();
+    let service_name = json_string(json, &["serviceName", "service-name"]).unwrap_or_default();
 
-    if network.eq_ignore_ascii_case("tcp") && header_type.eq_ignore_ascii_case("http") {
+    if matches!(network.to_ascii_lowercase().as_str(), "tcp" | "raw")
+        && header_type.eq_ignore_ascii_case("http")
+    {
         apply_http_transport(&mut proxy, &host, &path);
     } else {
         apply_transport(&mut proxy, &network, &host, &path, &service_name);
+    }
+    if matches!(network.to_ascii_lowercase().as_str(), "xhttp" | "splithttp") {
+        let mut xq = HashMap::new();
+        if let Some(mode) = json_string(json, &["mode"]) {
+            xq.insert("mode".to_string(), mode);
+        }
+        if let Some(extra) = json.get("extra") {
+            let extra_str = match extra {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Object(_) => extra.to_string(),
+                _ => String::new(),
+            };
+            if !extra_str.is_empty() {
+                xq.insert("extra".to_string(), extra_str);
+            }
+        }
+        if !xq.is_empty() {
+            apply_xhttp_query(&mut proxy, &xq)?;
+        }
     }
 
     Ok(proxy)
 }
 
+fn parse_vmess_shadowrocket(
+    decoded: &str,
+    query_str: Option<&str>,
+    fragment_name: Option<String>,
+) -> Result<Proxy> {
+    let (userinfo, host_port) = decoded
+        .trim()
+        .rsplit_once('@')
+        .ok_or_else(|| Error::InvalidLink("invalid VMess payload".into()))?;
+    let (cipher, uuid) = userinfo
+        .split_once(':')
+        .ok_or_else(|| Error::InvalidLink("invalid VMess credentials".into()))?;
+    let (server, port) = parse_host_port(host_port)?;
+    let mut query = HashMap::new();
+    if let Some(qs) = query_str {
+        for (k, v) in url::form_urlencoded::parse(qs.as_bytes()) {
+            query.insert(k.to_lowercase().replace('_', "-"), v.into_owned());
+        }
+    }
+    let name = query_value(&query, &["remarks", "ps"])
+        .map(str::to_string)
+        .or(fragment_name)
+        .unwrap_or_else(|| format!("VMess-{server}:{port}"));
+    let mut proxy = Proxy::new("vmess", name, server, port);
+    proxy.insert("uuid", uuid.trim());
+    proxy.insert("alterId", Value::Number(serde_yaml_ng::Number::from(0u64)));
+    proxy.insert(
+        "cipher",
+        if cipher.trim().is_empty() {
+            "auto"
+        } else {
+            cipher.trim()
+        },
+    );
+    proxy.insert("udp", true);
+
+    if query_bool(&query, &["tls"]) {
+        proxy.insert("tls", true);
+        if let Some(sni) = query_value(&query, &["peer", "sni", "servername"]) {
+            proxy.insert("servername", sni);
+        }
+        if let Some(alpn) = query_value(&query, &["alpn"]) {
+            insert_alpn(&mut proxy, alpn);
+        }
+        if let Some(fp) = query_value(&query, &["fp", "fingerprint", "client-fingerprint"]) {
+            proxy.insert("client-fingerprint", fp);
+        }
+    }
+    if query_bool(&query, &["allowinsecure", "insecure", "skip-cert-verify"]) {
+        proxy.insert("skip-cert-verify", true);
+    }
+    let network = query_value(&query, &["obfs", "type", "network"]).unwrap_or("tcp");
+    let host = query_value(&query, &["obfsparam", "host"]).unwrap_or_default();
+    let path = query_value(&query, &["path"]).unwrap_or_default();
+    let service_name = query_value(&query, &["servicename", "service-name"]).unwrap_or_default();
+    let normalized_net = if network.eq_ignore_ascii_case("none") {
+        "tcp"
+    } else if network.eq_ignore_ascii_case("websocket") {
+        "ws"
+    } else {
+        network
+    };
+    apply_transport(&mut proxy, normalized_net, host, path, service_name);
+    apply_common_opts(&mut proxy, &query)?;
+    Ok(proxy)
+}
+
 fn parse_vless(rest: &str) -> Result<Proxy> {
     let url = Url::parse(&format!("vless://{rest}"))?;
-    let server = url
-        .host_str()
-        .ok_or(Error::MissingField("server"))?
-        .to_string();
+    let server = url_host(&url)?;
     let port = url.port().unwrap_or(443);
     let name = fragment_name(&url).unwrap_or_else(|| format!("VLESS-{server}:{port}"));
     let mut proxy = Proxy::new("vless", name, server, port);
@@ -539,55 +733,15 @@ fn parse_vless(rest: &str) -> Result<Proxy> {
 
     let query = query_map(&url);
     let security = query_value(&query, &["security", "tls"]).unwrap_or("none");
-    let public_key = query_value(&query, &["pbk", "publickey", "public-key"]);
-    let reality = security.eq_ignore_ascii_case("reality") || public_key.is_some();
+    let reality = apply_reality_opts(&mut proxy, &query)?;
     if security.eq_ignore_ascii_case("tls") || reality {
         proxy.insert("tls", true);
     }
-    if reality {
-        let public_key = public_key.ok_or(Error::MissingField("pbk"))?;
-        if !crate::model::is_valid_reality_public_key(public_key) {
-            return Err(Error::InvalidLink(
-                "REALITY public key must be 32 bytes base64url".into(),
-            ));
-        }
-        let mut reality_opts = Mapping::new();
-        reality_opts.insert(
-            Value::String("public-key".into()),
-            Value::String(public_key.to_string()),
-        );
-        if let Some(short_id) = query_value(&query, &["sid", "shortid", "short-id"]) {
-            if !crate::model::is_valid_reality_short_id(short_id) {
-                return Err(Error::InvalidLink(
-                    "REALITY short-id must be 0-16 hex characters".into(),
-                ));
-            }
-            reality_opts.insert(
-                Value::String("short-id".into()),
-                Value::String(short_id.to_string()),
-            );
-        }
-        // Modern Xray REALITY servers expect a ClientHello with X25519-MLKEM768.
-        // Keep an explicit opt-out for older servers; pqv is a different (ML-DSA) key.
-        let support_mlkem =
-            query_optional_bool(&query, &["support-x25519mlkem768", "supportx25519mlkem768"])?
-                .unwrap_or(true);
-        reality_opts.insert(
-            Value::String("support-x25519mlkem768".into()),
-            Value::Bool(support_mlkem),
-        );
-        if query_value(&query, &["pqv", "mldsa65verify", "mldsa65-verify"]).is_some() {
-            return Err(Error::InvalidLink(
-                "Mihomo 暂不支持 REALITY pqv / mldsa65Verify 公钥验证，无法无损转换；该参数不是 support-x25519mlkem768 开关".into(),
-            ));
-        }
-        proxy.insert("reality-opts", Value::Mapping(reality_opts));
-    }
 
-    if let Some(sni) = query_value(&query, &["sni", "peer"]) {
+    if let Some(sni) = query_value(&query, &["sni", "peer", "servername"]) {
         proxy.insert("servername", sni.to_string());
     }
-    if let Some(fingerprint) = query_value(&query, &["fp", "fingerprint"]) {
+    if let Some(fingerprint) = query_value(&query, &["fp", "fingerprint", "client-fingerprint"]) {
         proxy.insert("client-fingerprint", fingerprint.to_string());
     }
     if let Some(flow) = query_value(&query, &["flow"]) {
@@ -598,12 +752,16 @@ fn parse_vless(rest: &str) -> Result<Proxy> {
     {
         proxy.insert("encryption", encryption.to_string());
     }
+    if let Some(pe) = query_value(&query, &["packetencoding", "packet-encoding"]) {
+        proxy.insert("packet-encoding", pe.to_string());
+    }
     if query_bool(&query, &["allowinsecure", "insecure", "skip-cert-verify"]) {
         proxy.insert("skip-cert-verify", true);
     }
     if let Some(alpn) = query_value(&query, &["alpn"]) {
         insert_alpn(&mut proxy, alpn);
     }
+    apply_common_opts(&mut proxy, &query)?;
 
     let network = query_value(&query, &["type", "network"]).unwrap_or("tcp");
     if !matches!(
@@ -643,15 +801,20 @@ fn parse_vless(rest: &str) -> Result<Proxy> {
 
 fn parse_trojan(rest: &str) -> Result<Proxy> {
     let url = Url::parse(&format!("trojan://{rest}"))?;
-    let server = url
-        .host_str()
-        .ok_or(Error::MissingField("server"))?
-        .to_string();
+    let server = url_host(&url)?;
     let port = url.port().unwrap_or(443);
     let name = fragment_name(&url).unwrap_or_else(|| format!("Trojan-{server}:{port}"));
     let mut proxy = Proxy::new("trojan", name, server, port);
 
-    let password = percent_decode(url.username());
+    let username = percent_decode(url.username());
+    let pass_part = url.password().map(percent_decode).unwrap_or_default();
+    let password = if pass_part.is_empty() {
+        username
+    } else if username.is_empty() {
+        pass_part
+    } else {
+        format!("{username}:{pass_part}")
+    };
     if password.is_empty() {
         return Err(Error::MissingField("password"));
     }
@@ -659,8 +822,9 @@ fn parse_trojan(rest: &str) -> Result<Proxy> {
     proxy.insert("udp", true);
 
     let query = query_map(&url);
-    if let Some(sni) = query_value(&query, &["sni", "peer"]) {
-        proxy.insert("servername", sni.to_string());
+    apply_reality_opts(&mut proxy, &query)?;
+    if let Some(sni) = query_value(&query, &["sni", "peer", "servername"]) {
+        proxy.insert("sni", sni.to_string());
     }
     if query_bool(&query, &["allowinsecure", "insecure", "skip-cert-verify"]) {
         proxy.insert("skip-cert-verify", true);
@@ -668,25 +832,33 @@ fn parse_trojan(rest: &str) -> Result<Proxy> {
     if let Some(alpn) = query_value(&query, &["alpn"]) {
         insert_alpn(&mut proxy, alpn);
     }
-    if let Some(fingerprint) = query_value(&query, &["fp", "fingerprint"]) {
+    if let Some(fingerprint) = query_value(&query, &["fp", "fingerprint", "client-fingerprint"]) {
         proxy.insert("client-fingerprint", fingerprint.to_string());
     }
+    apply_common_opts(&mut proxy, &query)?;
 
     let network = query_value(&query, &["type", "network"]).unwrap_or("tcp");
-    let host = query_value(&query, &["host"]).unwrap_or_default();
-    let path = query_value(&query, &["path"]).unwrap_or_default();
+    let host = query_value(&query, &["host", "xhttp-host"]).unwrap_or_default();
+    let path = query_value(&query, &["path", "xhttp-path"]).unwrap_or_default();
     let service_name = query_value(&query, &["servicename", "service-name"]).unwrap_or_default();
-    apply_transport(&mut proxy, network, host, path, service_name);
+    if matches!(network.to_ascii_lowercase().as_str(), "tcp" | "raw")
+        && query_value(&query, &["headertype", "header-type"])
+            .is_some_and(|value| value.eq_ignore_ascii_case("http"))
+    {
+        apply_http_transport(&mut proxy, host, path);
+    } else {
+        apply_transport(&mut proxy, network, host, path, service_name);
+    }
+    if matches!(network.to_ascii_lowercase().as_str(), "xhttp" | "splithttp") {
+        apply_xhttp_query(&mut proxy, &query)?;
+    }
 
     Ok(proxy)
 }
 
 fn parse_hysteria2(rest: &str) -> Result<Proxy> {
     let url = Url::parse(&format!("hysteria2://{rest}"))?;
-    let server = url
-        .host_str()
-        .ok_or(Error::MissingField("server"))?
-        .to_string();
+    let server = url_host(&url)?;
     let port = url.port().unwrap_or(443);
     let name = fragment_name(&url).unwrap_or_else(|| format!("Hysteria2-{server}:{port}"));
     let mut proxy = Proxy::new("hysteria2", name, server, port);
@@ -706,13 +878,21 @@ fn parse_hysteria2(rest: &str) -> Result<Proxy> {
     proxy.insert("password", auth);
 
     let query = query_map(&url);
-    if let Some(sni) = query_value(&query, &["sni", "peer"]) {
+    if let Some(sni) = query_value(&query, &["sni", "peer", "servername"]) {
         proxy.insert("sni", sni.to_string());
     }
     if query_bool(&query, &["insecure", "allowinsecure", "skip-cert-verify"]) {
         proxy.insert("skip-cert-verify", true);
     }
-    if let Some(obfs) = query_value(&query, &["obfs"]) {
+    if let Some(fp) = query_value(&query, &["pinsha256", "pin-sha256", "fingerprint"]) {
+        proxy.insert("fingerprint", fp.to_string());
+    }
+    if let Some(alpn) = query_value(&query, &["alpn"]) {
+        insert_alpn(&mut proxy, alpn);
+    }
+    if let Some(obfs) = query_value(&query, &["obfs"])
+        && !obfs.eq_ignore_ascii_case("none")
+    {
         proxy.insert("obfs", obfs.to_string());
         if let Some(password) = query_value(&query, &["obfs-password", "obfspassword"]) {
             proxy.insert("obfs-password", password.to_string());
@@ -721,63 +901,99 @@ fn parse_hysteria2(rest: &str) -> Result<Proxy> {
     if let Some(ports) = query_value(&query, &["mport", "ports"]) {
         proxy.insert("ports", ports.to_string());
     }
+    if let Some(hop) = query_value(&query, &["hop-interval", "hopinterval"])
+        && let Ok(seconds) = hop.trim_end_matches('s').parse::<u64>()
+    {
+        proxy.insert("hop-interval", seconds);
+    }
+    if let Some(cwnd) = query_value(&query, &["cwnd"])
+        && let Ok(val) = cwnd.parse::<u64>()
+    {
+        proxy.insert("cwnd", val);
+    }
     if let Some(up) = query_value(&query, &["up", "upmbps"]) {
-        proxy.insert("up", up.to_string());
+        proxy.insert("up", normalize_hy2_bandwidth(up));
     }
     if let Some(down) = query_value(&query, &["down", "downmbps"]) {
-        proxy.insert("down", down.to_string());
+        proxy.insert("down", normalize_hy2_bandwidth(down));
     }
+    apply_common_opts(&mut proxy, &query)?;
 
     Ok(proxy)
 }
 
 fn parse_tuic(rest: &str) -> Result<Proxy> {
     let url = Url::parse(&format!("tuic://{rest}"))?;
-    let server = url
-        .host_str()
-        .ok_or(Error::MissingField("server"))?
-        .to_string();
+    let server = url_host(&url)?;
     let port = url.port().unwrap_or(443);
     let name = fragment_name(&url).unwrap_or_else(|| format!("TUIC-{server}:{port}"));
     let mut proxy = Proxy::new("tuic", name, server, port);
 
+    let query = query_map(&url);
     let uuid = percent_decode(url.username());
     let password = url.password().map(percent_decode).unwrap_or_default();
-    if uuid.is_empty() {
-        return Err(Error::MissingField("uuid"));
-    }
-    proxy.insert("uuid", uuid);
-    if !password.is_empty() {
-        proxy.insert("password", password);
+    let explicit_token = query_value(&query, &["token"]);
+    let is_v4 = query_value(&query, &["version"]) == Some("4");
+    if let Some(token) = explicit_token {
+        proxy.insert("token", token.to_string());
+        if !uuid.is_empty() {
+            proxy.insert("uuid", uuid);
+        }
+    } else if is_v4 && password.is_empty() && !uuid.is_empty() {
+        proxy.insert("token", uuid);
+    } else {
+        if uuid.is_empty() {
+            return Err(Error::MissingField("uuid"));
+        }
+        proxy.insert("uuid", uuid);
+        if !password.is_empty() {
+            proxy.insert("password", password);
+        }
     }
     proxy.insert("udp", true);
 
-    let query = query_map(&url);
     if let Some(value) = query_value(&query, &["congestion-control", "congestioncontrol", "cc"]) {
         proxy.insert("congestion-controller", value.to_string());
     }
     if let Some(value) = query_value(&query, &["udp-relay-mode", "udprelaymode"]) {
         proxy.insert("udp-relay-mode", value.to_string());
     }
-    if let Some(sni) = query_value(&query, &["sni", "peer"]) {
+    if let Some(sni) = query_value(&query, &["sni", "peer", "servername"]) {
         proxy.insert("sni", sni.to_string());
     }
     if query_bool(&query, &["allowinsecure", "insecure", "skip-cert-verify"]) {
         proxy.insert("skip-cert-verify", true);
     }
+    if let Some(v) = query_optional_bool(&query, &["disable-sni", "disablesni"])? {
+        proxy.insert("disable-sni", v);
+    }
+    if let Some(v) = query_optional_bool(&query, &["reduce-rtt", "reducertt"])? {
+        proxy.insert("reduce-rtt", v);
+    }
+    if let Some(hb) = query_value(&query, &["heartbeat-interval", "heartbeatinterval"])
+        && let Ok(ms) = hb.parse::<u64>()
+    {
+        proxy.insert("heartbeat-interval", ms);
+    }
+    if let Some(rt) = query_value(&query, &["request-timeout", "requesttimeout"])
+        && let Ok(ms) = rt.parse::<u64>()
+    {
+        proxy.insert("request-timeout", ms);
+    }
+    if let Some(fp) = query_value(&query, &["fp", "fingerprint", "client-fingerprint"]) {
+        proxy.insert("client-fingerprint", fp.to_string());
+    }
     if let Some(alpn) = query_value(&query, &["alpn"]) {
         insert_alpn(&mut proxy, alpn);
     }
+    apply_common_opts(&mut proxy, &query)?;
 
     Ok(proxy)
 }
 
 fn parse_simple_proxy(scheme: &str, rest: &str) -> Result<Proxy> {
     let url = Url::parse(&format!("{scheme}://{rest}"))?;
-    let server = url
-        .host_str()
-        .ok_or(Error::MissingField("server"))?
-        .to_string();
+    let server = url_host(&url)?;
     let port = match url.port() {
         Some(port) => port,
         None if scheme.eq_ignore_ascii_case("http") => 80,
@@ -793,13 +1009,26 @@ fn parse_simple_proxy(scheme: &str, rest: &str) -> Result<Proxy> {
         fragment_name(&url).unwrap_or_else(|| format!("{}-{server}:{port}", kind.to_uppercase()));
     let mut proxy = Proxy::new(kind, name, server, port);
 
-    let username = percent_decode(url.username());
-    if !username.is_empty() {
-        proxy.insert("username", username);
-    }
-    if let Some(password) = url.password() {
-        let password = percent_decode(password);
-        if !password.is_empty() {
+    let raw_user = percent_decode(url.username());
+    let raw_pass = url.password().map(percent_decode);
+    if raw_pass.is_none()
+        && !raw_user.is_empty()
+        && !raw_user.contains(':')
+        && let Some((u, p)) = decode_base64_user_pass(&raw_user)
+    {
+        if !u.is_empty() {
+            proxy.insert("username", u);
+        }
+        if !p.is_empty() {
+            proxy.insert("password", p);
+        }
+    } else {
+        if !raw_user.is_empty() {
+            proxy.insert("username", raw_user);
+        }
+        if let Some(password) = raw_pass
+            && !password.is_empty()
+        {
             proxy.insert("password", password);
         }
     }
@@ -811,9 +1040,21 @@ fn parse_simple_proxy(scheme: &str, rest: &str) -> Result<Proxy> {
     }
 
     let query = query_map(&url);
+    if query_bool(&query, &["tls"])
+        || query_value(&query, &["security"]).is_some_and(|v| v.eq_ignore_ascii_case("tls"))
+    {
+        proxy.insert("tls", true);
+    }
+    if let Some(sni) = query_value(&query, &["sni", "peer", "servername"]) {
+        proxy.insert("sni", sni.to_string());
+    }
+    if let Some(fp) = query_value(&query, &["fp", "fingerprint", "client-fingerprint"]) {
+        proxy.insert("client-fingerprint", fp.to_string());
+    }
     if query_bool(&query, &["allowinsecure", "insecure", "skip-cert-verify"]) {
         proxy.insert("skip-cert-verify", true);
     }
+    apply_common_opts(&mut proxy, &query)?;
 
     Ok(proxy)
 }
@@ -829,14 +1070,30 @@ fn apply_transport(proxy: &mut Proxy, network: &str, host: &str, path: &str, ser
         "ws" | "websocket" | "httpupgrade" => {
             proxy.insert("network", "ws");
             let mut options = Mapping::new();
-            if network == "httpupgrade" {
+            let is_upgrade = network == "httpupgrade";
+            if is_upgrade {
                 options.insert(
                     Value::String("v2ray-http-upgrade".into()),
                     Value::Bool(true),
                 );
             }
-            if !path.is_empty() {
-                options.insert(Value::String("path".into()), Value::String(path.into()));
+            let (clean_path, early_data) = if is_upgrade {
+                (path.to_string(), None)
+            } else {
+                split_ws_early_data(path)
+            };
+            if !clean_path.is_empty() {
+                options.insert(Value::String("path".into()), Value::String(clean_path));
+            }
+            if let Some(ed) = early_data {
+                options.insert(
+                    Value::String("max-early-data".into()),
+                    Value::Number(serde_yaml_ng::Number::from(ed)),
+                );
+                options.insert(
+                    Value::String("early-data-header-name".into()),
+                    Value::String("Sec-WebSocket-Protocol".into()),
+                );
             }
             if !host.is_empty() {
                 let mut headers = Mapping::new();
@@ -1015,9 +1272,12 @@ fn apply_xhttp_query(proxy: &mut Proxy, query: &HashMap<String, String>) -> Resu
                 XHTTP_EXTRA_FIELDS.iter().find(|(source, _)| *source == key)
             {
                 let value = xhttp_extra_value(target, value)?;
-                // Xray always takes these three fields from the outer settings.
-                if !matches!(*target, "host" | "path" | "mode") {
-                    options.insert(Value::String((*target).into()), value);
+                // Outer host/path/mode take precedence; fall back to extra when outer omitted them.
+                let target_key = Value::String((*target).into());
+                if !matches!(*target, "host" | "path" | "mode")
+                    || !options.contains_key(&target_key)
+                {
+                    options.insert(target_key, value);
                 }
             }
         }
@@ -1096,11 +1356,18 @@ fn link_compatibility_warnings(line: &str) -> Vec<String> {
                 "allowinsecure",
                 "skip-cert-verify",
                 "fp",
+                "fingerprint",
                 "client-fingerprint",
                 "alpn",
                 "idle-session-check-interval",
                 "idle-session-timeout",
                 "min-idle-session",
+                "udp",
+                "udp-relay",
+                "tfo",
+                "tcp-fast-open",
+                "ech",
+                "ech-config",
             ],
             "snell" => &[
                 "psk",
@@ -1268,6 +1535,144 @@ fn insert_alpn(proxy: &mut Proxy, raw: &str) {
         .collect();
     if !values.is_empty() {
         proxy.insert("alpn", Value::Sequence(values));
+    }
+}
+
+fn url_host(url: &Url) -> Result<String> {
+    let host = url
+        .host_str()
+        .ok_or(Error::MissingField("server"))?
+        .trim_matches(['[', ']'])
+        .to_string();
+    if host.is_empty() {
+        return Err(Error::MissingField("server"));
+    }
+    Ok(host)
+}
+
+fn apply_reality_opts(proxy: &mut Proxy, query: &HashMap<String, String>) -> Result<bool> {
+    let security = query_value(query, &["security", "tls"]).unwrap_or("none");
+    let public_key = query_value(query, &["pbk", "publickey", "public-key"]);
+    let reality = security.eq_ignore_ascii_case("reality") || public_key.is_some();
+    if !reality {
+        return Ok(false);
+    }
+    let public_key = public_key.ok_or(Error::MissingField("pbk"))?;
+    if !crate::model::is_valid_reality_public_key(public_key) {
+        return Err(Error::InvalidLink(
+            "REALITY public key must be 32 bytes base64url".into(),
+        ));
+    }
+    let mut reality_opts = Mapping::new();
+    reality_opts.insert(
+        Value::String("public-key".into()),
+        Value::String(public_key.to_string()),
+    );
+    if let Some(short_id) = query_value(query, &["sid", "shortid", "short-id"]) {
+        if !crate::model::is_valid_reality_short_id(short_id) {
+            return Err(Error::InvalidLink(
+                "REALITY short-id must be 0-16 hex characters".into(),
+            ));
+        }
+        reality_opts.insert(
+            Value::String("short-id".into()),
+            Value::String(short_id.to_string()),
+        );
+    }
+    // Modern Xray REALITY servers expect a ClientHello with X25519-MLKEM768.
+    // Keep an explicit opt-out for older servers; pqv is a different (ML-DSA) key.
+    let support_mlkem =
+        query_optional_bool(query, &["support-x25519mlkem768", "supportx25519mlkem768"])?
+            .unwrap_or(true);
+    reality_opts.insert(
+        Value::String("support-x25519mlkem768".into()),
+        Value::Bool(support_mlkem),
+    );
+    if query_value(query, &["pqv", "mldsa65verify", "mldsa65-verify"]).is_some() {
+        return Err(Error::InvalidLink(
+            "Mihomo 暂不支持 REALITY pqv / mldsa65Verify 公钥验证，无法无损转换；该参数不是 support-x25519mlkem768 开关".into(),
+        ));
+    }
+    proxy.insert("reality-opts", Value::Mapping(reality_opts));
+    Ok(true)
+}
+
+fn apply_common_opts(proxy: &mut Proxy, query: &HashMap<String, String>) -> Result<()> {
+    if let Some(tfo) = query_optional_bool(query, &["tfo", "tcp-fast-open"])? {
+        proxy.insert("tfo", tfo);
+    }
+    if let Some(ech) = query_value(query, &["ech", "ech-config"]) {
+        insert_ech(proxy, ech);
+    }
+    if let Some(udp) = query_optional_bool(query, &["udp", "udp-relay"])? {
+        proxy.insert("udp", udp);
+    }
+    Ok(())
+}
+
+fn insert_ech(proxy: &mut Proxy, raw: &str) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || matches!(trimmed.to_ascii_lowercase().as_str(), "0" | "false" | "off")
+    {
+        return;
+    }
+    let mut ech_opts = Mapping::new();
+    ech_opts.insert(Value::String("enable".into()), Value::Bool(true));
+    if !matches!(trimmed.to_ascii_lowercase().as_str(), "1" | "true" | "on") {
+        ech_opts.insert(
+            Value::String("config".into()),
+            Value::String(trimmed.to_string()),
+        );
+    }
+    proxy.insert("ech-opts", Value::Mapping(ech_opts));
+}
+
+fn normalize_hy2_bandwidth(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        format!("{trimmed} Mbps")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn split_ws_early_data(path: &str) -> (String, Option<u64>) {
+    let Some((base, query)) = path.split_once('?') else {
+        return (path.to_string(), None);
+    };
+    let mut ed: Option<u64> = None;
+    let mut kept = Vec::new();
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=')
+            && k.eq_ignore_ascii_case("ed")
+            && let Ok(val) = v.parse::<u64>()
+            && val > 0
+        {
+            ed = Some(val);
+            continue;
+        }
+        if !pair.is_empty() {
+            kept.push(pair);
+        }
+    }
+    if ed.is_none() {
+        return (path.to_string(), None);
+    }
+    let clean = if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    };
+    (clean, ed)
+}
+
+fn decode_base64_user_pass(raw: &str) -> Option<(String, String)> {
+    let decoded = decode_base64_text(raw).ok()?;
+    let (user, pass) = decoded.split_once(':')?;
+    if !user.is_empty() && decoded.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+        Some((user.to_string(), pass.to_string()))
+    } else {
+        None
     }
 }
 
@@ -1527,6 +1932,8 @@ mod tests {
                 .unwrap();
         assert_eq!(trojan.kind(), "trojan");
         assert_eq!(trojan.get_str("password"), Some("pass"));
+        assert_eq!(trojan.get_str("sni"), Some("example.com"));
+        assert_eq!(trojan.get_str("servername"), None);
         assert_eq!(trojan.get_str("network"), Some("grpc"));
 
         let hy2 = parse_hysteria2(
@@ -1537,6 +1944,151 @@ mod tests {
         assert_eq!(hy2.port(), 8443);
         assert_eq!(hy2.get_str("obfs"), Some("salamander"));
         assert_eq!(hy2.get_bool("skip-cert-verify"), Some(true));
+    }
+
+    #[test]
+    fn parses_latest_parameters_and_fixes_mihomo_export_fields() {
+        use base64::Engine;
+
+        // 1. IPv6 brackets stripped across URL-based protocols
+        let vless_v6 = parse_link(
+            "vless://11111111-2222-3333-4444-555555555555@[2001:db8::1]:443?security=tls&type=ws&path=%2Fws%3Fed%3D2048&host=cdn.example&packetEncoding=xudp&tfo=1&ech=AEX+DQ==&udp=0#V6",
+        )
+        .unwrap();
+        assert_eq!(vless_v6.server(), "2001:db8::1");
+        assert_eq!(vless_v6.get_str("packet-encoding"), Some("xudp"));
+        assert_eq!(vless_v6.get_bool("tfo"), Some(true));
+        assert_eq!(vless_v6.get_bool("udp"), Some(false));
+        assert_eq!(vless_v6.fields()["ws-opts"]["path"].as_str(), Some("/ws"));
+        assert_eq!(
+            vless_v6.fields()["ws-opts"]["max-early-data"].as_u64(),
+            Some(2048)
+        );
+        assert_eq!(
+            vless_v6.fields()["ws-opts"]["early-data-header-name"].as_str(),
+            Some("Sec-WebSocket-Protocol")
+        );
+        assert_eq!(
+            vless_v6.fields()["ech-opts"]["enable"].as_bool(),
+            Some(true)
+        );
+        let roundtrip = Proxy::from_yaml_text(&vless_v6.to_yaml_text().unwrap()).unwrap();
+        assert_eq!(roundtrip, vless_v6);
+
+        // 2. XHTTP falls back to extra.host/path/mode when outer omits them
+        let mut xhttp_url = Url::parse(&format!("{REALITY_LINK}&type=xhttp")).unwrap();
+        xhttp_url.query_pairs_mut().append_pair(
+            "extra",
+            r#"{"host":"inner.example","path":"/inner","mode":"packet-up"}"#,
+        );
+        let xhttp = parse_link(xhttp_url.as_str()).unwrap();
+        assert_eq!(
+            xhttp.fields()["xhttp-opts"]["host"].as_str(),
+            Some("inner.example")
+        );
+        assert_eq!(
+            xhttp.fields()["xhttp-opts"]["path"].as_str(),
+            Some("/inner")
+        );
+        assert_eq!(
+            xhttp.fields()["xhttp-opts"]["mode"].as_str(),
+            Some("packet-up")
+        );
+
+        // 3. Trojan: sni (not servername), password with colon, REALITY, IPv6
+        let trojan = parse_link(
+            "trojan://user:pass@[2001:db8::2]:443?sni=sni.example&security=reality&pbk=jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0&sid=ab12&fp=chrome#TR",
+        )
+        .unwrap();
+        assert_eq!(trojan.server(), "2001:db8::2");
+        assert_eq!(trojan.get_str("password"), Some("user:pass"));
+        assert_eq!(trojan.get_str("sni"), Some("sni.example"));
+        assert_eq!(trojan.get_str("servername"), None);
+        assert_eq!(
+            trojan.fields()["reality-opts"]["short-id"].as_str(),
+            Some("ab12")
+        );
+
+        // 4. Hysteria2: obfs=none omitted, Mbps normalized, pinSHA256, alpn, hop-interval, cwnd
+        let hy2 = parse_link(
+            "hy2://pass@[2001:db8::3]:8443?sni=hy2.example&obfs=none&upmbps=100&down=500%20Mbps&pinSHA256=deadbeef&alpn=h3&hop-interval=30s&cwnd=64#HY2-Latest",
+        )
+        .unwrap();
+        assert_eq!(hy2.server(), "2001:db8::3");
+        assert_eq!(hy2.get_str("obfs"), None);
+        assert_eq!(hy2.get_str("up"), Some("100 Mbps"));
+        assert_eq!(hy2.get_str("down"), Some("500 Mbps"));
+        assert_eq!(hy2.get_str("fingerprint"), Some("deadbeef"));
+        assert_eq!(hy2.get_u64("hop-interval"), Some(30));
+        assert_eq!(hy2.get_u64("cwnd"), Some(64));
+        assert_eq!(hy2.fields()["alpn"][0].as_str(), Some("h3"));
+
+        // 5. TUIC v5 latest params + TUIC v4 token
+        let tuic = parse_link(
+            "tuic://11111111-2222-3333-4444-555555555555:secret@[2001:db8::4]:443?sni=t.example&disable_sni=1&reduce_rtt=1&heartbeat_interval=10000&request_timeout=8000&fp=chrome&alpn=h3#TUIC5",
+        )
+        .unwrap();
+        assert_eq!(tuic.server(), "2001:db8::4");
+        assert_eq!(tuic.get_bool("disable-sni"), Some(true));
+        assert_eq!(tuic.get_bool("reduce-rtt"), Some(true));
+        assert_eq!(tuic.get_u64("heartbeat-interval"), Some(10000));
+        assert_eq!(tuic.get_u64("request-timeout"), Some(8000));
+        assert_eq!(tuic.get_str("client-fingerprint"), Some("chrome"));
+        let tuic_v4 = parse_link("tuic://mytoken@example.com:443?version=4#TUIC4").unwrap();
+        assert_eq!(tuic_v4.get_str("token"), Some("mytoken"));
+        assert!(tuic_v4.fatal_issue().is_none());
+
+        // 6. Shadowsocks: shadow-tls, v2ray-plugin mux bool, uot, tfo
+        let ss = parse_link(
+            "ss://YWVzLTI1Ni1nY206cGFzcw==@example.com:443?plugin=shadow-tls%3Bhost%3Dtls.example%3Bpassword%3Dstpass%3Bversion%3D3&uot=1&tfo=1#SS-STLS",
+        )
+        .unwrap();
+        assert_eq!(ss.get_str("plugin"), Some("shadow-tls"));
+        assert_eq!(
+            ss.fields()["plugin-opts"]["host"].as_str(),
+            Some("tls.example")
+        );
+        assert_eq!(ss.fields()["plugin-opts"]["version"].as_u64(), Some(3));
+        assert_eq!(ss.get_bool("udp-over-tcp"), Some(true));
+        assert_eq!(ss.get_bool("tfo"), Some(true));
+
+        let ss_v2 = parse_link(
+            "ss://YWVzLTI1Ni1nY206cGFzcw==@example.com:443?plugin=v2ray-plugin%3Bmode%3Dwebsocket%3Btls%3Bmux%3D0%3Bskip-cert-verify%3D1#SS-V2",
+        )
+        .unwrap();
+        assert_eq!(ss_v2.fields()["plugin-opts"]["mux"].as_bool(), Some(false));
+        assert_eq!(
+            ss_v2.fields()["plugin-opts"]["skip-cert-verify"].as_bool(),
+            Some(true)
+        );
+
+        // 7. VMess Shadowrocket URI format & JSON packetEncoding + ws ?ed=
+        let sr_payload = base64::engine::general_purpose::STANDARD
+            .encode("aes-128-gcm:11111111-2222-3333-4444-555555555555@sr.example.com:443");
+        let sr_link = format!(
+            "vmess://{sr_payload}?remarks=SR-Node&obfs=websocket&path=%2Fws%3Fed%3D2048&obfsParam=cdn.sr.example&tls=1&peer=sni.sr.example&allowInsecure=1"
+        );
+        let sr_vmess = parse_link(&sr_link).unwrap();
+        assert_eq!(sr_vmess.name(), "SR-Node");
+        assert_eq!(sr_vmess.server(), "sr.example.com");
+        assert_eq!(sr_vmess.get_str("servername"), Some("sni.sr.example"));
+        assert_eq!(sr_vmess.get_bool("skip-cert-verify"), Some(true));
+        assert_eq!(
+            sr_vmess.fields()["ws-opts"]["max-early-data"].as_u64(),
+            Some(2048)
+        );
+
+        // 8. SOCKS5 base64 userinfo + IPv6 + TLS + SNI
+        let s5_cred = base64::engine::general_purpose::STANDARD.encode("alice:s3cr3t");
+        let s5 = parse_link(&format!(
+            "socks5://{s5_cred}@[2001:db8::5]:1080?tls=1&sni=socks.example#S5"
+        ))
+        .unwrap();
+        assert_eq!(s5.server(), "2001:db8::5");
+        assert_eq!(s5.get_str("username"), Some("alice"));
+        assert_eq!(s5.get_str("password"), Some("s3cr3t"));
+        assert_eq!(s5.get_bool("tls"), Some(true));
+        assert_eq!(s5.get_str("sni"), Some("socks.example"));
     }
 
     #[test]

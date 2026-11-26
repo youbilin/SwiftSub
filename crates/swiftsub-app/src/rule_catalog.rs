@@ -816,6 +816,7 @@ pub fn binding_for(
 }
 
 /// Update only the requested entries of one source; keep other sources and manual URLs.
+#[cfg(test)]
 pub fn set_source_selection(
     bindings: &mut Vec<RuleSetBinding>,
     source: &RuleSetSource,
@@ -855,6 +856,41 @@ pub fn refresh_binding_url(binding: &mut RuleSetBinding, metacube_base: &str) {
             .iter()
             .find(|entry| binding.id == format!("{}-{}", source.id, entry.id))
         {
+            let managed = url::Url::parse(&binding.url).is_ok_and(|url| {
+                if url.scheme() != "https" || url.query().is_some() || url.fragment().is_some() {
+                    return false;
+                }
+                let raw_path = format!(
+                    "/{}/{}/{}/{}",
+                    source.owner, source.repo, source.branch, entry.path
+                );
+                let cdn_path = format!(
+                    "/gh/{}/{}@{}/{}",
+                    source.owner, source.repo, source.branch, entry.path
+                );
+                let github_path = format!(
+                    "/{}/{}/raw/refs/heads/{}/{}",
+                    source.owner, source.repo, source.branch, entry.path
+                );
+                let with_geo = |path: &str| {
+                    source.kind == SourceKind::MetaCube
+                        && url.path()
+                            == format!("{}geo/{}", path.trim_end_matches(entry.path), entry.path)
+                };
+                match url.host_str() {
+                    Some("github.com") => url.path() == github_path || with_geo(&github_path),
+                    Some("raw.githubusercontent.com") => {
+                        url.path() == raw_path || with_geo(&raw_path)
+                    }
+                    Some("cdn.jsdelivr.net" | "fastly.jsdelivr.net" | "testingcf.jsdelivr.net") => {
+                        url.path() == cdn_path || with_geo(&cdn_path)
+                    }
+                    _ => false,
+                }
+            });
+            if !managed {
+                return;
+            }
             binding.url = resolve_url(
                 source,
                 entry,
@@ -917,7 +953,7 @@ mod tests {
                 source,
                 &source.entries[0],
                 Mirror::GitHub,
-                "https://example.com/meta",
+                "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta",
                 &modules,
             );
             binding.target = "DIRECT".into();
@@ -951,5 +987,51 @@ mod tests {
             "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta",
         );
         assert_eq!(manual.url, original);
+
+        for base in [
+            "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo",
+            "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo",
+            "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo",
+            "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo",
+        ] {
+            let mut binding = binding_for(
+                &SOURCES[0],
+                &SOURCES[0].entries[0],
+                Mirror::GitHub,
+                base,
+                &modules,
+            );
+            refresh_binding_url(
+                &mut binding,
+                "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo",
+            );
+            assert!(binding.url.starts_with("https://cdn.jsdelivr.net/gh/"));
+        }
+    }
+
+    #[test]
+    fn mirror_changes_preserve_edited_catalog_urls() {
+        for source in SOURCES {
+            let mut binding = binding_for(
+                source,
+                &source.entries[0],
+                Mirror::GitHub,
+                "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta",
+                &HashSet::new(),
+            );
+            let original = binding.url.clone();
+            for edited in [
+                "https://example.com/custom.yaml".to_string(),
+                format!("{original}?version=custom"),
+                original.replace(source.branch, "custom-branch"),
+            ] {
+                binding.url = edited.clone();
+                refresh_binding_url(
+                    &mut binding,
+                    "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta",
+                );
+                assert_eq!(binding.url, edited);
+            }
+        }
     }
 }

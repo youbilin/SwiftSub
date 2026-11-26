@@ -129,5 +129,11 @@ pub fn is_known_protocol(kind: &str) -> bool {
             | "socks5"
             | "socks4"
             | "ssh"
+            | "mieru"
+            | "juicity"
+            | "masque"
+            | "direct"
+            | "dns"
+            | "reject"
     )
 }

@@ -5,6 +5,8 @@ pub(super) struct ProfileConfig {
     pub(super) routing: TemplateSnapshot,
     #[serde(default)]
     pub(super) membership: Option<HashSet<i64>>,
+    #[serde(default)]
+    pub(super) node_order: Option<Vec<String>>,
     #[serde(default = "default_filename")]
     filename: String,
 }
@@ -12,11 +14,15 @@ fn default_filename() -> String {
     "swiftsub.yaml".into()
 }
 
-impl SwiftSubApp {
-    pub fn refresh_profile_nodes(&mut self, cx: &mut Context<Self>) {
-        self.rebuild_nodes(cx);
-    }
+fn validate_profile_recipe(json: &str) -> Result<ProfileConfig, String> {
+    let config: ProfileConfig = serde_json::from_str(json).map_err(|error| error.to_string())?;
+    config
+        .routing
+        .generate_options(&GenerateOptions::default())?;
+    Ok(config)
+}
 
+impl SwiftSubApp {
     pub fn profile_includes(&self, id: i64) -> bool {
         self.profile_membership
             .as_ref()
@@ -30,6 +36,7 @@ impl SwiftSubApp {
                 .clone()
                 .unwrap_or_else(|| self.active_template_snapshot()),
             membership: self.profile_membership.clone(),
+            node_order: Some(self.node_order.clone()),
             filename: self.subscription_filename.clone(),
         }
     }
@@ -49,9 +56,17 @@ impl SwiftSubApp {
         }
         let json =
             serde_json::to_string(&self.current_profile_config()).map_err(|e| e.to_string())?;
-        self.store
-            .lock()
-            .expect("store mutex poisoned")
+        let store = self.store.lock().map_err(|error| error.to_string())?;
+        if let Some(previous) = store
+            .get_profile_by_token(&self.profile_token)
+            .map_err(|error| error.to_string())?
+            && let Some(previous) = previous.options_json
+        {
+            validate_profile_recipe(&previous).map_err(|error| {
+                format!("工作区原设置无法读取，已保留原设置和上次输出；请先修正分流：{error}")
+            })?;
+        }
+        store
             .save_profile_options(self.profile_id, &json)
             .map_err(|e| e.to_string())
     }
@@ -65,19 +80,36 @@ impl SwiftSubApp {
         if let Some(data) = data {
             match serde_json::from_str::<ProfileConfig>(data) {
                 Ok(mut config) => {
+                    if let Some(order) = config.node_order {
+                        self.node_order = order;
+                    }
                     config.routing.remove_legacy_regions();
-                    if let Ok(options) =
-                        config.routing.generate_options(&GenerateOptions::default())
-                    {
-                        self.options = options;
-                        self.enabled_modules = config.routing.enabled_modules.into_iter().collect();
-                        self.disabled_rule_sets =
-                            config.routing.disabled_rule_sets.into_iter().collect();
-                        self.custom_rule_sets = config.routing.custom_rule_sets;
-                        self.custom_groups = config.routing.custom_groups;
-                        self.chains = config.routing.chains;
-                        self.profile_membership = config.membership;
-                        self.subscription_filename = config.filename;
+                    match config.routing.generate_options(&GenerateOptions::default()) {
+                        Ok(options) => {
+                            self.options = options;
+                            self.enabled_modules =
+                                config.routing.enabled_modules.into_iter().collect();
+                            self.disabled_rule_sets =
+                                config.routing.disabled_rule_sets.into_iter().collect();
+                            self.custom_rule_sets = config.routing.custom_rule_sets;
+                            self.custom_groups = config.routing.custom_groups;
+                            self.chains = config.routing.chains;
+                            self.profile_membership = config.membership;
+                            self.subscription_filename = config.filename;
+                        }
+                        Err(error) => {
+                            self.store_error =
+                                Some(format!("工作区分流需要修正，原设置已保留：{error}"));
+                            self.profile_membership = config.membership;
+                            self.subscription_filename = config.filename;
+                            self.load_template_draft(
+                                config.routing,
+                                String::new(),
+                                None,
+                                window,
+                                cx,
+                            );
+                        }
                     }
                 }
                 Err(e) => {
@@ -100,271 +132,60 @@ impl SwiftSubApp {
             s.set_value(self.options.rule_provider_base_url.clone(), window, cx)
         });
         self.refresh_server_url();
-    }
-
-    pub fn switch_profile(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.template_session_active {
-            self.request_close_template(window, cx);
-            if self.template_session_active {
-                self.show_toast("未完成的分流输入已保存，请修正后再切换配置".into(), cx);
-                return;
-            }
-        }
-        if let Err(e) = self.save_active_profile() {
-            self.show_toast(e, cx);
-            return;
-        }
-        self.profiles = self
-            .store
-            .lock()
-            .expect("store mutex poisoned")
-            .list_profiles()
-            .unwrap_or_default();
-        let Some(profile) = self.profiles.iter().find(|p| p.id == id).cloned() else {
-            return;
-        };
-        self.profile_id = id;
-        self.profile_token = profile.token;
-        self.profile_delete_armed = false;
-        self.profile_membership = None;
-        self.disabled_nodes.clear();
-        self.restore_selected_profile(window, cx);
-        let _ = self
-            .store
-            .lock()
-            .expect("store mutex poisoned")
-            .set_setting("active_profile", &id.to_string());
-        self.rebuild_nodes(cx);
-        self.restore_draft(window, cx);
-    }
-
-    pub fn create_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.template_session_active {
-            self.request_close_template(window, cx);
-            if self.template_session_active {
-                self.show_toast("未完成的分流输入已保存，请修正后再切换配置".into(), cx);
-                return;
-            }
-        }
-        let name = self.profile_name_input.read(cx).value().trim().to_string();
-        if name.is_empty() || self.profiles.iter().any(|p| p.name == name) {
-            self.show_toast("请输入未使用的配置名称".into(), cx);
-            return;
-        }
-        let result = (|| {
-            let store = self.store.lock().expect("store mutex poisoned");
-            let profile = store
-                .get_or_create_profile(&name)
-                .map_err(|e| e.to_string())?;
-            store
-                .save_profile_options(
-                    profile.id,
-                    &serde_json::to_string(&self.current_profile_config())
-                        .map_err(|e| e.to_string())?,
-                )
-                .map_err(|e| e.to_string())?;
-            Ok::<_, String>(profile.id)
-        })();
-        match result {
-            Ok(id) => self.switch_profile(id, window, cx),
-            Err(e) => self.show_toast(e, cx),
-        }
-    }
-
-    pub fn rename_profile(&mut self, cx: &mut Context<Self>) {
-        let name = self.profile_name_input.read(cx).value().trim().to_string();
-        if name.is_empty()
-            || self
-                .profiles
-                .iter()
-                .any(|p| p.id != self.profile_id && p.name == name)
-        {
-            self.show_toast("名称为空或已存在".into(), cx);
-            return;
-        }
-        let result = self
-            .store
-            .lock()
-            .expect("store mutex poisoned")
-            .rename_profile(self.profile_id, &name);
-        match result {
-            Ok(()) => {
-                self.profiles = self
-                    .store
-                    .lock()
-                    .unwrap()
-                    .list_profiles()
-                    .unwrap_or_default();
-                cx.notify();
-            }
-            Err(e) => self.show_toast(e.to_string(), cx),
-        }
-    }
-
-    pub fn delete_active_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.template_dialog_open {
-            self.show_toast("请先关闭分流编辑器".into(), cx);
-            return;
-        }
-        if self.profiles.len() < 2 {
-            self.show_toast("至少保留一个配置".into(), cx);
-            return;
-        }
-        if !self.profile_delete_armed {
-            self.profile_delete_armed = true;
-            self.show_toast("再次点击删除当前配置，其订阅地址将失效".into(), cx);
-            return;
-        }
-        let result = self.store.lock().unwrap().delete_profile(self.profile_id);
-        match result {
-            Ok(true) => {
-                self.profiles = self
-                    .store
-                    .lock()
-                    .unwrap()
-                    .list_profiles()
-                    .unwrap_or_default();
-                if let Some(p) = self.profiles.first() {
-                    self.switch_profile(p.id, window, cx);
-                }
-            }
-            Ok(false) => {}
-            Err(e) => self.show_toast(e.to_string(), cx),
-        }
-    }
-
-    pub fn toggle_profile_subscription(&mut self, id: i64, cx: &mut Context<Self>) {
-        let mut ids = self
-            .profile_membership
-            .clone()
-            .unwrap_or_else(|| self.subscriptions.iter().map(|s| s.id).collect());
-        if !ids.remove(&id) {
-            ids.insert(id);
-        }
-        self.profile_membership = Some(ids);
-        self.rebuild_nodes(cx);
+        self.restore_generated_target(window, cx);
     }
 
     pub(super) fn publish_profiles(&self) {
         let Some(server) = &self.server else {
             return;
         };
-        let profiles = self
-            .store
-            .lock()
-            .expect("store mutex poisoned")
-            .list_profiles()
-            .unwrap_or_default();
-        let mut published = HashMap::new();
-        for profile in profiles {
-            let (yaml, userinfo) = if profile.id == self.profile_id {
-                (self.preview.clone(), self.aggregate_userinfo())
-            } else {
-                // Rebuild inactive profiles from current shared source payloads, preserving membership.
-                let config = profile
+        let snapshots = {
+            let store = self.store.lock().expect("store mutex poisoned");
+            let (Ok(profiles), Ok(configs)) = (store.list_profiles(), store.list_saved_configs())
+            else {
+                return;
+            };
+            let mut published = HashMap::new();
+            for profile in profiles {
+                let membership = profile
                     .options_json
                     .as_deref()
-                    .and_then(|v| serde_json::from_str::<ProfileConfig>(v).ok());
-                let userinfo = config
-                    .as_ref()
-                    .and_then(|c| profile_userinfo(&self.subscriptions, c.membership.as_ref()));
-                let generated = config
-                    .and_then(|config| {
-                        let options = config
-                            .routing
-                            .generate_options(&GenerateOptions::default())
-                            .ok()?;
-                        let store = self.store.lock().ok()?;
-                        let mut nodes = Vec::new();
-                        for sub in self.subscriptions.iter().filter(|s| {
-                            s.enabled
-                                && config
-                                    .membership
-                                    .as_ref()
-                                    .is_none_or(|ids| ids.contains(&s.id))
-                        }) {
-                            if let Some(parsed) =
-                                sub.payload.as_deref().and_then(|p| parse_content(p).ok())
-                            {
-                                let mut imported = build_nodes(
-                                    parsed.proxies,
-                                    sub.id.to_string(),
-                                    sub.name.clone(),
-                                );
-                                let overrides =
-                                    store.list_node_overrides(sub.id).unwrap_or_default();
-                                for n in &mut imported {
-                                    if let Some(o) = overrides.get(&n.source_key) {
-                                        if let Some(extras) = &o.extras {
-                                            if let Ok(proxy) = Proxy::from_yaml_text(extras) {
-                                                n.proxy = proxy;
-                                            }
-                                        }
-                                        if let Some(alias) = &o.alias {
-                                            n.set_name(alias.clone());
-                                        }
-                                        if let Some(enabled) = o.enabled {
-                                            n.enabled = enabled;
-                                        }
-                                        n.listen_port = o.listen_port;
-                                    }
-                                }
-                                for n in &mut imported {
-                                    n.region = detect_region(n.name());
-                                }
-                                nodes.extend(imported);
-                            }
-                        }
-                        let mut seen = HashSet::new();
-                        nodes.retain(|n| seen.insert(n.proxy.identity_key()));
-                        if !self.node_order.is_empty() {
-                            let positions: HashMap<_, _> = self
-                                .node_order
-                                .iter()
-                                .enumerate()
-                                .map(|(i, k)| (k, i))
-                                .collect();
-                            nodes.sort_by_key(|n| {
-                                positions.get(&n.source_key).copied().unwrap_or(usize::MAX)
-                            });
-                        }
-                        generate_profile(&nodes, &options).ok().map(|p| p.yaml)
-                    })
-                    .unwrap_or_default();
-                let _ = self
-                    .store
-                    .lock()
-                    .unwrap()
-                    .save_profile_yaml(profile.id, &generated);
-                (generated, userinfo)
-            };
-            published.insert(
-                profile.token,
-                ProfileSnapshot {
-                    yaml,
-                    userinfo_header: userinfo,
-                    update_interval_hours: 24,
-                },
-            );
-        }
-        // Saved YAMLs are snapshots: shared-source refresh must never regenerate them.
-        if let Ok(configs) = self.store.lock().unwrap().list_saved_configs() {
+                    .and_then(|json| serde_json::from_str::<ProfileConfig>(json).ok())
+                    .and_then(|config| config.membership);
+                published.insert(
+                    profile.token,
+                    ProfileSnapshot {
+                        yaml: profile.last_yaml.unwrap_or_default(),
+                        userinfo_header: profile_userinfo(&self.subscriptions, membership.as_ref()),
+                        update_interval_hours: 24,
+                    },
+                );
+            }
             for config in configs {
                 published.insert(
                     config.id,
                     ProfileSnapshot {
                         yaml: config.yaml,
-                        userinfo_header: None,
-                        update_interval_hours: 24,
+                        update_interval_hours: 1,
+                        ..Default::default()
                     },
                 );
             }
-        }
-        server.replace_profiles(published);
+            published
+        };
+        self.publication.submit(publication::PublishJob {
+            store: Arc::clone(&self.store),
+            publisher: server.publisher(),
+            active_profile: self.profile_id,
+            subscriptions: self.subscriptions.clone(),
+            node_order: self.node_order.clone(),
+            parsed_sources: self.parsed_sources.clone(),
+            snapshots,
+        });
     }
 }
 
-fn profile_userinfo(
+pub(super) fn profile_userinfo(
     subscriptions: &[StoredSubscription],
     membership: Option<&HashSet<i64>>,
 ) -> Option<String> {

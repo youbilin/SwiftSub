@@ -1,4 +1,10 @@
 mod dns;
+mod mrs;
+mod rule_content;
+mod rule_validation;
+pub use mrs::decode_mrs_payload;
+pub use rule_content::parse_rule_set_payload;
+pub use rule_validation::validate_rule_definitions;
 
 use std::collections::{HashMap, HashSet};
 
@@ -52,12 +58,13 @@ fn default_listener_address() -> String {
     "127.0.0.1".into()
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct GenerateOptions {
     pub preset: Preset,
     pub enabled_modules: Option<Vec<String>>,
     pub test_url: String,
     pub test_interval: u32,
+    pub test_tolerance: u32,
     pub mixed_port: u16,
     pub allow_lan: bool,
     pub rule_provider_base_url: String,
@@ -66,15 +73,26 @@ pub struct GenerateOptions {
     pub custom_rules: Vec<Rule>,
     pub custom_groups: Vec<CustomGroupSpec>,
     pub policy_groups: Vec<PolicyGroupSpec>,
+    pub group_order: Vec<String>,
     pub rule_set_targets: HashMap<String, String>,
     pub chains: Vec<ChainSpec>,
     pub dns: DnsOptions,
+    pub dns_override: bool,
+    pub rule_set_overrides: HashMap<String, Vec<String>>,
     pub rule_order: Vec<String>,
     pub listeners: Vec<ListenerSpec>,
     pub extra_yaml: String,
 }
 
 impl GenerateOptions {
+    pub fn resolved_group_name<'a>(&'a self, name: &'a str) -> &'a str {
+        self.policy_groups
+            .iter()
+            .find(|group| group.builtin_name() == Some(name))
+            .map(|group| group.name.as_str())
+            .unwrap_or(name)
+    }
+
     /// Migrate targets of retired built-in region groups; explicitly authored groups remain available.
     pub fn remove_legacy_region_groups(&mut self) {
         let authored: HashSet<_> = self
@@ -97,7 +115,7 @@ impl GenerateOptions {
             });
         }
         self.policy_groups
-            .retain(|g| !(g.builtin && retired.contains(g.name.as_str())));
+            .retain(|g| !g.builtin_name().is_some_and(|name| retired.contains(name)));
         let redirect = |target: &mut String| {
             if retired.contains(target.as_str()) {
                 *target = SELECT_GROUP.into();
@@ -132,6 +150,7 @@ impl Default for GenerateOptions {
             enabled_modules: None,
             test_url: HEALTH_CHECK_URL.to_string(),
             test_interval: 300,
+            test_tolerance: 50,
             mixed_port: 7897,
             allow_lan: false,
             rule_provider_base_url:
@@ -141,9 +160,12 @@ impl Default for GenerateOptions {
             custom_rules: Vec::new(),
             custom_groups: Vec::new(),
             policy_groups: Vec::new(),
+            group_order: Vec::new(),
             rule_set_targets: HashMap::new(),
             chains: Vec::new(),
             dns: DnsOptions::default(),
+            dns_override: false,
+            rule_set_overrides: HashMap::new(),
             rule_order: Vec::new(),
             listeners: Vec::new(),
             extra_yaml: String::new(),
@@ -170,11 +192,197 @@ pub struct GeneratedProfile {
 }
 
 pub fn generate_profile(nodes: &[Node], options: &GenerateOptions) -> Result<GeneratedProfile> {
+    if !valid_http_url(&options.test_url) || options.test_interval == 0 {
+        return Err(Error::InvalidConfig(
+            "全局测速地址须为有效 HTTP / HTTPS 链接，间隔必须大于零".into(),
+        ));
+    }
     let mut normalized = options.clone();
     normalized.remove_legacy_region_groups();
+    let aliases: HashMap<String, String> = normalized
+        .policy_groups
+        .iter()
+        .filter_map(|group| {
+            group
+                .builtin_name()
+                .filter(|name| *name != group.name)
+                .map(|name| (name.to_string(), group.name.clone()))
+        })
+        .collect();
+    if let Some(name) = aliases.values().find(|name| {
+        catalog::MODULES
+            .iter()
+            .any(|module| module.name == name.as_str())
+    }) {
+        return Err(Error::InvalidConfig(format!(
+            "策略组名称与内置组重名：{name}"
+        )));
+    }
+    for name in nodes
+        .iter()
+        .map(Node::name)
+        .chain(
+            normalized
+                .policy_groups
+                .iter()
+                .filter(|group| !group.builtin)
+                .map(|group| group.name.as_str()),
+        )
+        .chain(
+            normalized
+                .custom_groups
+                .iter()
+                .map(|group| group.name.as_str()),
+        )
+        .chain(normalized.chains.iter().map(|chain| chain.name.as_str()))
+    {
+        if aliases.contains_key(name) {
+            return Err(Error::InvalidConfig(format!(
+                "名称与内置组原名称重名：{name}"
+            )));
+        }
+    }
+    let resolve_alias = |target: &mut String| {
+        if let Some(name) = aliases.get(target) {
+            *target = name.clone();
+        }
+    };
+    for group in &mut normalized.policy_groups {
+        for member in &mut group.members {
+            resolve_alias(member);
+        }
+    }
+    for binding in &mut normalized.custom_rule_sets {
+        resolve_alias(&mut binding.target);
+    }
+    for rule in &mut normalized.custom_rules {
+        resolve_alias(&mut rule.target);
+    }
+    for target in normalized.rule_set_targets.values_mut() {
+        resolve_alias(target);
+    }
+    for listener in &mut normalized.listeners {
+        resolve_alias(&mut listener.proxy);
+    }
+    for name in &mut normalized.group_order {
+        resolve_alias(name);
+    }
+    for line in &mut normalized.rule_order {
+        if let Ok(mut rule) = Rule::parse(line) {
+            resolve_alias(&mut rule.target);
+            *line = rule.to_line();
+        }
+    }
+    if normalized.dns_override {
+        normalized.dns.validate()?;
+    } else {
+        normalized.dns = DnsOptions::default();
+    }
+    let active_modules = resolve_enabled_modules(&normalized);
+    let mut dormant: HashSet<_> = normalized
+        .policy_groups
+        .iter()
+        .filter(|group| group.disabled || group.removed)
+        .map(|group| group.name.clone())
+        .collect();
+    dormant.extend(
+        normalized
+            .custom_groups
+            .iter()
+            .filter(|group| group.disabled)
+            .map(|group| group.name.clone()),
+    );
+    dormant.extend(
+        normalized
+            .chains
+            .iter()
+            .filter(|chain| chain.disabled)
+            .map(|chain| chain.name.clone()),
+    );
+    dormant.extend(
+        nodes
+            .iter()
+            .filter(|node| !node.enabled)
+            .map(|node| node.name().to_string()),
+    );
+    dormant.extend(
+        catalog::MODULES
+            .iter()
+            .filter(|module| {
+                !matches!(module.kind, ModuleKind::Region(_))
+                    && !active_modules.iter().any(|active| active.id == module.id)
+            })
+            .map(|module| normalized.resolved_group_name(module.name).to_string()),
+    );
+    // An authored group or node can use a currently inactive catalog label.
+    for name in normalized
+        .policy_groups
+        .iter()
+        .filter(|group| !group.builtin && !group.disabled && !group.removed)
+        .map(|group| group.name.as_str())
+        .chain(
+            normalized
+                .custom_groups
+                .iter()
+                .filter(|group| !group.disabled)
+                .map(|group| group.name.as_str()),
+        )
+        .chain(
+            normalized
+                .chains
+                .iter()
+                .filter(|chain| !chain.disabled)
+                .map(|chain| chain.name.as_str()),
+        )
+        .chain(nodes.iter().filter(|node| node.enabled).map(Node::name))
+    {
+        dormant.remove(name);
+    }
+    normalized
+        .policy_groups
+        .retain(|group| !group.disabled && !group.removed && !dormant.contains(&group.name));
+    normalized.custom_groups.retain(|group| !group.disabled);
+    normalized.chains.retain(|chain| !chain.disabled);
+    for group in &mut normalized.policy_groups {
+        for member in &mut group.members {
+            if dormant.contains(member) {
+                *member = "DIRECT".into();
+            }
+        }
+    }
+    normalized.custom_rule_sets.retain(|binding| {
+        !dormant.contains(&binding.target) && !normalized.disabled_rule_sets.contains(&binding.id)
+    });
+    for (id, target) in &normalized.rule_set_targets {
+        if dormant.contains(target) && !normalized.disabled_rule_sets.contains(id) {
+            normalized.disabled_rule_sets.push(id.clone());
+        }
+    }
+    normalized
+        .custom_rules
+        .retain(|rule| !dormant.contains(&rule.target));
+    for listener in &mut normalized.listeners {
+        if dormant.contains(&listener.proxy) {
+            listener.proxy = "DIRECT".into();
+        }
+    }
     let options = &normalized;
     let mut warnings = Vec::new();
     let mut nodes = enabled_nodes(nodes);
+    for node in &mut nodes {
+        if let Some(target) = node.proxy.get_str("dialer-proxy")
+            && let Some(name) = aliases.get(target)
+        {
+            node.proxy.set_dialer_proxy(name);
+        }
+        if node
+            .proxy
+            .get_str("dialer-proxy")
+            .is_some_and(|target| dormant.contains(target))
+        {
+            node.proxy.set_dialer_proxy("DIRECT");
+        }
+    }
     nodes.retain(|node| {
         if let Some(issue) = node.proxy.fatal_issue() {
             warnings.push(format!("已跳过节点「{}」：{issue}", node.name()));
@@ -188,10 +396,23 @@ pub fn generate_profile(nodes: &[Node], options: &GenerateOptions) -> Result<Gen
         return Err(Error::NoNodes);
     }
 
-    let modules = resolve_enabled_modules(options);
+    let modules = active_modules;
     let mut groups = build_groups(&nodes, &modules, options, &mut warnings);
     let builtin_names: HashSet<String> = groups.iter().map(|g| g.name.clone()).collect();
-    let final_group = groups.pop();
+    let mut output_names = HashSet::new();
+    for group in &mut groups {
+        group.name = options.resolved_group_name(&group.name).to_string();
+        if !output_names.insert(group.name.clone()) {
+            return Err(Error::InvalidConfig(format!(
+                "策略组名称重复：{}",
+                group.name
+            )));
+        }
+    }
+    let final_group = groups
+        .iter()
+        .position(|group| group.name == options.resolved_group_name(FINAL_GROUP))
+        .map(|index| groups.remove(index));
 
     let mut used_group_names: HashSet<String> =
         groups.iter().map(|group| group.name.clone()).collect();
@@ -206,7 +427,7 @@ pub fn generate_profile(nodes: &[Node], options: &GenerateOptions) -> Result<Gen
         options,
         &mut used_group_names,
         &mut warnings,
-    ));
+    )?);
     let (chain_proxies, chain_groups) = build_chains(
         &nodes,
         options,
@@ -224,9 +445,12 @@ pub fn generate_profile(nodes: &[Node], options: &GenerateOptions) -> Result<Gen
         if name.is_empty()
             || name.contains([',', '\n', '\r'])
             || name != spec.name
-            || (used_group_names.contains(name) && !spec.builtin)
+            || (!spec.builtin && (used_group_names.contains(name) || aliases.contains_key(name)))
             || (spec.builtin
-                && (!builtin_names.contains(name) || !overridden.insert(name.to_string())))
+                && (!spec
+                    .builtin_name()
+                    .is_some_and(|origin| builtin_names.contains(origin))
+                    || !overridden.insert(spec.builtin_name().unwrap().to_string())))
             || used_proxy_names.contains(name)
             || [
                 "DIRECT",
@@ -253,14 +477,25 @@ pub fn generate_profile(nodes: &[Node], options: &GenerateOptions) -> Result<Gen
         let mut members = spec.members.clone();
         if spec.include_all_nodes {
             members.extend(nodes.iter().map(|node| node.name().to_string()));
+            members.extend(options.chains.iter().map(|chain| chain.name.clone()));
         }
         let mut seen = HashSet::new();
         members.retain(|member| seen.insert(member.clone()));
         let mut group = ProxyGroup::new(name, spec.kind, members);
+        if spec.kind == GroupKind::UrlTest {
+            group.tolerance = spec.tolerance;
+        }
+        if spec.kind == GroupKind::LoadBalance {
+            let strategy = spec.strategy.as_deref().unwrap_or("consistent-hashing");
+            if !["consistent-hashing", "round-robin", "sticky-sessions"].contains(&strategy) {
+                return Err(Error::InvalidLink(format!("负载均衡策略无效：{name}")));
+            }
+            group.strategy = Some(strategy.into());
+        }
         if spec.kind != GroupKind::Select {
             let url = spec.test_url.as_deref().unwrap_or(&options.test_url);
             let interval = spec.test_interval.unwrap_or(options.test_interval);
-            if !(url.starts_with("https://") || url.starts_with("http://")) || interval == 0 {
+            if !valid_http_url(url) || interval == 0 {
                 return Err(Error::UnknownRuleTarget(format!(
                     "策略组「{name}」测速参数无效"
                 )));
@@ -278,16 +513,46 @@ pub fn generate_profile(nodes: &[Node], options: &GenerateOptions) -> Result<Gen
         }
     }
 
+    for group in &mut groups {
+        for member in &mut group.proxies {
+            resolve_alias(member);
+        }
+    }
+    let positions: HashMap<&str, usize> = options
+        .group_order
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.as_str(), index))
+        .collect();
+    groups.sort_by_key(|group| {
+        positions
+            .get(group.name.as_str())
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
     let group_names: HashSet<String> = groups.iter().map(|group| group.name.clone()).collect();
     let proxy_names = used_proxy_names;
 
-    let (rules, providers) = build_rules(&modules, options, &group_names, &mut warnings)?;
+    if let Some(name) = group_names.intersection(&proxy_names).next() {
+        return Err(Error::InvalidConfig(format!(
+            "节点与策略组名称重复：{name}，请修改节点或自定义组名称"
+        )));
+    }
+    let routing_targets: HashSet<_> = group_names.union(&proxy_names).cloned().collect();
+    let (rules, providers) = build_rules(&modules, options, &routing_targets, &mut warnings)?;
+    for group in &mut groups {
+        if group.kind == GroupKind::UrlTest && group.tolerance.is_none() {
+            group.tolerance = Some(options.test_tolerance);
+        }
+    }
     validate_group_references(&groups, &group_names, &proxy_names)?;
 
     let mut proxies: Vec<Value> = nodes.iter().map(|node| node.proxy.to_value()).collect();
     proxies.extend(chain_proxies.iter().map(Proxy::to_value));
     let mut root = build_root(proxies, &groups, &rules, &providers, options);
-    if options.mixed_port == 0 || options.dns.domestic.is_empty() || options.dns.foreign.is_empty()
+    if options.mixed_port == 0
+        || options.dns_override
+            && (options.dns.domestic.is_empty() || options.dns.foreign.is_empty())
     {
         return Err(Error::InvalidLink(
             "监听端口不能为零，DNS 列表不能为空".into(),
@@ -355,6 +620,13 @@ pub fn generate_profile(nodes: &[Node], options: &GenerateOptions) -> Result<Gen
         }
     }
 
+    validate_rule_definitions(
+        &rules,
+        root.get(Value::String("sub-rules".into())),
+        &routing_targets,
+        &providers.keys().cloned().collect(),
+    )?;
+
     let body = serde_yaml_ng::to_string(&Value::Mapping(root))?;
     use sha2::{Digest, Sha256};
     let digest = format!("{:x}", Sha256::digest(body.as_bytes()));
@@ -401,6 +673,18 @@ fn resolve_enabled_modules(options: &GenerateOptions) -> Vec<&'static Module> {
     for required in ["select", "auto", "final"] {
         ids.insert(required.to_string());
     }
+    for spec in options
+        .policy_groups
+        .iter()
+        .filter(|spec| spec.builtin && (spec.disabled || spec.removed))
+    {
+        if let Some(module) = catalog::MODULES
+            .iter()
+            .find(|module| spec.builtin_name() == Some(module.name))
+        {
+            ids.remove(module.id);
+        }
+    }
 
     catalog::MODULES
         .iter()
@@ -415,26 +699,50 @@ fn build_groups(
     _warnings: &mut Vec<String>,
 ) -> Vec<ProxyGroup> {
     let node_names: Vec<String> = nodes.iter().map(|node| node.name().to_string()).collect();
+    let active = |id: &str| modules.iter().any(|module| module.id == id);
+    let available_members = |members: Vec<String>| {
+        members
+            .into_iter()
+            .filter(|name| {
+                (name != SELECT_GROUP || active("select")) && (name != AUTO_GROUP || active("auto"))
+            })
+            .collect::<Vec<_>>()
+    };
 
     let mut groups = Vec::new();
-    groups.push(ProxyGroup::new(
-        SELECT_GROUP,
-        GroupKind::Select,
-        std::iter::once(AUTO_GROUP.to_string())
-            .chain(node_names.clone())
-            .chain(std::iter::once("DIRECT".to_string()))
-            .collect(),
-    ));
-    groups.push(
-        ProxyGroup::new(AUTO_GROUP, GroupKind::UrlTest, node_names.clone())
+    if active("select") {
+        groups.push(ProxyGroup::new(
+            SELECT_GROUP,
+            GroupKind::Select,
+            available_members(
+                std::iter::once(AUTO_GROUP.to_string())
+                    .chain(node_names.clone())
+                    .chain(options.chains.iter().map(|chain| chain.name.clone()))
+                    .chain(std::iter::once("DIRECT".to_string()))
+                    .collect(),
+            ),
+        ));
+    }
+    if active("auto") {
+        groups.push(
+            ProxyGroup::new(
+                AUTO_GROUP,
+                GroupKind::UrlTest,
+                node_names
+                    .clone()
+                    .into_iter()
+                    .chain(options.chains.iter().map(|chain| chain.name.clone()))
+                    .collect(),
+            )
             .with_health_check(&options.test_url, options.test_interval),
-    );
+        );
+    }
 
-    let service_members = vec![
+    let service_members = available_members(vec![
         SELECT_GROUP.to_string(),
         AUTO_GROUP.to_string(),
         "DIRECT".to_string(),
-    ];
+    ]);
 
     for module in modules {
         match module.kind {
@@ -446,30 +754,32 @@ fn build_groups(
             ModuleKind::DirectFirst => groups.push(ProxyGroup::new(
                 module.name,
                 GroupKind::Select,
-                vec!["DIRECT".to_string(), SELECT_GROUP.to_string()],
+                available_members(vec!["DIRECT".to_string(), SELECT_GROUP.to_string()]),
             )),
             ModuleKind::RejectFirst => groups.push(ProxyGroup::new(
                 module.name,
                 GroupKind::Select,
-                vec![
+                available_members(vec![
                     "REJECT".to_string(),
                     "DIRECT".to_string(),
                     SELECT_GROUP.to_string(),
-                ],
+                ]),
             )),
             _ => {}
         }
     }
 
-    groups.push(ProxyGroup::new(
-        FINAL_GROUP,
-        GroupKind::Select,
-        vec![
-            SELECT_GROUP.to_string(),
-            AUTO_GROUP.to_string(),
-            "DIRECT".to_string(),
-        ],
-    ));
+    if active("final") {
+        groups.push(ProxyGroup::new(
+            FINAL_GROUP,
+            GroupKind::Select,
+            available_members(vec![
+                SELECT_GROUP.to_string(),
+                AUTO_GROUP.to_string(),
+                "DIRECT".to_string(),
+            ]),
+        ));
+    }
 
     groups
 }
@@ -479,10 +789,11 @@ fn build_custom_groups(
     options: &GenerateOptions,
     used_group_names: &mut HashSet<String>,
     warnings: &mut Vec<String>,
-) -> Vec<ProxyGroup> {
+) -> Result<Vec<ProxyGroup>> {
     let mut groups = Vec::new();
 
     for spec in &options.custom_groups {
+        reserve_authored_group_name(&spec.name, used_group_names)?;
         let members: Vec<String> = nodes
             .iter()
             .filter(|node| spec.filter.matches(node))
@@ -497,15 +808,14 @@ fn build_custom_groups(
             GroupKind::UrlTest | GroupKind::Fallback | GroupKind::LoadBalance => spec.kind,
             _ => GroupKind::Select,
         };
-        let name = unique_group_name(&spec.name, used_group_names);
-        let mut group = ProxyGroup::new(name, kind, members);
+        let mut group = ProxyGroup::new(&spec.name, kind, members);
         if kind != GroupKind::Select {
             group = group.with_health_check(&options.test_url, options.test_interval);
         }
         groups.push(group);
     }
 
-    groups
+    Ok(groups)
 }
 
 fn build_chains(
@@ -518,6 +828,7 @@ fn build_chains(
     let mut groups = Vec::new();
 
     for chain in &options.chains {
+        reserve_authored_group_name(&chain.name, used_group_names)?;
         let selectors = if chain.hops.is_empty() {
             vec![chain.entry_node.clone(), chain.landing_node.clone()]
         } else {
@@ -564,9 +875,8 @@ fn build_chains(
             previous = name;
             proxies.push(proxy);
         }
-        let group_name = unique_group_name(&chain.name, used_group_names);
         groups.push(ProxyGroup::new(
-            group_name,
+            &chain.name,
             GroupKind::Select,
             vec![previous],
         ));
@@ -575,7 +885,7 @@ fn build_chains(
     Ok((proxies, groups))
 }
 
-fn unique_group_name(base: &str, used: &mut HashSet<String>) -> String {
+fn reserve_authored_group_name(base: &str, used: &mut HashSet<String>) -> Result<()> {
     const RESERVED: &[&str] = &[
         "DIRECT",
         "REJECT",
@@ -585,24 +895,20 @@ fn unique_group_name(base: &str, used: &mut HashSet<String>) -> String {
         "GLOBAL",
     ];
 
-    let base = base.trim();
-    let base = if base.is_empty() {
-        "自定义组"
-    } else {
-        base
-    };
-    let mut candidate = base.to_string();
-    let mut index = 2;
-    while used.contains(&candidate)
+    if base.is_empty()
+        || base.trim() != base
+        || base.contains([',', '\n', '\r'])
+        || used.contains(base)
         || RESERVED
             .iter()
-            .any(|reserved| reserved.eq_ignore_ascii_case(&candidate))
+            .any(|reserved| reserved.eq_ignore_ascii_case(base))
     {
-        candidate = format!("{base} {index}");
-        index += 1;
+        return Err(Error::InvalidConfig(format!(
+            "策略组名称无效或重复：{base}"
+        )));
     }
-    used.insert(candidate.clone());
-    candidate
+    used.insert(base.to_string());
+    Ok(())
 }
 
 fn unique_proxy_name(base: &str, used: &mut HashSet<String>) -> String {
@@ -627,6 +933,7 @@ struct ProviderSpec {
     behavior: catalog::RuleSetBehavior,
     format: &'static str,
     url: String,
+    payload: Option<Vec<String>>,
 }
 
 fn build_rules(
@@ -644,10 +951,23 @@ fn build_rules(
         .map(String::as_str)
         .collect();
 
-    let mut ordered: Vec<&Module> = modules
+    let active_ids: HashSet<_> = modules.iter().map(|module| module.id).collect();
+    let custom_ids: HashSet<_> = options
+        .custom_rule_sets
         .iter()
-        .filter(|module| !module.rule_sets.is_empty())
-        .copied()
+        .map(|binding| binding.id.as_str())
+        .collect();
+    let mut ordered: Vec<&Module> = catalog::MODULES
+        .iter()
+        .filter(|module| {
+            !module.rule_sets.is_empty()
+                && (active_ids.contains(module.id)
+                    || module.rule_sets.iter().any(|spec| {
+                        options.rule_set_targets.get(spec.id).is_some_and(|target| {
+                            target != module.name && group_names.contains(target)
+                        })
+                    }))
+        })
         .collect();
     let catalog_index = |module: &Module| {
         catalog::MODULES
@@ -659,8 +979,28 @@ fn build_rules(
 
     for module in ordered {
         for spec in module.rule_sets {
-            if disabled_rule_sets.contains(spec.id) {
+            if disabled_rule_sets.contains(spec.id)
+                || custom_ids.contains(spec.id)
+                || (!active_ids.contains(module.id)
+                    && !options.rule_set_targets.get(spec.id).is_some_and(|target| {
+                        target != module.name && group_names.contains(target)
+                    }))
+            {
                 continue;
+            }
+            if let Some(payload) = options.rule_set_overrides.get(spec.id) {
+                parse_rule_set_payload(&payload.join("\n"), spec.behavior.as_str()).map_err(
+                    |error| Error::InvalidConfig(format!("规则集「{}」：{error}", spec.id)),
+                )?;
+            } else if !valid_http_url(&format!(
+                "{}/{}",
+                options.rule_provider_base_url.trim_end_matches('/'),
+                spec.path
+            )) {
+                return Err(Error::InvalidConfig(format!(
+                    "规则集「{}」来源链接无效",
+                    spec.id
+                )));
             }
             providers
                 .entry(spec.id.to_string())
@@ -672,12 +1012,13 @@ fn build_rules(
                         options.rule_provider_base_url.trim_end_matches('/'),
                         spec.path
                     ),
+                    payload: options.rule_set_overrides.get(spec.id).cloned(),
                 });
             let target = options
                 .rule_set_targets
                 .get(spec.id)
                 .map(String::as_str)
-                .unwrap_or(module.name);
+                .unwrap_or_else(|| options.resolved_group_name(module.name));
             let rule = Rule::rule_set(
                 spec.id,
                 target,
@@ -692,7 +1033,31 @@ fn build_rules(
         }
     }
 
+    let mut binding_ids = HashSet::new();
     for binding in &options.custom_rule_sets {
+        if binding.id.trim().is_empty()
+            || binding.id != binding.id.trim()
+            || binding.id.contains([',', '/', '\\', '\n', '\r'])
+            || !binding_ids.insert(&binding.id)
+        {
+            return Err(Error::InvalidConfig(format!(
+                "规则集 ID 无效或重复：{}",
+                binding.id
+            )));
+        }
+        if let Some(payload) = options.rule_set_overrides.get(&binding.id) {
+            parse_rule_set_payload(&payload.join("\n"), &binding.behavior).map_err(|error| {
+                Error::InvalidConfig(format!(
+                    "规则集「{}」（{}）：{error}",
+                    binding.name, binding.id
+                ))
+            })?;
+        } else if !valid_http_url(&binding.url) {
+            return Err(Error::InvalidConfig(format!(
+                "规则集「{}」（{}）来源链接无效",
+                binding.name, binding.id
+            )));
+        }
         validate_rule_target(
             &Rule::rule_set(
                 binding.id.clone(),
@@ -704,12 +1069,24 @@ fn build_rules(
         let behavior = match binding.behavior.as_str() {
             "ipcidr" => catalog::RuleSetBehavior::IpCidr,
             "classical" => catalog::RuleSetBehavior::Classical,
-            _ => catalog::RuleSetBehavior::Domain,
+            "domain" => catalog::RuleSetBehavior::Domain,
+            _ => {
+                return Err(Error::InvalidConfig(format!(
+                    "规则集「{}」（{}）内容类型无效：{}",
+                    binding.name, binding.id, binding.behavior
+                )));
+            }
         };
         let format = match binding.format.as_str() {
             "yaml" => "yaml",
             "text" => "text",
-            _ => "mrs",
+            "mrs" => "mrs",
+            _ => {
+                return Err(Error::InvalidConfig(format!(
+                    "规则集「{}」（{}）文件格式无效：{}",
+                    binding.name, binding.id, binding.format
+                )));
+            }
         };
         if behavior == catalog::RuleSetBehavior::Classical && format == "mrs" {
             return Err(Error::InvalidLink(format!(
@@ -721,6 +1098,7 @@ fn build_rules(
             behavior,
             format,
             url: binding.url.clone(),
+            payload: options.rule_set_overrides.get(&binding.id).cloned(),
         });
         let rule = Rule::rule_set(
             binding.id.clone(),
@@ -729,7 +1107,7 @@ fn build_rules(
         );
         let priority = catalog::MODULES
             .iter()
-            .find(|m| m.name == binding.target)
+            .find(|m| options.resolved_group_name(m.name) == binding.target)
             .map(catalog::rule_priority)
             .unwrap_or(400);
         if priority >= 800 {
@@ -740,11 +1118,14 @@ fn build_rules(
     }
 
     let mut custom = Vec::with_capacity(options.custom_rules.len());
-    for rule in &options.custom_rules {
+    for (index, rule) in options.custom_rules.iter().enumerate() {
+        let line = rule.to_line();
+        Rule::parse(&line).map_err(|error| {
+            Error::InvalidConfig(format!("自定义规则第 {} 条「{line}」：{error}", index + 1))
+        })?;
         validate_rule_target(rule, group_names)?;
-        if rule.kind == "RULE-SET" {
-            let provider = rule.payload.as_deref().unwrap_or_default();
-            if !providers.contains_key(provider) {
+        for provider in rule.referenced_rule_sets() {
+            if !providers.contains_key(&provider) {
                 return Err(Error::UnknownRuleTarget(format!(
                     "rule-set '{provider}' is not registered"
                 )));
@@ -756,7 +1137,7 @@ fn build_rules(
     let priority = |rule: &Rule| {
         let rank = catalog::MODULES
             .iter()
-            .find(|m| m.name == rule.target)
+            .find(|m| options.resolved_group_name(m.name) == rule.target)
             .map(catalog::rule_priority)
             .unwrap_or(400);
         if rank == 800 && rule.no_resolve {
@@ -773,7 +1154,15 @@ fn build_rules(
     rules.extend(low_priority);
 
     if !rules.iter().any(|rule| rule.kind == "MATCH") {
-        rules.push(Rule::match_all(FINAL_GROUP));
+        let final_name = options.resolved_group_name(FINAL_GROUP);
+        let select_name = options.resolved_group_name(SELECT_GROUP);
+        rules.push(Rule::match_all(if group_names.contains(final_name) {
+            final_name
+        } else if group_names.contains(select_name) {
+            select_name
+        } else {
+            "DIRECT"
+        }));
     }
 
     let ranks: HashMap<&str, usize> = options
@@ -794,6 +1183,7 @@ fn build_rules(
                             old.kind == rule.kind
                                 && old.payload == rule.payload
                                 && old.no_resolve == rule.no_resolve
+                                && old.source_ip == rule.source_ip
                         })
                     })
                 })
@@ -802,13 +1192,13 @@ fn build_rules(
     }
 
     let mut seen = HashSet::new();
-    let mut matchers: HashMap<(String, Option<String>), String> = HashMap::new();
+    let mut matchers: HashMap<(String, Option<String>, bool), String> = HashMap::new();
     rules.retain(|rule| {
         if !seen.insert(rule.to_line()) {
             warnings.push(format!("重复规则已合并：{}", rule.to_line()));
             return false;
         }
-        let key = (rule.kind.clone(), rule.payload.clone());
+        let key = (rule.kind.clone(), rule.payload.clone(), rule.source_ip);
         if let Some(target) = matchers.get(&key) {
             if target != &rule.target {
                 warnings.push(format!(
@@ -823,20 +1213,25 @@ fn build_rules(
         }
         true
     });
-    if let Some(index) = rules.iter().position(|r| r.kind == "MATCH") {
-        if index + 1 < rules.len() {
-            warnings.push(format!(
-                "第 {} 条 MATCH 后有 {} 条规则无法命中，请调整最终顺序",
-                index + 1,
-                rules.len() - index - 1
-            ));
-        }
+    if let Some(index) = rules.iter().position(|r| r.kind == "MATCH")
+        && index + 1 < rules.len()
+    {
+        warnings.push(format!(
+            "第 {} 条 MATCH 后有 {} 条规则无法命中，请调整最终顺序",
+            index + 1,
+            rules.len() - index - 1
+        ));
     }
     Ok((rules, providers))
 }
 
 pub fn rule_identity(rule: &Rule) -> String {
     rule.to_line()
+}
+
+fn valid_http_url(value: &str) -> bool {
+    url::Url::parse(value)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
 }
 
 fn validate_rule_target(rule: &Rule, group_names: &HashSet<String>) -> Result<()> {
@@ -848,7 +1243,10 @@ fn validate_rule_target(rule: &Rule, group_names: &HashSet<String>) -> Result<()
         "COMPATIBLE",
         "GLOBAL",
     ];
-    if POLICIES.contains(&rule.target.as_str()) || group_names.contains(&rule.target) {
+    if rule.kind == "SUB-RULE"
+        || POLICIES.contains(&rule.target.as_str())
+        || group_names.contains(&rule.target)
+    {
         Ok(())
     } else {
         Err(Error::UnknownRuleTarget(rule.target.clone()))
@@ -944,6 +1342,11 @@ fn build_root(
     insert(&mut root, "profile", Value::Mapping(profile));
 
     insert(&mut root, "dns", dns::build_dns(&options.dns));
+    insert(
+        &mut root,
+        "hosts",
+        Value::Mapping(options.dns.hosts.clone()),
+    );
     insert(&mut root, "sniffer", sniffer());
 
     insert(&mut root, "geodata-mode", Value::Bool(true));
@@ -963,11 +1366,21 @@ fn build_root(
         let mut provider_map = Mapping::new();
         for (id, spec) in providers {
             let mut provider = Mapping::new();
-            insert(&mut provider, "type", string("http"));
             insert(&mut provider, "behavior", string(spec.behavior.as_str()));
-            insert(&mut provider, "format", string(spec.format));
-            insert(&mut provider, "url", string(&spec.url));
-            insert(&mut provider, "interval", number(86_400));
+            if let Some(payload) = &spec.payload {
+                insert(&mut provider, "type", string("inline"));
+                insert(&mut provider, "format", string("yaml"));
+                insert(
+                    &mut provider,
+                    "payload",
+                    Value::Sequence(payload.iter().map(|s| string(s)).collect()),
+                );
+            } else {
+                insert(&mut provider, "type", string("http"));
+                insert(&mut provider, "format", string(spec.format));
+                insert(&mut provider, "url", string(&spec.url));
+                insert(&mut provider, "interval", number(86_400));
+            }
             provider_map.insert(Value::String(id.clone()), Value::Mapping(provider));
         }
         insert(&mut root, "rule-providers", Value::Mapping(provider_map));

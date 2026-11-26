@@ -1,10 +1,17 @@
+mod generation;
+mod layout;
 mod lifecycle;
+mod ordering;
+pub(crate) use ordering::{WorkspaceNodeKind, chain_order_key};
 mod profiles;
+mod publication;
+mod refresh;
 mod saved_configs;
 mod saved_editor;
 pub use saved_editor::{SavedEditor, SavedEditorTab};
-mod sharing;
-use std::collections::{HashMap, HashSet};
+pub mod upgrades;
+pub mod workspace;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,8 +20,8 @@ use chrono::{Local, TimeZone};
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{
-    AppContext as _, ClipboardItem, Context, Entity, ScrollHandle, Window, WindowAppearance, point,
-    px,
+    AppContext as _, ClipboardItem, Context, Entity, Focusable, ScrollHandle, Window,
+    WindowAppearance, point, px,
 };
 use serde::{Deserialize, Serialize};
 use swiftsub_core::catalog::{self, Preset};
@@ -22,7 +29,7 @@ use swiftsub_core::generator::RuleSetBinding;
 use swiftsub_core::model::{
     ChainSpec, CustomGroupSpec, GroupKind, Node, NodeFilter, PolicyGroupSpec, Proxy, Rule,
 };
-use swiftsub_core::normalize::{apply_name_template, build_nodes, merge_manual_proxies_yaml};
+use swiftsub_core::normalize::{build_nodes, merge_manual_proxies_yaml};
 use swiftsub_core::parser::{looks_like_clash_yaml, parse_content};
 use swiftsub_core::region::{Region, detect_region};
 use swiftsub_core::{GenerateOptions, ProfileStats, generate_profile};
@@ -36,6 +43,10 @@ use swiftsub_store::{
 
 use crate::rule_catalog;
 
+fn default_test_tolerance() -> u32 {
+    50
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Subscriptions,
@@ -47,21 +58,15 @@ pub enum Page {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsTab {
-    Profiles,
-    Service,
     Generation,
-    Desktop,
+    RuleSources,
+    Templates,
     Data,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TemplateTab {
     PolicyGroups,
-    RuleSets,
-    CustomRules,
-    RuleOrder,
-    Changes,
-    Advanced,
     Tools,
 }
 
@@ -80,6 +85,10 @@ pub(crate) struct TemplateSnapshot {
     #[serde(default)]
     dns: swiftsub_core::generator::DnsOptions,
     #[serde(default)]
+    dns_override: bool,
+    #[serde(default)]
+    rule_set_overrides: HashMap<String, Vec<String>>,
+    #[serde(default)]
     listeners: Vec<swiftsub_core::generator::ListenerSpec>,
     #[serde(default)]
     extra_yaml: String,
@@ -88,6 +97,8 @@ pub(crate) struct TemplateSnapshot {
     #[serde(default)]
     policy_groups: Vec<PolicyGroupSpec>,
     #[serde(default)]
+    group_order: Vec<String>,
+    #[serde(default)]
     rule_set_targets: HashMap<String, String>,
     #[serde(default)]
     custom_groups: Vec<CustomGroupSpec>,
@@ -95,6 +106,8 @@ pub(crate) struct TemplateSnapshot {
     chains: Vec<ChainSpec>,
     test_url: String,
     test_interval: u32,
+    #[serde(default = "default_test_tolerance")]
+    test_tolerance: u32,
     mixed_port: u16,
     allow_lan: bool,
 }
@@ -110,13 +123,17 @@ impl TemplateSnapshot {
         options.custom_groups = self.custom_groups.clone();
         options.chains = self.chains.clone();
         options.policy_groups = self.policy_groups.clone();
+        options.group_order = self.group_order.clone();
         options.rule_order = self.rule_order.clone();
         options.dns = self.dns.clone();
+        options.dns_override = self.dns_override;
+        options.rule_set_overrides = self.rule_set_overrides.clone();
         options.listeners = self.listeners.clone();
         options.extra_yaml = self.extra_yaml.clone();
         options.rule_set_targets = self.rule_set_targets.clone();
         options.test_url = self.test_url.clone();
         options.test_interval = self.test_interval;
+        options.test_tolerance = self.test_tolerance;
         options.mixed_port = self.mixed_port;
         options.allow_lan = self.allow_lan;
         if !self.rule_provider_base_url.is_empty() {
@@ -152,6 +169,7 @@ struct AdvancedDraft {
     extra_yaml: String,
 }
 
+#[cfg(test)]
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TemplateFile {
@@ -161,6 +179,7 @@ pub(crate) struct TemplateFile {
     config: TemplateSnapshot,
 }
 
+#[cfg(test)]
 impl TemplateFile {
     fn decode(text: &str) -> Result<Self, String> {
         let file: Self = serde_json::from_str(text).map_err(|e| format!("模板文件无效：{e}"))?;
@@ -175,12 +194,6 @@ impl TemplateFile {
         }
         Ok(file)
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AddMode {
-    Subscription,
-    Node,
 }
 
 pub(crate) fn rule_set_binding_from_url(url: &str) -> Result<RuleSetBinding, String> {
@@ -254,8 +267,11 @@ pub(crate) fn parse_custom_rule_lines(text: &str) -> Result<Vec<Rule>, String> {
         }
         match Rule::parse(line) {
             Ok(rule) => rules.push(rule),
-            Err(_) => {
-                return Err(format!("第 {} 行规则格式无效：{line}", index + 1));
+            Err(error) => {
+                return Err(format!(
+                    "自定义规则第 {} 行格式无效：{line}。{error}",
+                    index + 1
+                ));
             }
         }
     }
@@ -293,7 +309,6 @@ pub(crate) fn template_summary_counts(config_json: &str) -> (usize, usize, usize
 pub enum CustomDialog {
     None,
     Filter,
-    Chain,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -303,10 +318,10 @@ pub enum ChainSide {
 }
 
 pub struct SwiftSubApp {
+    pub workspace: workspace::Workspace,
+    pub upgrades: upgrades::Upgrades,
     pub desktop: crate::desktop::DesktopIntegration,
     pub close_to_tray: bool,
-    pub autostart: bool,
-    pub qr_content: Option<(String, String)>,
     pub recovered_draft: bool,
     pub page: Page,
     pub light_theme: bool,
@@ -319,17 +334,12 @@ pub struct SwiftSubApp {
     pub parse_warnings: Vec<String>,
     pub import_report: Vec<swiftsub_core::parser::ImportReportItem>,
     pub source_import_report: Vec<(String, swiftsub_core::parser::ImportReportItem)>,
-    pub diagnostics_open: bool,
     pub generation_report: String,
     pub search: Entity<InputState>,
     pub add_open: bool,
-    pub add_mode: AddMode,
     pub add_name: Entity<InputState>,
-    pub add_url: Entity<InputState>,
+    pub add_url: Entity<TextareaState>,
     pub add_error: Option<String>,
-    pub batch_import_open: bool,
-    pub batch_import: Entity<TextareaState>,
-    pub batch_error: Option<String>,
     pub custom_dialog: CustomDialog,
     pub filter_name: Entity<InputState>,
     pub filter_include: Entity<InputState>,
@@ -352,10 +362,16 @@ pub struct SwiftSubApp {
     pub generated_config_name: Entity<InputState>,
     pub generated_save_open: bool,
     pub generated_save_update: bool,
+    pub generated_save_error: Option<String>,
+    pub clash_import_busy: bool,
     pub saved_config_yaml: Entity<TextareaState>,
     pub saved_config_error: Option<String>,
+    pub saved_file_baseline: Option<String>,
+    pub saved_external_change: bool,
+    pub saved_draft_corrupt: bool,
     pub saved_config_delete_armed: bool,
-    pub editing_saved_config: Option<String>,
+    pub generated_saved_config: Option<swiftsub_store::SavedConfig>,
+    generation_cache: generation::GenerationCache,
     pub template_name: Entity<InputState>,
     pub template_error: Option<String>,
     pub template_dialog_open: bool,
@@ -363,21 +379,13 @@ pub struct SwiftSubApp {
     pub template_session_active: bool,
     template_advanced_saved: String,
     template_baseline: Option<TemplateSnapshot>,
-    template_base_options: Option<GenerateOptions>,
-    pub batch_rename_open: bool,
-    pub rename_template: Entity<InputState>,
-    pub rename_error: Option<String>,
-    pub confirm_delete: Option<i64>,
-    pub edit_subscription: Option<i64>,
-    pub edit_data: Option<StoredSubscription>,
-    pub edit_nodes: Vec<(String, String, String)>,
-    pub edit_name: Entity<InputState>,
-    pub edit_url: Entity<InputState>,
-    pub edit_interval: Entity<InputState>,
-    pub edit_ua: Entity<InputState>,
-    pub edit_enabled: bool,
-    pub edit_error: Option<String>,
+    pub(crate) template_base_options: Option<GenerateOptions>,
     pub refreshing: HashSet<i64>,
+    refresh_queue: VecDeque<refresh::FetchJob>,
+    refresh_versions: HashMap<i64, u64>,
+    refresh_reload_pending: bool,
+    parsed_sources: generation::ParseCache,
+    publication: publication::PublicationWorker,
     pub failure_counts: HashMap<i64, u32>,
     pub retry_after: HashMap<i64, i64>,
     pub options: GenerateOptions,
@@ -391,6 +399,7 @@ pub struct SwiftSubApp {
     pub template_custom_rule_sets: Vec<RuleSetBinding>,
     pub template_enabled_modules: HashSet<String>,
     pub template_policy_groups: Vec<PolicyGroupSpec>,
+    pub template_group_order: Vec<String>,
     pub template_rule_set_targets: HashMap<String, String>,
     pub template_policy_name: Entity<InputState>,
     pub template_policy_rename: Entity<InputState>,
@@ -399,30 +408,29 @@ pub struct SwiftSubApp {
     pub template_member_search: Entity<InputState>,
     pub template_rule_order: Vec<String>,
     pub template_policy_edit: Option<usize>,
-    pub template_target_picker: Option<String>,
-    pub template_rules_selected_only: bool,
     pub template_rules_target_filter: String,
     pub template_rule_search: Entity<InputState>,
     pub template_rule_url: Entity<InputState>,
     pub template_custom_rules: Entity<TextareaState>,
     pub advanced_draft: Entity<TextareaState>,
     pub template_tab: TemplateTab,
-    pub template_rule_link_open: bool,
     pub settings_tab: SettingsTab,
     pub template_rule_sources_collapsed: HashSet<String>,
-    pub module_categories_collapsed: HashSet<String>,
     pub profiles: Vec<swiftsub_store::Profile>,
     pub profile_name_input: Entity<InputState>,
     pub profile_membership: Option<HashSet<i64>>,
-    pub profile_delete_armed: bool,
     pub profile_id: i64,
     pub profile_token: String,
     pub server: Option<LocalServer>,
+    pub server_bind_lan: bool,
+    pub server_lan_host: Option<String>,
     pub server_url: Option<String>,
     pub server_error: Option<String>,
+    pub update_repo: String,
+    pub update_checking: bool,
+    pub update_result: Option<swiftsub_fetch::ReleaseInfo>,
+    pub update_error: Option<String>,
     pub preview: String,
-    pub preview_open: bool,
-    pub nodes_panel_open: bool,
     pub node_rename_key: Option<String>,
     pub node_rename_sub_id: Option<i64>,
     pub node_rename_input: Entity<InputState>,
@@ -433,8 +441,8 @@ pub struct SwiftSubApp {
     pub toast: Option<String>,
     pub toast_epoch: u64,
     pub disabled_nodes: HashSet<String>,
+    pub deleted_nodes: HashSet<String>,
     pub preview_scroll: ScrollHandle,
-    pub settings_scroll: ScrollHandle,
     pub _subscriptions: Vec<gpui_kit::Subscription>,
 }
 
@@ -452,8 +460,37 @@ impl SwiftSubApp {
         let store = Arc::new(Mutex::new(store));
         let light_theme = {
             let guard = store.lock().expect("store mutex poisoned");
-            guard.get_setting("theme").ok().flatten().as_deref() == Some("light")
+            guard.get_setting("theme").ok().flatten().as_deref() != Some("dark")
         };
+        let (server_bind_lan, server_lan_host, update_repo) = {
+            let guard = store.lock().expect("store mutex poisoned");
+            let bind_lan = guard
+                .get_setting("server_bind_lan")
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some("true");
+            let lan_host = guard
+                .get_setting("server_lan_host")
+                .ok()
+                .flatten()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+            let repo = guard
+                .get_setting("update_repo")
+                .ok()
+                .flatten()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "youbilin/SwiftSub".to_string());
+            (bind_lan, lan_host, repo)
+        };
+        let deleted_nodes = store
+            .lock()
+            .ok()
+            .and_then(|store| store.get_setting("deleted_nodes").ok().flatten())
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default();
 
         let (profile_id, profile_token) = {
             let guard = store.lock().expect("store mutex poisoned");
@@ -496,18 +533,8 @@ impl SwiftSubApp {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索节点…"));
         let add_name = cx.new(|cx| InputState::new(window, cx).placeholder("订阅名称（可选）"));
         let add_url = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("https://... 或 ss:// / vmess:// / vless:// ...")
+            TextareaState::new(window, cx).placeholder("粘贴订阅地址或节点链接，支持多行")
         });
-        let batch_import = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .placeholder("每行一个节点链接，也可直接粘贴 Clash YAML 或 Base64 订阅内容")
-        });
-        let edit_name = cx.new(|cx| InputState::new(window, cx).placeholder("订阅名称"));
-        let edit_url = cx.new(|cx| InputState::new(window, cx).placeholder("订阅链接"));
-        let edit_interval =
-            cx.new(|cx| InputState::new(window, cx).placeholder("刷新间隔（分钟）"));
-        let edit_ua = cx.new(|cx| InputState::new(window, cx).placeholder("User-Agent（可选）"));
         let node_rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("节点名称"));
         let node_edit_textarea =
             cx.new(|cx| TextareaState::new(window, cx).placeholder("节点配置 YAML"));
@@ -533,8 +560,6 @@ impl SwiftSubApp {
                 "每行一条规则，例如 DOMAIN-SUFFIX,example.com,节点选择\nIP-CIDR,1.1.1.0/24,DIRECT,no-resolve",
             )
         });
-        let rename_template =
-            cx.new(|cx| InputState::new(window, cx).placeholder("{region} {index:02}"));
         let filter_name =
             cx.new(|cx| InputState::new(window, cx).placeholder("筛选组名称（可选）"));
         let filter_include =
@@ -549,7 +574,7 @@ impl SwiftSubApp {
         let rule_provider_input =
             cx.new(|cx| InputState::new(window, cx).default_value(rule_provider_base_url.clone()));
 
-        let enabled_modules: HashSet<String> = catalog::modules_for_preset(Preset::Standard)
+        let enabled_modules: HashSet<String> = catalog::modules_for_preset(Preset::Minimal)
             .into_iter()
             .map(|module| module.id.to_string())
             .collect();
@@ -617,7 +642,16 @@ impl SwiftSubApp {
             .and_then(|v| serde_json::from_str(&v).ok())
             .unwrap_or_default();
         let options = GenerateOptions {
+            preset: Preset::Minimal,
             rule_order,
+            group_order: store
+                .lock()
+                .expect("store mutex poisoned")
+                .get_setting("group_order")
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or_default(),
             policy_groups,
             rule_set_targets,
             rule_provider_base_url,
@@ -636,15 +670,17 @@ impl SwiftSubApp {
             cx.new(|cx| InputState::new(window, cx).placeholder("配置名称"));
         let saved_editor = SavedEditor::new(window, cx);
         let saved_config_name = cx.new(|cx| InputState::new(window, cx).placeholder("配置名称"));
-        let saved_config_yaml =
-            cx.new(|cx| TextareaState::new(window, cx).placeholder("选择或保存一份 YAML 配置"));
+        let saved_config_yaml = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .searchable(true)
+                .placeholder("选择或保存一份 YAML 配置")
+        });
         let mut app = Self {
+            upgrades: upgrades::Upgrades::new(window, cx),
             desktop: crate::desktop::DesktopIntegration::new(window),
             close_to_tray: false,
-            autostart: crate::desktop::autostart_enabled(),
-            qr_content: None,
             recovered_draft: false,
-            page: Page::Subscriptions,
+            page: Page::Generator,
             light_theme,
             store,
             store_error,
@@ -655,17 +691,12 @@ impl SwiftSubApp {
             parse_warnings: Vec::new(),
             import_report: Vec::new(),
             source_import_report: Vec::new(),
-            diagnostics_open: false,
             generation_report: String::new(),
             search,
             add_open: false,
-            add_mode: AddMode::Subscription,
             add_name,
             add_url,
             add_error: None,
-            batch_import_open: false,
-            batch_import,
-            batch_error: None,
             custom_dialog: CustomDialog::None,
             filter_name,
             filter_include,
@@ -688,10 +719,16 @@ impl SwiftSubApp {
             generated_config_name,
             generated_save_open: false,
             generated_save_update: false,
+            generated_save_error: None,
+            clash_import_busy: false,
             saved_config_yaml,
             saved_config_error: None,
+            saved_file_baseline: None,
+            saved_external_change: false,
+            saved_draft_corrupt: false,
             saved_config_delete_armed: false,
-            editing_saved_config: None,
+            generated_saved_config: None,
+            generation_cache: generation::GenerationCache::default(),
             template_name,
             template_error: None,
             template_dialog_open: false,
@@ -700,20 +737,12 @@ impl SwiftSubApp {
             template_advanced_saved: String::new(),
             template_baseline: None,
             template_base_options: None,
-            batch_rename_open: false,
-            rename_template,
-            rename_error: None,
-            confirm_delete: None,
-            edit_subscription: None,
-            edit_data: None,
-            edit_nodes: Vec::new(),
-            edit_name,
-            edit_url,
-            edit_interval,
-            edit_ua,
-            edit_enabled: true,
-            edit_error: None,
             refreshing: HashSet::new(),
+            refresh_queue: VecDeque::new(),
+            refresh_versions: HashMap::new(),
+            refresh_reload_pending: false,
+            parsed_sources: generation::ParseCache::default(),
+            publication: publication::PublicationWorker::default(),
             failure_counts: HashMap::new(),
             retry_after: HashMap::new(),
             options,
@@ -727,6 +756,7 @@ impl SwiftSubApp {
             template_custom_rule_sets: Vec::new(),
             template_enabled_modules: HashSet::new(),
             template_policy_groups: Vec::new(),
+            template_group_order: Vec::new(),
             template_rule_set_targets: HashMap::new(),
             template_policy_name,
             template_policy_rename,
@@ -735,37 +765,34 @@ impl SwiftSubApp {
             template_member_search,
             template_rule_order: Vec::new(),
             template_policy_edit: None,
-            template_target_picker: None,
-            template_rules_selected_only: false,
             template_rules_target_filter: String::new(),
             template_rule_search,
             template_rule_url,
             template_custom_rules,
             advanced_draft,
-            template_tab: TemplateTab::RuleSets,
-            template_rule_link_open: false,
-            settings_tab: SettingsTab::Service,
+            template_tab: TemplateTab::PolicyGroups,
+            workspace: workspace::Workspace::new(window, cx),
+            settings_tab: SettingsTab::Generation,
             template_rule_sources_collapsed: rule_catalog::SOURCES
                 .iter()
                 .map(|source| source.id.to_string())
                 .chain(std::iter::once("builtin".to_string()))
                 .collect(),
-            module_categories_collapsed: HashSet::from([
-                "region".to_string(),
-                "service".to_string(),
-            ]),
             profiles,
             profile_name_input,
             profile_membership: None,
-            profile_delete_armed: false,
             profile_id,
             profile_token,
             server: None,
+            server_bind_lan,
+            server_lan_host,
             server_url: None,
             server_error: None,
+            update_repo,
+            update_checking: false,
+            update_result: None,
+            update_error: None,
             preview: String::new(),
-            preview_open: false,
-            nodes_panel_open: true,
             node_rename_key: None,
             node_rename_sub_id: None,
             node_rename_input,
@@ -776,8 +803,8 @@ impl SwiftSubApp {
             toast: None,
             toast_epoch: 0,
             disabled_nodes: HashSet::new(),
+            deleted_nodes,
             preview_scroll: ScrollHandle::default(),
-            settings_scroll: ScrollHandle::default(),
             _subscriptions: Vec::new(),
         };
 
@@ -787,7 +814,7 @@ impl SwiftSubApp {
             ThemeMode::Dark
         };
         Theme::change(mode, None, cx);
-        crate::configure_theme(cx);
+        crate::configure_theme(cx, app.light_theme);
         crate::ui::set_light_theme(app.light_theme);
         cx.set_window_appearance(Some(if app.light_theme {
             WindowAppearance::Light
@@ -798,9 +825,10 @@ impl SwiftSubApp {
         let add_url_sub = cx.subscribe_in(
             &app.add_url,
             window,
-            |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.submit_add(window, cx);
+            |this, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.add_error = None;
+                    cx.notify();
                 }
             },
         );
@@ -825,10 +853,35 @@ impl SwiftSubApp {
             cx.observe_in(&app.generated_config_name, window, |_, _, _, cx| {
                 cx.notify()
             });
+        let generated_name_sub = cx.subscribe_in(
+            &app.generated_config_name,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if this.page == Page::Generator && this.generated_save_open {
+                    match event {
+                        InputEvent::PressEnter { .. } => {
+                            this.save_generated_config(this.generated_save_update, window, cx);
+                        }
+                        InputEvent::Change => {
+                            this.generated_save_error = None;
+                            cx.notify();
+                        }
+                        _ => {}
+                    }
+                }
+            },
+        );
         let saved_name_obs =
             cx.observe_in(&app.saved_config_name, window, |_, _, _, cx| cx.notify());
         let template_rule_search_obs =
             cx.observe_in(&app.template_rule_search, window, |_, _, _, cx| cx.notify());
+        let rule_content_obs = cx.observe_in(&app.workspace.rule_content, window, |_, _, _, cx| {
+            cx.notify()
+        });
+        let rule_content_search_obs =
+            cx.observe_in(&app.workspace.rule_content_search, window, |_, _, _, cx| {
+                cx.notify()
+            });
         let visual_inputs = [
             app.saved_editor.search.clone(),
             app.saved_editor.member_search.clone(),
@@ -851,10 +904,13 @@ impl SwiftSubApp {
             search_obs,
             chain_search_obs,
             template_rule_search_obs,
+            rule_content_obs,
+            rule_content_search_obs,
             member_search_obs,
             saved_yaml_obs,
             saved_name_obs,
             generated_name_obs,
+            generated_name_sub,
         ];
         app._subscriptions.extend(visual_observers);
 
@@ -881,6 +937,7 @@ impl SwiftSubApp {
             // Existing individual settings remain authoritative for legacy UI actions.
             app.options.test_url = snapshot.test_url;
             app.options.test_interval = snapshot.test_interval;
+            app.options.test_tolerance = snapshot.test_tolerance;
             app.options.mixed_port = snapshot.mixed_port;
             app.options.allow_lan = snapshot.allow_lan;
             app.options.dns = snapshot.dns;
@@ -890,7 +947,9 @@ impl SwiftSubApp {
         app.load_module_config();
         app.load_templates();
         app.reload_saved_configs();
+        app.load_profile_pull_history();
         app.restore_selected_profile(window, cx);
+        app.workspace_load_global_defaults();
         app.reload_subscriptions(cx);
         if demo_mode {
             if app.subscriptions.is_empty() {
@@ -911,7 +970,7 @@ impl SwiftSubApp {
         if let Some(dialog) = dialog_override {
             match dialog.as_str() {
                 "add" => {
-                    app.page = Page::Subscriptions;
+                    app.page = Page::Generator;
                     app.add_open = true;
                 }
                 "filter" => {
@@ -920,25 +979,8 @@ impl SwiftSubApp {
                 }
                 "chain" => {
                     app.page = Page::Generator;
-                    app.custom_dialog = CustomDialog::Chain;
-                }
-                "batch" => {
-                    app.page = Page::Subscriptions;
-                    app.batch_import_open = true;
-                }
-                "edit" => {
-                    app.page = Page::Subscriptions;
-                    if let Some(id) = app
-                        .subscriptions
-                        .first()
-                        .map(|subscription| subscription.id)
-                    {
-                        app.open_edit_subscription(id, window, cx);
-                    }
-                }
-                "rename" => {
-                    app.page = Page::Generator;
-                    app.batch_rename_open = true;
+                    app.open_template_dialog(window, cx);
+                    app.template_tab = TemplateTab::Tools;
                 }
                 "rules" => {
                     app.page = Page::Generator;
@@ -950,13 +992,17 @@ impl SwiftSubApp {
         app.recount_manual_nodes();
         app.start_server();
         app.start_scheduler(cx);
-        if app.page == Page::SavedConfigs && app.saved_config_id.is_none() {
-            if let Some(config) = app.saved_configs.first() {
-                app.open_saved_config(config.id.clone(), window, cx);
-            }
+        if app.page == Page::SavedConfigs
+            && app.saved_config_id.is_none()
+            && let Some(config) = app.saved_configs.first()
+        {
+            app.open_saved_config(config.id.clone(), window, cx);
         }
         app.start_desktop_lifecycle(window, cx);
         app.restore_draft(window, cx);
+        if app.page == Page::Generator {
+            app.open_template_dialog(window, cx);
+        }
         app
     }
 
@@ -992,55 +1038,6 @@ impl SwiftSubApp {
         }
     }
 
-    fn start_scheduler(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let mut first_tick = true;
-            loop {
-                let delay = if first_tick {
-                    Duration::from_secs(3)
-                } else {
-                    Duration::from_secs(60)
-                };
-                first_tick = false;
-                cx.background_executor().timer(delay).await;
-                let Some(this) = this.upgrade() else {
-                    break;
-                };
-                let due = this.update(cx, |this, _| this.due_subscription_ids());
-                for id in due {
-                    this.update(cx, |this, cx| this.refresh_subscription(id, cx));
-                }
-            }
-        })
-        .detach();
-    }
-
-    fn due_subscription_ids(&self) -> Vec<i64> {
-        let now = swiftsub_store::now_ts();
-        self.subscriptions
-            .iter()
-            .filter(|subscription| {
-                subscription.enabled
-                    && subscription.url.is_some()
-                    && !self.refreshing.contains(&subscription.id)
-            })
-            .filter(|subscription| {
-                if self
-                    .retry_after
-                    .get(&subscription.id)
-                    .is_some_and(|until| now < *until)
-                {
-                    return false;
-                }
-                subscription.last_ok_at.is_none_or(|last| {
-                    now.saturating_sub(last) >= i64::from(subscription.refresh_minutes.max(15)) * 60
-                })
-            })
-            .map(|subscription| subscription.id)
-            .take(2)
-            .collect()
-    }
-
     pub fn set_theme(&mut self, light: bool, cx: &mut Context<Self>) {
         if self.light_theme == light {
             return;
@@ -1059,7 +1056,7 @@ impl SwiftSubApp {
             None,
             cx,
         );
-        crate::configure_theme(cx);
+        crate::configure_theme(cx, light);
         crate::ui::set_light_theme(light);
         cx.set_window_appearance(Some(if light {
             WindowAppearance::Light
@@ -1069,7 +1066,20 @@ impl SwiftSubApp {
         cx.notify();
     }
 
+    pub fn set_close_to_tray(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.close_to_tray = enabled;
+        if let Ok(store) = self.store.lock() {
+            let _ = store.set_setting("close_to_tray", if enabled { "true" } else { "false" });
+        }
+        cx.notify();
+    }
+
     pub fn set_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(error) = self.workspace_checkpoint_rule_content(cx) {
+            self.workspace.rule_content_error = Some(error);
+            cx.notify();
+            return;
+        }
         if let Err(e) = self.autosave_saved_editor(window, cx) {
             self.saved_config_error = Some(e);
         }
@@ -1083,170 +1093,27 @@ impl SwiftSubApp {
         if page != self.page {
             match page {
                 Page::Generator => self.preview_scroll.set_offset(point(px(0.0), px(0.0))),
-                Page::Settings => self.settings_scroll.set_offset(point(px(0.0), px(0.0))),
+                Page::Settings => {
+                    self.workspace.settings_error_section = None;
+                }
                 Page::Subscriptions | Page::Templates | Page::SavedConfigs => {}
             }
         }
         self.page = page;
-        if page == Page::SavedConfigs && self.saved_config_id.is_none() {
-            if let Some(config) = self.saved_configs.first() {
-                self.open_saved_config(config.id.clone(), window, cx);
-            }
+        if page == Page::Generator && !self.workspace.saved_editor_open {
+            self.open_template_dialog(window, cx);
+        }
+        if page == Page::SavedConfigs {
+            self.workspace.saved_editor_open = false;
         }
         cx.notify();
     }
 
-    pub fn open_add_dialog(&mut self, cx: &mut Context<Self>) {
+    pub fn open_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.add_open = true;
         self.add_error = None;
+        self.add_url.read(cx).focus_handle(cx).focus(window, cx);
         cx.notify();
-    }
-
-    pub fn set_add_mode(&mut self, mode: AddMode, cx: &mut Context<Self>) {
-        self.add_mode = mode;
-        self.add_error = None;
-        cx.notify();
-    }
-
-    pub fn open_batch_rename(&mut self, cx: &mut Context<Self>) {
-        self.batch_rename_open = true;
-        self.rename_error = None;
-        cx.notify();
-    }
-
-    pub fn close_batch_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.batch_rename_open = false;
-        self.rename_error = None;
-        self.rename_template
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        cx.notify();
-    }
-
-    pub fn apply_batch_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let template = self.rename_template.read(cx).value().trim().to_string();
-        if template.is_empty() {
-            self.rename_error = Some("请输入命名模板".to_string());
-            cx.notify();
-            return;
-        }
-        if self.nodes.is_empty() {
-            self.rename_error = Some("没有可重命名的节点".to_string());
-            cx.notify();
-            return;
-        }
-
-        let old_names: Vec<String> = self
-            .nodes
-            .iter()
-            .map(|node| node.name().to_string())
-            .collect();
-        let mut renamed = self.nodes.clone();
-        apply_name_template(&mut renamed, &template);
-
-        let changes: Vec<(i64, String, String)> = renamed
-            .iter()
-            .zip(old_names.iter())
-            .filter(|(node, old_name)| node.name() != old_name.as_str())
-            .filter_map(|(node, _)| {
-                node.source_id
-                    .parse::<i64>()
-                    .ok()
-                    .map(|sub_id| (sub_id, node.source_key.clone(), node.name().to_string()))
-            })
-            .collect();
-
-        if changes.is_empty() {
-            self.rename_error = Some("名称没有变化".to_string());
-            cx.notify();
-            return;
-        }
-
-        let count = changes.len();
-        {
-            let store = self.store.lock().expect("store mutex poisoned");
-            for (sub_id, key, alias) in &changes {
-                let _ = store.set_node_override_alias(*sub_id, key, alias);
-            }
-        }
-        self.close_batch_rename(window, cx);
-        self.reload_subscriptions(cx);
-        self.show_toast(format!("已重命名 {count} 个节点"), cx);
-    }
-
-    pub fn open_batch_import(&mut self, cx: &mut Context<Self>) {
-        self.batch_import_open = true;
-        self.batch_error = None;
-        self.page = Page::Subscriptions;
-        cx.notify();
-    }
-
-    pub fn close_batch_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.batch_import_open = false;
-        self.batch_error = None;
-        self.batch_import
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        cx.notify();
-    }
-
-    pub fn paste_batch_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = cx
-            .read_from_clipboard()
-            .and_then(|item| item.text())
-            .filter(|text| !text.trim().is_empty())
-        else {
-            self.batch_error = Some("剪贴板为空或没有可读取的文本".to_string());
-            cx.notify();
-            return;
-        };
-        self.batch_import
-            .update(cx, |state, cx| state.set_value(text, window, cx));
-        self.batch_error = None;
-        cx.notify();
-    }
-
-    pub fn import_batch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let input = self.batch_import.read(cx).value().trim().to_string();
-        if input.is_empty() {
-            self.batch_error = Some("请粘贴节点链接或订阅内容".to_string());
-            cx.notify();
-            return;
-        }
-
-        let parsed = match parse_content(&input) {
-            Ok(parsed) if !parsed.proxies.is_empty() => {
-                self.import_report = parsed.report.clone();
-                parsed
-            }
-            Ok(parsed) => {
-                self.import_report = parsed.report;
-                self.batch_error = Some("没有识别到可用节点".to_string());
-                cx.notify();
-                return;
-            }
-            Err(error) => {
-                self.batch_error = Some(format!("内容解析失败：{error}"));
-                cx.notify();
-                return;
-            }
-        };
-
-        let imported = parsed.proxies.len();
-        match self.append_manual_proxies(parsed.proxies) {
-            Ok(total) => {
-                self.batch_import
-                    .update(cx, |state, cx| state.set_value("", window, cx));
-                self.batch_error = None;
-                self.reload_subscriptions(cx);
-                self.show_toast(
-                    format!("本次导入 {imported} 个节点，手动节点共 {total} 个"),
-                    cx,
-                );
-            }
-            Err(error) => {
-                self.batch_error = Some(error);
-                cx.notify();
-            }
-        }
     }
 
     fn append_manual_proxies(&mut self, proxies: Vec<Proxy>) -> Result<usize, String> {
@@ -1292,11 +1159,16 @@ impl SwiftSubApp {
         store
             .save_manual_payload(id, &payload, total)
             .map_err(|error| error.to_string())?;
+        if let Some(ids) = &mut self.profile_membership {
+            ids.insert(id);
+        }
         Ok(total)
     }
 
     pub fn open_custom_dialog(&mut self, dialog: CustomDialog, cx: &mut Context<Self>) {
         self.custom_dialog = dialog;
+        self.workspace.edit_filter = None;
+        self.workspace.edit_chain = None;
         self.custom_error = None;
         cx.notify();
     }
@@ -1319,6 +1191,14 @@ impl SwiftSubApp {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.chain_name
             .update(cx, |state, cx| state.set_value("", window, cx));
+        self.workspace
+            .filter_sources
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.workspace
+            .chain_hops
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.workspace.edit_filter = None;
+        self.workspace.edit_chain = None;
         cx.notify();
     }
 
@@ -1329,129 +1209,12 @@ impl SwiftSubApp {
         cx.notify();
     }
 
-    pub fn select_chain_node(
-        &mut self,
-        side: ChainSide,
-        key: String,
-        name: String,
-        cx: &mut Context<Self>,
-    ) {
-        match side {
-            ChainSide::Entry => {
-                if self.chain_entry_key.as_deref() == Some(key.as_str()) {
-                    self.chain_entry_key = None;
-                    self.chain_entry_name = None;
-                } else {
-                    self.chain_entry_key = Some(key);
-                    self.chain_entry_name = Some(name);
-                }
-            }
-            ChainSide::Landing => {
-                if self.chain_landing_key.as_deref() == Some(key.as_str()) {
-                    self.chain_landing_key = None;
-                    self.chain_landing_name = None;
-                } else {
-                    self.chain_landing_key = Some(key);
-                    self.chain_landing_name = Some(name);
-                }
-            }
-        }
-        cx.notify();
-    }
-
     pub fn add_filter_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut regions: Vec<Region> = self.filter_regions.iter().copied().collect();
-        regions.sort();
-        let include_keywords = split_keywords(&self.filter_include.read(cx).value());
-        let exclude_keywords = split_keywords(&self.filter_exclude.read(cx).value());
-
-        if regions.is_empty() && include_keywords.is_empty() && exclude_keywords.is_empty() {
-            self.custom_error = Some("请选择地区或填写关键词".to_string());
-            cx.notify();
-            return;
-        }
-
-        let typed_name = self.filter_name.read(cx).value().trim().to_string();
-        let name = if typed_name.is_empty() {
-            format!("筛选组 {}", self.custom_groups.len() + 1)
-        } else {
-            typed_name
-        };
-
-        self.custom_groups.push(CustomGroupSpec {
-            name,
-            kind: GroupKind::Select,
-            filter: NodeFilter {
-                regions,
-                sources: Vec::new(),
-                include_keywords,
-                exclude_keywords,
-            },
-        });
-        self.save_custom_config();
-        self.close_custom_dialog(window, cx);
-        self.regenerate(cx);
-        self.show_toast("已添加筛选代理组".to_string(), cx);
+        self.save_workspace_filter(window, cx);
     }
 
     pub fn add_chain(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(entry_key), Some(entry_name)) =
-            (self.chain_entry_key.clone(), self.chain_entry_name.clone())
-        else {
-            self.custom_error = Some("请选择中转节点".to_string());
-            cx.notify();
-            return;
-        };
-        let (Some(landing_key), Some(landing_name)) = (
-            self.chain_landing_key.clone(),
-            self.chain_landing_name.clone(),
-        ) else {
-            self.custom_error = Some("请选择落地节点".to_string());
-            cx.notify();
-            return;
-        };
-        if entry_key == landing_key {
-            self.custom_error = Some("中转和落地不能是同一个节点".to_string());
-            cx.notify();
-            return;
-        }
-
-        let typed_name = self.chain_name.read(cx).value().trim().to_string();
-        let name = if typed_name.is_empty() {
-            format!("链式代理 {}", self.chains.len() + 1)
-        } else {
-            typed_name
-        };
-
-        self.chains.push(ChainSpec::new(
-            name,
-            entry_key,
-            entry_name,
-            landing_key,
-            landing_name,
-        ));
-        self.save_custom_config();
-        self.close_custom_dialog(window, cx);
-        self.regenerate(cx);
-        self.show_toast("已添加链式代理".to_string(), cx);
-    }
-
-    pub fn delete_filter_group(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index < self.custom_groups.len() {
-            self.custom_groups.remove(index);
-            self.save_custom_config();
-            self.regenerate(cx);
-            self.show_toast("已删除筛选代理组".to_string(), cx);
-        }
-    }
-
-    pub fn delete_chain(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index < self.chains.len() {
-            self.chains.remove(index);
-            self.save_custom_config();
-            self.regenerate(cx);
-            self.show_toast("已删除链式代理".to_string(), cx);
-        }
+        self.save_workspace_chain(window, cx);
     }
 
     fn load_custom_config(&mut self) {
@@ -1465,19 +1228,6 @@ impl SwiftSubApp {
             && let Ok(items) = serde_json::from_str::<Vec<ChainSpec>>(&value)
         {
             self.chains = items;
-        }
-    }
-
-    fn save_custom_config(&self) {
-        if self.template_dialog_open {
-            return;
-        }
-        let store = self.store.lock().expect("store mutex poisoned");
-        if let Ok(value) = serde_json::to_string(&self.custom_groups) {
-            let _ = store.set_setting("custom_groups", &value);
-        }
-        if let Ok(value) = serde_json::to_string(&self.chains) {
-            let _ = store.set_setting("chains", &value);
         }
     }
 
@@ -1497,26 +1247,50 @@ impl SwiftSubApp {
         }
         let input = self.add_url.read(cx).value().trim().to_string();
         if input.is_empty() {
-            self.add_error = Some(match self.add_mode {
-                AddMode::Subscription => "请输入订阅链接".to_string(),
-                AddMode::Node => "请粘贴节点链接".to_string(),
-            });
+            self.add_error = Some("请粘贴订阅地址或节点链接".into());
             cx.notify();
             return;
         }
 
         let typed_name = self.add_name.read(cx).value().trim().to_string();
-        if self.add_mode == AddMode::Node || is_node_link(&input) {
+        if input.lines().count() > 1
+            || is_node_link(&input)
+            || looks_like_clash_yaml(&input)
+            || !(input.starts_with("http://") || input.starts_with("https://"))
+        {
             self.add_single_node(input, typed_name, window, cx);
             return;
         }
 
-        if !(input.starts_with("http://") || input.starts_with("https://")) {
+        if url::Url::parse(&input).is_err() {
             self.add_error = Some("请输入有效的 HTTP/HTTPS 订阅链接".to_string());
             cx.notify();
             return;
         }
         let url = input;
+
+        if let Some(existing) = self
+            .subscriptions
+            .iter()
+            .find(|sub| sub.url.as_deref() == Some(&url))
+            .cloned()
+        {
+            if let Some(ids) = &mut self.profile_membership {
+                ids.insert(existing.id);
+            }
+            self.close_add_dialog(window, cx);
+            self.reload_subscriptions(cx);
+            self.fetch_in_background(
+                existing.id,
+                url,
+                existing.name,
+                CacheValidators::default(),
+                FetchOptions::default(),
+                cx,
+            );
+            self.show_toast("订阅已存在，正在刷新原订阅".into(), cx);
+            return;
+        }
 
         let name = if typed_name.is_empty() {
             default_subscription_name(&url)
@@ -1531,6 +1305,9 @@ impl SwiftSubApp {
 
         match result {
             Ok(id) => {
+                if let Some(ids) = &mut self.profile_membership {
+                    ids.insert(id);
+                }
                 self.add_open = false;
                 self.add_error = None;
                 self.add_name
@@ -1557,11 +1334,11 @@ impl SwiftSubApp {
     fn add_single_node(
         &mut self,
         input: String,
-        _typed_name: String,
+        typed_name: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let parsed = match parse_content(&input) {
+        let mut parsed = match parse_content(&input) {
             Ok(parsed) if !parsed.proxies.is_empty() => {
                 self.import_report = parsed.report.clone();
                 parsed
@@ -1578,13 +1355,58 @@ impl SwiftSubApp {
             }
         };
 
+        let errors: Vec<_> = parsed
+            .report
+            .iter()
+            .filter(|item| item.status == swiftsub_core::parser::ImportStatus::Rejected)
+            .map(|item| format!("第 {} 行：{}", item.index, item.messages.join("；")))
+            .collect();
+        if !errors.is_empty() {
+            self.add_error = Some(format!(
+                "识别到 {} 个有效节点，请修正以下内容后添加：\n{}",
+                parsed.proxies.len(),
+                errors.join("\n")
+            ));
+            cx.notify();
+            return;
+        }
+        if parsed.proxies.len() == 1 && !typed_name.is_empty() {
+            parsed.proxies[0].set_name(typed_name);
+        }
         let imported = parsed.proxies.len();
+        let previous_count = self
+            .subscriptions
+            .iter()
+            .find(|sub| sub.name == "手动节点" && sub.url.is_none())
+            .map(|sub| sub.node_count)
+            .unwrap_or(0);
+        let previous_keys: HashSet<_> = self
+            .nodes
+            .iter()
+            .map(|node| node.source_key.clone())
+            .collect();
         match self.append_manual_proxies(parsed.proxies) {
             Ok(total) => {
                 self.close_add_dialog(window, cx);
                 self.reload_subscriptions(cx);
+                self.workspace.node_source.clear();
+                self.search
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                if let Some(index) = self
+                    .nodes
+                    .iter()
+                    .position(|node| !previous_keys.contains(&node.source_key))
+                {
+                    self.workspace
+                        .node_scroll
+                        .scroll_to_item_strict(index, gpui_kit::ScrollStrategy::Top);
+                }
                 self.show_toast(
-                    format!("本次导入 {imported} 个节点，手动节点共 {total} 个"),
+                    format!(
+                        "新增 {} 个节点，{} 个已存在或重复，手动节点共 {total} 个",
+                        total.saturating_sub(previous_count),
+                        imported.saturating_sub(total.saturating_sub(previous_count))
+                    ),
                     cx,
                 );
             }
@@ -1592,6 +1414,15 @@ impl SwiftSubApp {
                 self.add_error = Some(format!("保存节点失败：{error}"));
                 cx.notify();
             }
+        }
+    }
+
+    pub fn paste_add_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.add_url
+                .update(cx, |input, cx| input.set_value(text, window, cx));
+            self.add_error = None;
+            cx.notify();
         }
     }
 
@@ -1628,79 +1459,6 @@ impl SwiftSubApp {
                 self.page = Page::Generator;
             }
             Err(error) => self.show_toast(format!("添加示例失败：{error}"), cx),
-        }
-    }
-
-    pub fn import_from_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = cx
-            .read_from_clipboard()
-            .and_then(|item| item.text())
-            .map(|text| text.trim().to_string())
-        else {
-            self.add_error = Some("剪贴板为空或没有可读取的文本".to_string());
-            cx.notify();
-            return;
-        };
-        if text.is_empty() {
-            self.add_error = Some("剪贴板内容为空".to_string());
-            cx.notify();
-            return;
-        }
-
-        if text.starts_with("http://") || text.starts_with("https://") {
-            let name = default_subscription_name(&text);
-            let result = {
-                let store = self.store.lock().expect("store mutex poisoned");
-                store.add_subscription(&NewSubscription::url(name.clone(), text.clone()))
-            };
-            match result {
-                Ok(id) => {
-                    self.close_add_dialog(window, cx);
-                    self.reload_subscriptions(cx);
-                    self.fetch_in_background(
-                        id,
-                        text,
-                        name,
-                        CacheValidators::default(),
-                        FetchOptions::default(),
-                        cx,
-                    );
-                }
-                Err(error) => {
-                    self.add_error = Some(format!("保存订阅失败：{error}"));
-                    cx.notify();
-                }
-            }
-            return;
-        }
-
-        match parse_content(&text) {
-            Ok(parsed) if !parsed.proxies.is_empty() => {
-                self.import_report = parsed.report.clone();
-                let imported = parsed.proxies.len();
-                match self.append_manual_proxies(parsed.proxies) {
-                    Ok(total) => {
-                        self.close_add_dialog(window, cx);
-                        self.reload_subscriptions(cx);
-                        self.show_toast(
-                            format!("本次导入 {imported} 个节点，手动节点共 {total} 个"),
-                            cx,
-                        );
-                    }
-                    Err(error) => {
-                        self.add_error = Some(format!("保存节点失败：{error}"));
-                        cx.notify();
-                    }
-                }
-            }
-            Ok(_) => {
-                self.add_error = Some("剪贴板中没有可用节点".to_string());
-                cx.notify();
-            }
-            Err(error) => {
-                self.add_error = Some(format!("无法识别剪贴板内容：{error}"));
-                cx.notify();
-            }
         }
     }
 
@@ -1766,51 +1524,6 @@ impl SwiftSubApp {
         }
     }
 
-    pub fn export_diagnostics(&mut self, cx: &mut Context<Self>) {
-        let report = serde_json::json!({"format":"swiftsub-diagnostics","version":1,
-            "last_import":self.import_report,"subscriptions":self.source_import_report,
-            "generation":serde_json::from_str::<serde_json::Value>(&self.generation_report).ok(),
-            "warnings":self.gen_warnings});
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("诊断 JSON", &["json"])
-            .set_file_name("swiftsub-report.json")
-            .save_file()
-        else {
-            return;
-        };
-        let result = serde_json::to_string_pretty(&report)
-            .map_err(|e| e.to_string())
-            .and_then(|text| std::fs::write(path, text).map_err(|e| e.to_string()));
-        match result {
-            Ok(()) => self.show_toast("诊断报告已导出".into(), cx),
-            Err(e) => self.show_toast(format!("导出失败：{e}"), cx),
-        }
-    }
-
-    pub fn export_preview(&mut self, cx: &mut Context<Self>) {
-        if self.preview.is_empty() {
-            self.show_toast("暂无可导出的配置".to_string(), cx);
-            return;
-        }
-        let Some(path) = rfd::FileDialog::new()
-            .set_file_name("swiftsub.yaml")
-            .add_filter("Mihomo YAML", &["yaml", "yml"])
-            .save_file()
-        else {
-            return;
-        };
-        match std::fs::write(&path, &self.preview) {
-            Ok(()) => {
-                let name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("swiftsub.yaml");
-                self.show_toast(format!("已导出到 {name}"), cx);
-            }
-            Err(error) => self.show_toast(format!("导出失败：{error}"), cx),
-        }
-    }
-
     pub fn reload_subscriptions(&mut self, cx: &mut Context<Self>) {
         let result = {
             let store = self.store.lock().expect("store mutex poisoned");
@@ -1820,159 +1533,8 @@ impl SwiftSubApp {
             Ok(subscriptions) => self.subscriptions = subscriptions,
             Err(error) => self.store_error = Some(error.to_string()),
         }
+        self.parsed_sources.retain(&self.subscriptions);
         self.rebuild_nodes(cx);
-    }
-
-    fn rebuild_nodes(&mut self, cx: &mut Context<Self>) {
-        let mut reports = Vec::new();
-        let mut all_nodes = Vec::new();
-        let mut seen = HashSet::new();
-        let mut warnings = Vec::new();
-        let subscriptions = self.subscriptions.clone();
-
-        {
-            let store = self.store.lock().expect("store mutex poisoned");
-            for subscription in subscriptions.iter().filter(|subscription| {
-                subscription.enabled && self.profile_includes(subscription.id)
-            }) {
-                let Some(payload) = subscription.payload.as_deref() else {
-                    continue;
-                };
-                match parse_content(payload) {
-                    Ok(parsed) => {
-                        reports.extend(
-                            parsed
-                                .report
-                                .iter()
-                                .cloned()
-                                .map(|item| (subscription.name.clone(), item)),
-                        );
-                        for warning in parsed.warnings {
-                            warnings.push(format!("{} · {}", subscription.name, warning.message));
-                        }
-                        let mut nodes = build_nodes(
-                            parsed.proxies,
-                            subscription.id.to_string(),
-                            subscription.name.clone(),
-                        );
-                        let overrides = store
-                            .list_node_overrides(subscription.id)
-                            .unwrap_or_default();
-                        for node in &mut nodes {
-                            let source_key = node.source_key.clone();
-                            if let Some(value) = overrides.get(&source_key) {
-                                if let Some(extras) = &value.extras
-                                    && let Ok(edited) = Proxy::from_yaml_text(extras)
-                                {
-                                    node.proxy = edited;
-                                }
-                                if let Some(alias) = &value.alias {
-                                    node.set_name(alias.clone());
-                                }
-                                if let Some(enabled) = value.enabled {
-                                    node.enabled = enabled;
-                                }
-                                node.listen_port = value.listen_port;
-                            }
-                            if self.disabled_nodes.contains(&source_key) {
-                                node.enabled = false;
-                            }
-                            node.region = detect_region(node.name());
-                            if seen.insert(node.proxy.identity_key()) {
-                                all_nodes.push(node.clone());
-                            }
-                        }
-                    }
-                    Err(error) => warnings.push(format!("{}：{error}", subscription.name)),
-                }
-            }
-        }
-
-        if !self.node_order.is_empty() {
-            let positions: HashMap<&str, usize> = self
-                .node_order
-                .iter()
-                .enumerate()
-                .map(|(index, key)| (key.as_str(), index))
-                .collect();
-            all_nodes.sort_by_key(|node| {
-                positions
-                    .get(node.source_key.as_str())
-                    .copied()
-                    .unwrap_or(usize::MAX)
-            });
-        }
-
-        self.nodes = all_nodes;
-        self.source_import_report = reports;
-        self.parse_warnings = warnings;
-        self.regenerate(cx);
-    }
-
-    pub fn regenerate(&mut self, cx: &mut Context<Self>) {
-        if let Err(error) = self.save_active_profile() {
-            self.store_error = Some(format!("配置保存失败：{error}"));
-        }
-        if self.nodes.is_empty() {
-            self.preview.clear();
-            let _ = self
-                .store
-                .lock()
-                .expect("store mutex poisoned")
-                .save_profile_yaml(self.profile_id, "");
-            self.stats = ProfileStats::default();
-            self.gen_warnings = self.parse_warnings.clone();
-            self.publish_profiles();
-            cx.notify();
-            return;
-        }
-
-        let mut options = self.options.clone();
-        options.enabled_modules = Some(self.enabled_modules.iter().cloned().collect());
-        options.disabled_rule_sets = self.disabled_rule_sets.iter().cloned().collect();
-        options.custom_rule_sets = self.normalize_rule_set_bindings(&self.custom_rule_sets);
-        options.custom_groups = self
-            .template_baseline
-            .as_ref()
-            .map(|b| b.custom_groups.clone())
-            .unwrap_or_else(|| self.custom_groups.clone());
-        options.chains = self
-            .template_baseline
-            .as_ref()
-            .map(|b| b.chains.clone())
-            .unwrap_or_else(|| self.chains.clone());
-
-        let preview_was_empty = self.preview.is_empty();
-        match generate_profile(&self.nodes, &options) {
-            Ok(profile) => {
-                self.generation_report =
-                    serde_json::to_string_pretty(&profile.trace).unwrap_or_default();
-                self.preview = profile.yaml;
-                if preview_was_empty {
-                    self.preview_scroll.set_offset(point(px(0.0), px(0.0)));
-                }
-                self.stats = profile.stats;
-                self.gen_warnings = profile.warnings;
-
-                if self.profile_id > 0 {
-                    let store = self.store.lock().expect("store mutex poisoned");
-                    let _ = store.save_profile_yaml(self.profile_id, &self.preview);
-                }
-                self.publish_profiles();
-            }
-            Err(error) => {
-                self.preview.clear();
-                self.stats = ProfileStats::default();
-                let _ = self
-                    .store
-                    .lock()
-                    .expect("store mutex poisoned")
-                    .save_profile_yaml(self.profile_id, "");
-                self.publish_profiles();
-                self.gen_warnings = vec![format!("生成失败：{error}")];
-            }
-        }
-        cx.notify();
     }
 
     fn start_server(&mut self) {
@@ -1988,7 +1550,8 @@ impl SwiftSubApp {
         if let Some(port) = preferred_port.filter(|port| *port > 0) {
             candidates.push(port);
         }
-        for port in 7899..=7905 {
+        // Always include fallback ports outside Clash's 7890-7899 range, plus OS-assigned port 0.
+        for port in (17899..=17920).chain(7899..=7910).chain(std::iter::once(0)) {
             if !candidates.contains(&port) {
                 candidates.push(port);
             }
@@ -1999,7 +1562,7 @@ impl SwiftSubApp {
             let config = ServerConfig {
                 port,
                 token: self.profile_token.clone(),
-                bind_lan: false,
+                bind_lan: self.server_bind_lan,
                 update_interval_hours: 24,
             };
             let snapshot = ProfileSnapshot {
@@ -2009,9 +1572,10 @@ impl SwiftSubApp {
             };
             match LocalServer::start(config, snapshot) {
                 Ok(server) => {
+                    let bound_port = server.local_addr().port();
                     {
                         let store = self.store.lock().expect("store mutex poisoned");
-                        let _ = store.set_setting("server_port", &port.to_string());
+                        let _ = store.set_setting("server_port", &bound_port.to_string());
                     }
                     self.server_url =
                         Some(server.profile_url(&self.profile_token, &self.subscription_filename));
@@ -2026,352 +1590,140 @@ impl SwiftSubApp {
         self.server_error = last_error.map(|error| error.to_string());
     }
 
-    pub fn refresh_subscription(&mut self, id: i64, cx: &mut Context<Self>) {
-        if self.refreshing.contains(&id) {
+    pub fn set_server_bind_lan(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.server_bind_lan == enabled && self.server.is_some() {
             return;
         }
-        let Some(subscription) = self
-            .subscriptions
-            .iter()
-            .find(|subscription| subscription.id == id)
-            .cloned()
-        else {
+        let previous = self.server_bind_lan;
+        self.server_bind_lan = enabled;
+        if let Some(mut server) = self.server.take() {
+            server.stop();
+        }
+        self.start_server();
+        if self.server.is_none() && enabled {
+            let err = self
+                .server_error
+                .clone()
+                .unwrap_or_else(|| "端口绑定失败".into());
+            self.server_bind_lan = previous;
+            self.start_server();
+            self.show_toast(format!("开启局域网导入失败：{err}"), cx);
+            cx.notify();
             return;
+        }
+        {
+            let store = self.store.lock().expect("store mutex poisoned");
+            let _ = store.set_setting(
+                "server_bind_lan",
+                if self.server_bind_lan {
+                    "true"
+                } else {
+                    "false"
+                },
+            );
+        }
+        let message = if let Some(error) = &self.server_error {
+            format!("重启本地订阅服务失败：{error}")
+        } else if self.server_bind_lan {
+            let port = self
+                .server
+                .as_ref()
+                .map(|server| server.local_addr().port())
+                .unwrap_or(17899);
+            if let Some(ip) = self.active_lan_host() {
+                format!("已开启局域网导入（{ip}:{port}）")
+            } else {
+                format!("已开启局域网监听（0.0.0.0:{port}），暂未检测到局域网 IP")
+            }
+        } else {
+            "已关闭局域网导入（仅本机 127.0.0.1 可用）".into()
         };
-        let Some(url) = subscription.url.clone() else {
-            self.show_toast("该订阅没有远程地址，无需刷新".to_string(), cx);
-            return;
-        };
-        let cache = CacheValidators {
-            etag: subscription.etag.clone(),
-            last_modified: subscription.last_modified.clone(),
-        };
-        let mut options = FetchOptions::default();
-        if let Some(user_agent) = subscription.user_agent {
-            options.user_agent = user_agent;
-        }
-        self.fetch_in_background(id, url, subscription.name, cache, options, cx);
-    }
-
-    pub fn refresh_all(&mut self, cx: &mut Context<Self>) {
-        let ids: Vec<i64> = self
-            .subscriptions
-            .iter()
-            .filter(|subscription| subscription.enabled && subscription.url.is_some())
-            .map(|subscription| subscription.id)
-            .collect();
-        if ids.is_empty() {
-            self.show_toast("没有可刷新的远程订阅".to_string(), cx);
-            return;
-        }
-        for id in ids {
-            self.refresh_subscription(id, cx);
-        }
-    }
-
-    fn fetch_in_background(
-        &mut self,
-        id: i64,
-        url: String,
-        name: String,
-        cache: CacheValidators,
-        options: FetchOptions,
-        cx: &mut Context<Self>,
-    ) {
-        self.refreshing.insert(id);
+        self.show_toast(message, cx);
         cx.notify();
+    }
 
-        let store = Arc::clone(&self.store);
-        cx.spawn(async move |this, cx| {
-            let (outcome, node_count) = cx
+    pub fn check_for_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.update_checking {
+            return;
+        }
+        self.update_checking = true;
+        self.update_error = None;
+        let repo = self.update_repo.clone();
+        let current = env!("CARGO_PKG_VERSION").to_string();
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let outcome =
-                        fetch_subscription(&url, &options, &cache).map_err(|e| e.to_string());
-                    let (outcome, node_count) = match outcome {
-                        Ok(FetchOutcome::Fetched(result)) => match parse_content(&result.content) {
-                            Ok(parsed)
-                                if parsed.proxies.iter().any(|p| p.fatal_issue().is_none()) =>
-                            {
-                                let count = parsed.proxies.len();
-                                (Ok(FetchOutcome::Fetched(result)), count)
-                            }
-                            Ok(_) => (Err("订阅没有可用节点，保留上次成功内容".to_string()), 0),
-                            Err(e) => (Err(format!("订阅解析失败，保留上次成功内容：{e}")), 0),
-                        },
-                        other => (other, 0),
-                    };
-                    (outcome, node_count)
+                    swiftsub_fetch::check_github_release(&repo, &current, &FetchOptions::default())
                 })
                 .await;
-
-            let Some(this) = this.upgrade() else {
-                return;
-            };
-            this.update(cx, |this, cx| {
-                this.refreshing.remove(&id);
-                match outcome {
-                    Ok(FetchOutcome::Fetched(result)) => {
-                        let info = result.info.clone().unwrap_or_default();
-                        let traffic = TrafficSnapshot {
-                            upload: info.upload,
-                            download: info.download,
-                            total: info.total,
-                            expire_at: info.expire,
-                        };
-                        {
-                            let store = store.lock().expect("store mutex poisoned");
-                            if let Err(error) = store.save_fetch_success(
-                                id,
-                                &result.content,
-                                result.etag.as_deref(),
-                                result.last_modified.as_deref(),
-                                &traffic,
-                                node_count,
-                            ) {
-                                this.show_toast(format!("订阅保存失败，保留上次内容：{error}"), cx);
-                                return;
-                            }
-                            if let Some(hours) = result.update_interval_hours {
-                                let minutes = hours.saturating_mul(60).clamp(15, 10_080);
-                                let _ = store.set_subscription_refresh_minutes(id, minutes);
-                            }
-                            let _ = store.log_refresh(Some(id), true, None);
+            let _ = cx.update(|_, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    this.update_checking = false;
+                    match result {
+                        Ok(info) => {
+                            let msg = if info.has_update {
+                                format!("发现新版本 v{}", info.version)
+                            } else {
+                                format!("当前已是最新版本（v{}）", env!("CARGO_PKG_VERSION"))
+                            };
+                            this.update_result = Some(info);
+                            this.update_error = None;
+                            this.show_toast(msg, cx);
                         }
-                        this.failure_counts.remove(&id);
-                        this.retry_after.remove(&id);
-                        this.show_toast(format!("{name} 已更新，共 {node_count} 个节点"), cx);
-                    }
-                    Ok(FetchOutcome::NotModified { info, .. }) => {
-                        let traffic = info.map(|info| TrafficSnapshot {
-                            upload: info.upload,
-                            download: info.download,
-                            total: info.total,
-                            expire_at: info.expire,
-                        });
-                        {
-                            let store = store.lock().expect("store mutex poisoned");
-                            let _ = store.save_fetch_not_modified(id, traffic.as_ref());
-                            let _ = store.log_refresh(Some(id), true, Some("not modified"));
+                        Err(error) => {
+                            this.update_error = Some(error.clone());
+                            this.show_toast(format!("检查更新失败：{error}"), cx);
                         }
-                        this.failure_counts.remove(&id);
-                        this.retry_after.remove(&id);
-                        this.show_toast(format!("{name} 已是最新版本"), cx);
                     }
-                    Err(error) => {
-                        let message = error.to_string();
-                        {
-                            let store = store.lock().expect("store mutex poisoned");
-                            let _ = store.save_fetch_error(id, &message);
-                            let _ = store.log_refresh(Some(id), false, Some(&message));
-                        }
-                        let failures = this.failure_counts.entry(id).or_insert(0);
-                        *failures = failures.saturating_add(1);
-                        let delay_seconds = 3600_i64
-                            .saturating_mul(1_i64 << (*failures - 1).min(5))
-                            .min(86_400);
-                        this.retry_after
-                            .insert(id, swiftsub_store::now_ts() + delay_seconds);
-                        this.show_toast(format!("{name} 更新失败：{message}"), cx);
-                    }
-                }
-                this.reload_subscriptions(cx);
+                    cx.notify();
+                });
             });
         })
         .detach();
     }
 
-    pub fn toggle_subscription(&mut self, id: i64, enabled: bool, cx: &mut Context<Self>) {
-        {
-            let store = self.store.lock().expect("store mutex poisoned");
-            let _ = store.set_subscription_enabled(id, enabled);
-        }
-        self.reload_subscriptions(cx);
-    }
-
-    pub fn open_edit_subscription(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(subscription) = self
-            .subscriptions
-            .iter()
-            .find(|subscription| subscription.id == id)
-            .cloned()
-        else {
+    pub fn open_update_download(&mut self, cx: &mut Context<Self>) {
+        let Some(info) = &self.update_result else {
             return;
         };
-
-        self.edit_name.update(cx, |state, cx| {
-            state.set_value(subscription.name.clone(), window, cx)
-        });
-        self.edit_url.update(cx, |state, cx| {
-            state.set_value(subscription.url.clone().unwrap_or_default(), window, cx)
-        });
-        self.edit_interval.update(cx, |state, cx| {
-            state.set_value(subscription.refresh_minutes.to_string(), window, cx)
-        });
-        self.edit_ua.update(cx, |state, cx| {
-            state.set_value(
-                subscription.user_agent.clone().unwrap_or_default(),
-                window,
-                cx,
-            )
-        });
-        self.edit_enabled = subscription.enabled;
-        self.edit_error = None;
-        self.edit_nodes = subscription
-            .payload
+        let target = info
+            .download_url
             .as_deref()
-            .and_then(|payload| parse_content(payload).ok())
-            .map(|parsed| {
-                parsed
-                    .proxies
-                    .iter()
-                    .map(|proxy| {
-                        (
-                            proxy.name().to_string(),
-                            detect_region(proxy.name()).label().to_string(),
-                            proxy.kind().to_uppercase(),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        self.edit_data = Some(subscription);
-        self.edit_subscription = Some(id);
-        cx.notify();
-    }
-
-    pub fn close_edit_subscription(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.edit_subscription = None;
-        self.edit_data = None;
-        self.edit_nodes.clear();
-        self.edit_error = None;
-        for input in [
-            &self.edit_name,
-            &self.edit_url,
-            &self.edit_interval,
-            &self.edit_ua,
-        ] {
-            input.update(cx, |state, cx| state.set_value("", window, cx));
-        }
-        cx.notify();
-    }
-
-    pub fn set_edit_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.edit_enabled = enabled;
-        cx.notify();
-    }
-
-    pub fn save_edit_subscription(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.edit_subscription else {
-            return;
-        };
-        let Some(old) = self.edit_data.clone() else {
-            return;
-        };
-
-        let name = self.edit_name.read(cx).value().trim().to_string();
-        if name.is_empty() {
-            self.edit_error = Some("订阅名称不能为空".to_string());
-            cx.notify();
-            return;
-        }
-
-        let interval = match self.edit_interval.read(cx).value().trim().parse::<u32>() {
-            Ok(interval) if interval > 0 => interval.clamp(15, 10_080),
-            _ => {
-                self.edit_error = Some("刷新间隔必须是 15-10080 之间的分钟数".to_string());
-                cx.notify();
-                return;
-            }
-        };
-
-        let url = if old.kind == swiftsub_store::SubscriptionKind::Url {
-            let url = self.edit_url.read(cx).value().trim().to_string();
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
-                self.edit_error = Some("订阅链接必须是 HTTP/HTTPS 地址".to_string());
-                cx.notify();
-                return;
-            }
-            Some(url)
-        } else {
-            old.url.clone()
-        };
-        let url_changed = old.url != url;
-
-        let user_agent = self.edit_ua.read(cx).value().trim().to_string();
-        let user_agent = (!user_agent.is_empty()).then_some(user_agent.as_str());
-
-        let result = {
-            let store = self.store.lock().expect("store mutex poisoned");
-            store.update_subscription_meta(
-                id,
-                &name,
-                url.as_deref(),
-                self.edit_enabled,
-                interval,
-                user_agent,
-            )
-        };
-
-        match result {
-            Ok(()) => {
-                self.close_edit_subscription(window, cx);
-                self.reload_subscriptions(cx);
-                if url_changed
-                    && old.kind == swiftsub_store::SubscriptionKind::Url
-                    && let Some(url) = url
-                {
-                    self.fetch_in_background(
-                        id,
-                        url,
-                        name,
-                        CacheValidators::default(),
-                        FetchOptions::default(),
-                        cx,
-                    );
-                }
-                self.show_toast("订阅已保存".to_string(), cx);
-            }
-            Err(error) => {
-                self.edit_error = Some(format!("保存失败：{error}"));
-                cx.notify();
-            }
+            .unwrap_or(info.html_url.as_str());
+        match crate::desktop::open_external_url(target) {
+            Ok(()) => self.show_toast("已在浏览器中打开下载页面".into(), cx),
+            Err(error) => self.show_toast(error, cx),
         }
     }
 
-    pub fn ask_delete(&mut self, id: i64, cx: &mut Context<Self>) {
-        self.confirm_delete = Some(id);
-        cx.notify();
+    pub fn active_lan_host(&self) -> Option<String> {
+        if let Some(host) = self
+            .server_lan_host
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+        {
+            return Some(host.to_string());
+        }
+        swiftsub_server::detect_lan_ipv4().map(|ip| ip.to_string())
     }
 
-    pub fn cancel_delete(&mut self, cx: &mut Context<Self>) {
-        self.confirm_delete = None;
-        cx.notify();
-    }
-
-    pub fn perform_delete(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.confirm_delete.take() else {
-            return;
-        };
+    pub fn set_server_lan_host(&mut self, host: Option<String>, cx: &mut Context<Self>) {
+        let host = host.map(|h| h.trim().to_string()).filter(|h| !h.is_empty());
+        self.server_lan_host = host.clone();
         {
             let store = self.store.lock().expect("store mutex poisoned");
-            let _ = store.delete_subscription(id);
+            let _ = store.set_setting("server_lan_host", host.as_deref().unwrap_or(""));
         }
-        self.reload_subscriptions(cx);
-        self.show_toast("订阅已删除".to_string(), cx);
-    }
-
-    pub fn toggle_module(&mut self, id: String, enabled: bool, cx: &mut Context<Self>) {
-        if matches!(id.as_str(), "select" | "auto" | "final") {
-            return;
-        }
-        if enabled {
-            self.enabled_modules.insert(id);
-        } else {
-            self.enabled_modules.remove(&id);
-        }
-        self.save_module_config();
-        self.regenerate(cx);
+        let label = host.unwrap_or_else(|| {
+            swiftsub_server::detect_lan_ipv4()
+                .map(|ip| format!("自动（{ip}）"))
+                .unwrap_or_else(|| "自动".into())
+        });
+        self.show_toast(format!("局域网订阅地址已切换为 {label}"), cx);
+        cx.notify();
     }
 
     fn load_templates(&mut self) {
@@ -2393,7 +1745,7 @@ impl SwiftSubApp {
         }
         self.template_base_options = Some(self.options.clone());
         self.template_baseline = Some(self.active_template_snapshot());
-        self.template_edit_id = None;
+        self.template_edit_id = self.workspace.selected_template_id;
         self.template_session_active = true;
         self.template_dialog_open = true;
         self.reset_advanced_draft(window, cx);
@@ -2403,10 +1755,17 @@ impl SwiftSubApp {
         self.template_custom_rule_sets = self.custom_rule_sets.clone();
         self.template_enabled_modules = self.enabled_modules.clone();
         self.template_policy_groups = self.options.policy_groups.clone();
+        self.template_group_order = self.options.group_order.clone();
+        for group in &mut self.template_policy_groups {
+            group.ensure_id();
+            if group.id.is_empty() {
+                group.id = uuid::Uuid::new_v4().to_string();
+            }
+        }
         self.template_rule_order = self.options.rule_order.clone();
         self.template_rule_set_targets = self.options.rule_set_targets.clone();
         self.template_policy_edit = None;
-        self.template_target_picker = None;
+        self.workspace.settings_loaded = false;
         self.template_policy_name
             .update(cx, |state, cx| state.set_value("", window, cx));
         let lines = self
@@ -2428,6 +1787,14 @@ impl SwiftSubApp {
     }
 
     pub fn close_template_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace_close_rule_content(cx);
+        if self.workspace.rule_content_id.is_some() {
+            return;
+        }
+        self.workspace.rule_picker_open = false;
+        self.workspace.rule_metadata_id = None;
+        self.workspace.group_settings_open = false;
+        self.workspace.rules_target = None;
         self.clear_saved_draft();
         self.recovered_draft = false;
         if let Some(baseline) = self.template_baseline.take() {
@@ -2444,10 +1811,10 @@ impl SwiftSubApp {
         self.template_custom_rule_sets = self.custom_rule_sets.clone();
         self.template_enabled_modules = self.enabled_modules.clone();
         self.template_policy_groups = self.options.policy_groups.clone();
+        self.template_group_order = self.options.group_order.clone();
         self.template_rule_order = self.options.rule_order.clone();
         self.template_rule_set_targets = self.options.rule_set_targets.clone();
         self.template_policy_edit = None;
-        self.template_target_picker = None;
         self.template_policy_name
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.template_name
@@ -2462,6 +1829,17 @@ impl SwiftSubApp {
     }
 
     pub fn reset_advanced_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_advanced_draft(false, window, cx);
+    }
+
+    fn refresh_advanced_draft(
+        &mut self,
+        preserve_dirty: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dirty = preserve_dirty
+            && self.advanced_draft.read(cx).value().as_ref() != self.template_advanced_saved;
         let base = self.template_base_options.as_ref().unwrap_or(&self.options);
         let draft = AdvancedDraft {
             dns: base.dns.clone(),
@@ -2472,8 +1850,10 @@ impl SwiftSubApp {
         };
         if let Ok(text) = serde_json::to_string_pretty(&draft) {
             self.template_advanced_saved = text.clone();
-            self.advanced_draft
-                .update(cx, |s, cx| s.set_value(text, window, cx));
+            if !dirty {
+                self.advanced_draft
+                    .update(cx, |s, cx| s.set_value(text, window, cx));
+            }
         }
     }
 
@@ -2529,80 +1909,6 @@ impl SwiftSubApp {
         cx.notify();
     }
 
-    pub fn set_template_tab(&mut self, tab: TemplateTab, cx: &mut Context<Self>) {
-        self.template_tab = tab;
-        self.template_target_picker = None;
-        cx.notify();
-    }
-
-    pub fn toggle_template_rule_set(&mut self, id: String, enabled: bool, cx: &mut Context<Self>) {
-        self.set_template_source_rules("builtin".into(), vec![id], enabled, cx);
-    }
-
-    pub fn toggle_template_source_rule_set(
-        &mut self,
-        source_id: String,
-        entry_id: String,
-        enabled: bool,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_template_source_rules(source_id, vec![entry_id], enabled, cx);
-    }
-
-    pub fn toggle_template_rule_source(&mut self, id: String, cx: &mut Context<Self>) {
-        if !self.template_rule_sources_collapsed.insert(id.clone()) {
-            self.template_rule_sources_collapsed.remove(&id);
-        }
-        cx.notify();
-    }
-
-    pub fn set_template_source_rules(
-        &mut self,
-        source_id: String,
-        entry_ids: Vec<String>,
-        enabled: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if source_id == "builtin" {
-            for id in entry_ids {
-                if enabled {
-                    self.template_disabled_rule_sets.remove(&id);
-                    if let Some(module) = catalog::MODULES
-                        .iter()
-                        .find(|module| module.rule_sets.iter().any(|spec| spec.id == id))
-                    {
-                        self.template_enabled_modules.insert(module.id.to_string());
-                    }
-                } else {
-                    self.template_disabled_rule_sets.insert(id);
-                }
-            }
-        } else if let Some(source) = rule_catalog::SOURCES
-            .iter()
-            .find(|source| source.id == source_id)
-        {
-            rule_catalog::set_source_selection(
-                &mut self.template_custom_rule_sets,
-                source,
-                &entry_ids,
-                enabled,
-                &self.options.rule_provider_base_url,
-                &self.template_enabled_modules,
-            );
-            if enabled {
-                for binding in &self.template_custom_rule_sets {
-                    if let Some(module) = catalog::MODULES
-                        .iter()
-                        .find(|module| module.name == binding.target)
-                    {
-                        self.template_enabled_modules.insert(module.id.to_string());
-                    }
-                }
-            }
-        }
-        cx.notify();
-    }
-
     pub fn add_template_rule_set_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let url = self.template_rule_url.read(cx).value().trim().to_string();
         if url.is_empty() {
@@ -2612,6 +1918,17 @@ impl SwiftSubApp {
         }
         match rule_set_binding_from_url(&url) {
             Ok(mut binding) => {
+                if self
+                    .template_custom_rule_sets
+                    .iter()
+                    .any(|item| item.url == binding.url)
+                {
+                    self.show_toast("此规则集链接已添加，可在列表中调整目标".into(), cx);
+                    return;
+                }
+                if !self.template_rules_target_filter.is_empty() {
+                    binding.target = self.template_rules_target_filter.clone();
+                }
                 let base_id = binding.id.clone();
                 let mut suffix = 2;
                 while self
@@ -2629,12 +1946,6 @@ impl SwiftSubApp {
             }
             Err(error) => self.template_error = Some(error),
         }
-        cx.notify();
-    }
-
-    pub fn remove_template_custom_binding(&mut self, id: String, cx: &mut Context<Self>) {
-        self.template_custom_rule_sets
-            .retain(|binding| binding.id != id);
         cx.notify();
     }
 
@@ -2674,69 +1985,6 @@ impl SwiftSubApp {
         names
     }
 
-    pub fn open_template_target_picker(&mut self, id: String, cx: &mut Context<Self>) {
-        self.template_target_picker = Some(id);
-        self.template_error = None;
-        cx.notify();
-    }
-
-    pub fn set_template_rule_target(&mut self, id: String, target: String, cx: &mut Context<Self>) {
-        if id == "__target_filter__" {
-            self.template_rules_target_filter = target;
-            self.template_target_picker = None;
-            cx.notify();
-            return;
-        }
-        if let Some(module) = catalog::MODULES.iter().find(|module| module.name == target) {
-            self.template_enabled_modules.insert(module.id.to_string());
-        }
-        if let Some(binding) = self
-            .template_custom_rule_sets
-            .iter_mut()
-            .find(|binding| binding.id == id)
-        {
-            binding.target = target;
-        } else if catalog::MODULES
-            .iter()
-            .any(|module| module.rule_sets.iter().any(|spec| spec.id == id))
-        {
-            self.template_rule_set_targets.insert(id, target);
-        } else {
-            for source in rule_catalog::SOURCES {
-                if let Some(entry) = source
-                    .entries
-                    .iter()
-                    .find(|entry| format!("{}-{}", source.id, entry.id) == id)
-                {
-                    let mut binding = rule_catalog::binding_for(
-                        source,
-                        entry,
-                        rule_catalog::mirror_from_base(&self.options.rule_provider_base_url),
-                        &self.options.rule_provider_base_url,
-                        &self.template_enabled_modules,
-                    );
-                    binding.target = target;
-                    self.template_custom_rule_sets.push(binding);
-                    break;
-                }
-            }
-        }
-        self.template_target_picker = None;
-        cx.notify();
-    }
-
-    pub fn toggle_template_module(&mut self, id: String, enabled: bool, cx: &mut Context<Self>) {
-        if !matches!(id.as_str(), "select" | "auto" | "final") {
-            if enabled {
-                self.template_enabled_modules.insert(id);
-            } else {
-                self.template_enabled_modules.remove(&id);
-            }
-        }
-        self.template_error = None;
-        cx.notify();
-    }
-
     pub fn add_template_policy_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self
             .template_policy_name
@@ -2765,9 +2013,14 @@ impl SwiftSubApp {
             );
         } else {
             self.template_policy_groups.push(PolicyGroupSpec {
+                id: uuid::Uuid::new_v4().to_string(),
                 name,
                 kind: GroupKind::Select,
-                members: vec!["节点选择".into(), "自动选择".into(), "DIRECT".into()],
+                members: vec![
+                    self.workspace_resolved_group_name("节点选择").into(),
+                    self.workspace_resolved_group_name("自动选择").into(),
+                    "DIRECT".into(),
+                ],
                 include_all_nodes: false,
                 ..Default::default()
             });
@@ -2787,6 +2040,10 @@ impl SwiftSubApp {
     ) {
         if let Some(group) = self.template_policy_groups.get(index) {
             self.template_policy_edit = Some(index);
+            self.workspace.member_source.clear();
+            self.workspace.member_region.clear();
+            self.template_member_search
+                .update(cx, |input, cx| input.set_value("", window, cx));
             self.template_policy_rename
                 .update(cx, |s, cx| s.set_value(group.name.clone(), window, cx));
             self.template_health_url.update(cx, |s, cx| {
@@ -2798,6 +2055,16 @@ impl SwiftSubApp {
                         .test_interval
                         .map(|n| n.to_string())
                         .unwrap_or_default(),
+                    window,
+                    cx,
+                )
+            });
+            self.workspace.description.update(cx, |input, cx| {
+                input.set_value(group.description.clone(), window, cx)
+            });
+            self.workspace.tolerance.update(cx, |input, cx| {
+                input.set_value(
+                    group.tolerance.map(|n| n.to_string()).unwrap_or_default(),
                     window,
                     cx,
                 )
@@ -2817,28 +2084,15 @@ impl SwiftSubApp {
         options.custom_rules =
             parse_custom_rule_lines(&self.template_custom_rules.read(cx).value())?;
         options.policy_groups = self.template_policy_groups.clone();
+        options.group_order = self.template_group_order.clone();
         options.rule_set_targets = self.template_rule_set_targets.clone();
         options.rule_order = self.template_rule_order.clone();
         options.custom_groups = self.custom_groups.clone();
         options.chains = self.chains.clone();
+        if let Some(defaults) = &self.workspace.global_defaults {
+            defaults.apply(&mut options);
+        }
         Ok(options)
-    }
-
-    pub fn draft_generated(
-        &self,
-        cx: &Context<Self>,
-    ) -> Result<swiftsub_core::generator::GeneratedProfile, String> {
-        let options = self.draft_generate_options(cx)?;
-        let nodes = if self.nodes.iter().any(|n| n.enabled) {
-            self.nodes.clone()
-        } else {
-            build_nodes(
-                vec![Proxy::new("direct", "模板校验节点", "127.0.0.1", 1)],
-                "validation",
-                "validation",
-            )
-        };
-        generate_profile(&nodes, &options).map_err(|e| e.to_string())
     }
 
     pub fn edit_builtin_policy_group(
@@ -2856,18 +2110,12 @@ impl SwiftSubApp {
             return;
         }
         // Defaults are generated with the draft's modules but without any overrides.
-        let Ok(mut options) = self.draft_generate_options(cx) else {
-            return;
-        };
-        options.policy_groups.clear();
-        options.custom_groups.clear();
-        options.chains.clear();
-        options.custom_rules.clear();
-        options.custom_rule_sets.clear();
-        options.rule_set_targets.clear();
-        options.rule_order.clear();
-        options.listeners.clear();
-        options.extra_yaml.clear();
+        // Opening a built-in group must not parse unrelated, unfinished rule text.
+        let options = workspace::builtin_group_options(
+            self.template_base_options.as_ref().unwrap_or(&self.options),
+            &self.template_enabled_modules,
+            &name,
+        );
         let nodes = if self.nodes.iter().any(|n| n.enabled) {
             self.nodes.clone()
         } else {
@@ -2877,26 +2125,42 @@ impl SwiftSubApp {
                 "validation",
             )
         };
-        if let Ok(profile) = generate_profile(&nodes, &options) {
-            if let Some(group) = profile.groups.iter().find(|g| g.name == name) {
-                let all_nodes = matches!(name.as_str(), "节点选择" | "自动选择");
-                self.template_policy_groups.push(PolicyGroupSpec {
-                    name,
-                    kind: group.kind,
-                    members: if all_nodes {
-                        Vec::new()
-                    } else {
-                        group.proxies.clone()
-                    },
-                    include_all_nodes: all_nodes,
-                    builtin: true,
-                    ..Default::default()
-                });
-                self.edit_template_policy_group(self.template_policy_groups.len() - 1, window, cx);
-            } else {
-                self.template_error = Some("该组没有匹配节点，请先启用节点或模块".into());
+        let profile = match generate_profile(&nodes, &options) {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.template_error = Some(format!("策略组「{name}」无法打开：{error}"));
                 cx.notify();
+                return;
             }
+        };
+        if let Some(group) = profile.groups.iter().find(|g| g.name == name) {
+            let all_nodes = matches!(name.as_str(), "节点选择" | "自动选择");
+            self.template_policy_groups.push(PolicyGroupSpec {
+                id: format!("builtin:{name}"),
+                name,
+                kind: group.kind,
+                members: if all_nodes {
+                    group
+                        .proxies
+                        .iter()
+                        .filter(|member| !self.nodes.iter().any(|node| node.name() == *member))
+                        .map(|member| self.workspace_resolved_group_name(member).to_string())
+                        .collect()
+                } else {
+                    group
+                        .proxies
+                        .iter()
+                        .map(|member| self.workspace_resolved_group_name(member).to_string())
+                        .collect()
+                },
+                include_all_nodes: all_nodes,
+                builtin: true,
+                ..Default::default()
+            });
+            self.edit_template_policy_group(self.template_policy_groups.len() - 1, window, cx);
+        } else {
+            self.template_error = Some(format!("策略组「{name}」没有匹配节点，请先启用节点或模块"));
+            cx.notify();
         }
     }
 
@@ -2929,107 +2193,74 @@ impl SwiftSubApp {
             match interval_text.parse::<u32>() {
                 Ok(n) if n > 0 => Some(n),
                 _ => {
-                    self.template_error = Some("测速间隔必须是正整数".into());
+                    self.template_error =
+                        Some(format!("策略组「{old_name}」的测速间隔必须是正整数"));
                     cx.notify();
                     return;
                 }
             }
         };
-        if (!url.is_empty() && !(url.starts_with("https://") || url.starts_with("http://")))
-            || name.is_empty()
-            || name.contains([',', '\n', '\r'])
-            || (name != old_name
-                && (group.builtin
-                    || self.template_target_options().contains(&name)
-                    || ["PASS", "COMPATIBLE", "GLOBAL"].contains(&name.as_str())
-                    || self.nodes.iter().any(|n| n.name() == name)))
+        let tolerance_text = self.workspace.tolerance.read(cx).value().trim().to_string();
+        let tolerance = if tolerance_text.is_empty() {
+            None
+        } else {
+            match tolerance_text.parse::<u32>() {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    self.template_error =
+                        Some(format!("策略组「{old_name}」的测速容差必须是非负整数"));
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        if !url.is_empty()
+            && !url::Url::parse(&url).is_ok_and(|url| {
+                matches!(url.scheme(), "https" | "http") && url.host_str().is_some()
+            })
         {
-            self.template_error = Some("名称重复或无效，或测速 URL 无效；内置组名称固定".into());
+            self.template_error = Some(format!(
+                "策略组「{old_name}」的测速地址无效，请填写 HTTP / HTTPS 地址"
+            ));
             cx.notify();
             return;
         }
-        // Parse first: invalid rule text must not result in a partially renamed draft.
-        let mut rules = match parse_custom_rule_lines(&self.template_custom_rules.read(cx).value())
+        if name.is_empty()
+            || name.contains([',', '\n', '\r'])
+            || (name != old_name
+                && ((self.template_target_options().contains(&name)
+                    && group.builtin_name() != Some(name.as_str()))
+                    || [
+                        "DIRECT",
+                        "REJECT",
+                        "REJECT-DROP",
+                        "PASS",
+                        "COMPATIBLE",
+                        "GLOBAL",
+                    ]
+                    .iter()
+                    .any(|reserved| reserved.eq_ignore_ascii_case(&name))
+                    || self.nodes.iter().any(|n| n.name() == name)))
         {
-            Ok(rules) => rules,
-            Err(e) => {
-                self.template_error = Some(e);
-                cx.notify();
-                return;
-            }
-        };
-        if old_name != name {
-            for g in &mut self.template_policy_groups {
-                for member in &mut g.members {
-                    if *member == old_name {
-                        *member = name.clone();
-                    }
-                }
-            }
-            for b in &mut self.template_custom_rule_sets {
-                if b.target == old_name {
-                    b.target = name.clone();
-                }
-            }
-            for t in self.template_rule_set_targets.values_mut() {
-                if *t == old_name {
-                    *t = name.clone();
-                }
-            }
-            for rule in &mut rules {
-                if rule.target == old_name {
-                    rule.target = name.clone();
-                }
-            }
-            self.template_custom_rules.update(cx, |s, cx| {
-                s.set_value(
-                    rules
-                        .iter()
-                        .map(Rule::to_line)
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    window,
-                    cx,
-                )
-            });
+            self.template_error = Some(format!(
+                "策略组「{old_name}」的名称“{name}”重复或无效：名称不能为空、包含逗号或换行，或与现有组、节点及保留策略重名"
+            ));
+            cx.notify();
+            return;
         }
         let group = &mut self.template_policy_groups[index];
-        group.name = name;
+        group.tolerance = tolerance;
+        group.description = self.workspace.description.read(cx).value().to_string();
         group.test_url = (!url.is_empty()).then_some(url);
         group.test_interval = interval;
+        if old_name != name
+            && let Err(error) = self.rename_workspace_policy_group(index, name, window, cx)
+        {
+            self.template_error = Some(error);
+            cx.notify();
+            return;
+        }
         self.template_error = None;
-        cx.notify();
-    }
-
-    pub fn move_policy_member(
-        &mut self,
-        index: usize,
-        from: usize,
-        to: usize,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(g) = self.template_policy_groups.get_mut(index) {
-            if from < g.members.len() && to < g.members.len() {
-                let member = g.members.remove(from);
-                g.members.insert(to, member);
-            }
-        }
-        cx.notify();
-    }
-
-    pub fn move_template_rule(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
-        if let Ok(profile) = self.draft_generated(cx) {
-            let mut keys: Vec<_> = profile
-                .rules
-                .iter()
-                .map(swiftsub_core::generator::rule_identity)
-                .collect();
-            if from < keys.len() && to < keys.len() {
-                let key = keys.remove(from);
-                keys.insert(to, key);
-                self.template_rule_order = keys;
-            }
-        }
         cx.notify();
     }
 
@@ -3045,28 +2276,24 @@ impl SwiftSubApp {
         cx.notify();
     }
 
-    pub fn toggle_template_policy_member(
-        &mut self,
-        index: usize,
-        member: String,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(group) = self.template_policy_groups.get_mut(index) {
-            if member == "__all_nodes" {
-                group.include_all_nodes = !group.include_all_nodes;
-            } else if group.members.contains(&member) {
-                group.members.retain(|name| name != &member);
-            } else {
-                if let Some(module) = catalog::MODULES.iter().find(|module| module.name == member) {
-                    self.template_enabled_modules.insert(module.id.to_string());
-                }
-                group.members.push(member);
-            }
-        }
-        cx.notify();
-    }
-
     pub fn remove_template_policy_group(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(group) = self.template_policy_groups.get(index)
+            && let Some(identity) = group.builtin_name()
+        {
+            let name = group.name.clone();
+            match self.workspace_builtin_spec(identity) {
+                Ok(mut restored) => {
+                    restored.name = name;
+                    self.template_policy_groups[index] = restored;
+                    self.template_policy_edit = None;
+                    self.workspace.group_settings_open = false;
+                    self.template_error = None;
+                }
+                Err(error) => self.template_error = Some(error),
+            }
+            cx.notify();
+            return;
+        }
         if index < self.template_policy_groups.len() {
             let name = &self.template_policy_groups[index].name;
             let referenced = self
@@ -3118,8 +2345,11 @@ impl SwiftSubApp {
             custom_rule_sets: self.template_custom_rule_sets.clone(),
             custom_rule_lines: rules.iter().map(Rule::to_line).collect(),
             policy_groups: self.template_policy_groups.clone(),
+            group_order: self.template_group_order.clone(),
             rule_order: self.template_rule_order.clone(),
             dns: base.dns.clone(),
+            dns_override: base.dns_override,
+            rule_set_overrides: base.rule_set_overrides.clone(),
             listeners: base.listeners.clone(),
             extra_yaml: base.extra_yaml.clone(),
             rule_set_targets: self.template_rule_set_targets.clone(),
@@ -3128,6 +2358,7 @@ impl SwiftSubApp {
             chains: self.chains.clone(),
             test_url: base.test_url.clone(),
             test_interval: base.test_interval,
+            test_tolerance: base.test_tolerance,
             mixed_port: base.mixed_port,
             allow_lan: base.allow_lan,
         };
@@ -3172,6 +2403,7 @@ impl SwiftSubApp {
                 .map(|group| group.name.clone()),
         );
         targets.extend(snapshot.chains.iter().map(|chain| chain.name.clone()));
+        targets.extend(self.nodes.iter().map(|node| node.name().to_string()));
         for (label, target) in snapshot
             .custom_rule_sets
             .iter()
@@ -3204,16 +2436,15 @@ impl SwiftSubApp {
         }
         let options = snapshot.generate_options(&self.options)?;
         // Validate structure even when a template is edited before importing subscriptions.
-        let nodes = if self.nodes.iter().any(|node| node.enabled) {
-            self.nodes.clone()
-        } else {
-            swiftsub_core::normalize::build_nodes(
+        let mut nodes = self.nodes.clone();
+        if !nodes.iter().any(|node| node.enabled) {
+            nodes.extend(swiftsub_core::normalize::build_nodes(
                 vec![Proxy::new("direct", "模板校验节点", "127.0.0.1", 1)],
                 "validation",
                 "validation",
-            )
-        };
-        generate_profile(&nodes, &options).map_err(|error| error.to_string())?;
+            ));
+        }
+        self.generation_cache.generate(&nodes, &options)?;
         Ok(())
     }
 
@@ -3235,15 +2466,19 @@ impl SwiftSubApp {
                 .collect(),
             rule_provider_base_url: self.options.rule_provider_base_url.clone(),
             policy_groups: self.options.policy_groups.clone(),
+            group_order: self.options.group_order.clone(),
             rule_set_targets: self.options.rule_set_targets.clone(),
             rule_order: self.options.rule_order.clone(),
             dns: self.options.dns.clone(),
+            dns_override: self.options.dns_override,
+            rule_set_overrides: self.options.rule_set_overrides.clone(),
             listeners: self.options.listeners.clone(),
             extra_yaml: self.options.extra_yaml.clone(),
             custom_groups: self.custom_groups.clone(),
             chains: self.chains.clone(),
             test_url: self.options.test_url.clone(),
             test_interval: self.options.test_interval,
+            test_tolerance: self.options.test_tolerance,
             mixed_port: self.options.mixed_port,
             allow_lan: self.options.allow_lan,
         }
@@ -3262,7 +2497,6 @@ impl SwiftSubApp {
             return;
         }
         self.template_dialog_open = false;
-        self.template_target_picker = None;
         cx.notify();
     }
 
@@ -3310,6 +2544,17 @@ impl SwiftSubApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        self.persist_template_with_node_overrides(snapshot, save, &[], window, cx)
+    }
+
+    fn persist_template_with_node_overrides(
+        &mut self,
+        snapshot: TemplateSnapshot,
+        save: Option<(Option<i64>, String)>,
+        overrides: &[swiftsub_store::NodeOverride],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
         self.validate_template_snapshot(&snapshot)?;
         let options = snapshot.generate_options(&self.options)?;
         let json = serde_json::to_string(&snapshot).map_err(|e| e.to_string())?;
@@ -3327,17 +2572,36 @@ impl SwiftSubApp {
         }
         // Keep the whole snapshot for deterministic startup recovery as fields evolve.
         settings.insert("routing_snapshot".into(), json.clone());
+        settings.insert(
+            "deleted_nodes".into(),
+            serde_json::to_string(&self.deleted_nodes).map_err(|error| error.to_string())?,
+        );
+        settings.insert(
+            "node_order".into(),
+            serde_json::to_string(&self.node_order).map_err(|error| error.to_string())?,
+        );
+        settings.insert(
+            format!("rule-visibility:{}", self.profile_id),
+            serde_json::to_string(&self.workspace.rule_visibility)
+                .map_err(|error| error.to_string())?,
+        );
         let profile_json = self.profile_snapshot_json(snapshot.clone())?;
-        self.store
+        let saved_template_id = self
+            .store
             .lock()
             .expect("store mutex poisoned")
-            .save_routing_profile_snapshot(
+            .save_routing_profile_with_node_overrides(
                 &settings,
                 save.as_ref()
                     .map(|(id, name)| (*id, name.as_str(), json.as_str())),
                 Some((self.profile_id, profile_json.as_str())),
+                overrides,
             )
             .map_err(|e| format!("保存失败，配置未应用：{e}"))?;
+        if save.is_some() {
+            self.workspace.selected_template_id = saved_template_id;
+            self.template_edit_id = saved_template_id;
+        }
         self.options = options;
         self.enabled_modules = snapshot.enabled_modules.into_iter().collect();
         self.disabled_rule_sets = snapshot.disabled_rule_sets.into_iter().collect();
@@ -3384,6 +2648,10 @@ impl SwiftSubApp {
             Ok(()) => {
                 self.close_template_dialog(window, cx);
                 self.load_templates();
+                self.workspace.save_template_open = false;
+                if self.page == Page::Generator {
+                    self.open_template_dialog(window, cx);
+                }
                 self.show_toast("模板已保存并应用".into(), cx);
             }
             Err(e) => {
@@ -3403,12 +2671,26 @@ impl SwiftSubApp {
     ) {
         snapshot.remove_legacy_regions();
         self.open_template_dialog(window, cx);
-        self.template_base_options = snapshot.generate_options(&self.options).ok();
+        let mut base_snapshot = snapshot.clone();
+        if parse_custom_rule_lines(&base_snapshot.custom_rule_lines.join("\n")).is_err() {
+            base_snapshot.custom_rule_lines.clear();
+        }
+        self.template_base_options = base_snapshot.generate_options(&self.options).ok();
+        self.workspace.settings_loaded = false;
         self.template_edit_id = id;
+        self.workspace.selected_template_id = id;
         self.template_enabled_modules = snapshot.enabled_modules.into_iter().collect();
         self.template_disabled_rule_sets = snapshot.disabled_rule_sets.into_iter().collect();
         self.template_custom_rule_sets = snapshot.custom_rule_sets;
         self.template_policy_groups = snapshot.policy_groups;
+        self.template_group_order = snapshot.group_order;
+        for group in &mut self.template_policy_groups {
+            group.ensure_id();
+            if group.id.is_empty() {
+                group.id = uuid::Uuid::new_v4().to_string();
+            }
+        }
+        self.template_policy_edit = None;
         self.template_rule_set_targets = snapshot.rule_set_targets;
         self.template_rule_order = snapshot.rule_order;
         self.custom_groups = snapshot.custom_groups;
@@ -3418,102 +2700,45 @@ impl SwiftSubApp {
         self.template_custom_rules.update(cx, |s, cx| {
             s.set_value(snapshot.custom_rule_lines.join("\n"), window, cx)
         });
+        self.workspace.rule_repair_open =
+            parse_custom_rule_lines(&self.template_custom_rules.read(cx).value()).is_err();
         self.reset_advanced_draft(window, cx);
         self.page = Page::Generator;
         cx.notify();
     }
 
-    pub fn apply_custom_template(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.template_dialog_open {
-            self.show_toast("请先处理当前草稿".into(), cx);
-            return;
-        }
-        if let Some(t) = self.custom_templates.iter().find(|t| t.id == id).cloned() {
-            match serde_json::from_str(&t.config_json)
-                .map_err(|e| e.to_string())
-                .and_then(|s| self.validate_template_snapshot(&s).map(|_| s))
-            {
-                Ok(s) => self.load_template_draft(s, t.name, Some(id), window, cx),
-                Err(e) => self.show_toast(format!("模板无效：{e}"), cx),
-            }
-        }
-    }
-
-    pub fn copy_custom_template(&mut self, id: i64, cx: &mut Context<Self>) {
-        if let Some(t) = self.custom_templates.iter().find(|t| t.id == id).cloned() {
-            let mut name = format!("{} 副本", t.name);
-            let mut i = 2;
-            while self.custom_templates.iter().any(|t| t.name == name) {
-                name = format!("{} 副本 {i}", t.name);
-                i += 1;
-            }
-            let result = self
-                .store
-                .lock()
-                .expect("store mutex poisoned")
-                .add_custom_template(&name, &t.config_json);
-            match result {
-                Ok(_) => {
-                    self.load_templates();
-                    self.show_toast("模板已复制".into(), cx)
-                }
-                Err(e) => self.show_toast(format!("复制失败：{e}"), cx),
-            }
-        }
-    }
-
-    pub fn export_custom_template(&mut self, id: i64, cx: &mut Context<Self>) {
-        let Some(t) = self.custom_templates.iter().find(|t| t.id == id).cloned() else {
+    pub fn update_custom_template_with_current(
+        &mut self,
+        id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(existing) = self.custom_templates.iter().find(|t| t.id == id).cloned() else {
             return;
         };
-        let result = serde_json::from_str(&t.config_json)
-            .map_err(|e| e.to_string())
-            .and_then(|config| {
-                serde_json::to_string_pretty(&TemplateFile {
-                    format: "swiftsub-routing-template".into(),
-                    version: 1,
-                    name: t.name,
-                    config,
-                })
-                .map_err(|e| e.to_string())
-            });
-        let text = match result {
-            Ok(s) => s,
-            Err(e) => {
-                self.show_toast(e, cx);
-                return;
-            }
-        };
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("SwiftSub 模板", &["json"])
-            .set_file_name("routing-template.json")
-            .save_file()
-        {
-            match std::fs::write(path, text) {
-                Ok(()) => self.show_toast("模板已导出".into(), cx),
-                Err(e) => self.show_toast(format!("导出失败：{e}"), cx),
-            }
-        }
-    }
-
-    pub fn import_custom_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.template_dialog_open {
-            self.show_toast("请先处理当前草稿".into(), cx);
+        if !self.finish_policy_details(window, cx) {
             return;
         }
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("SwiftSub 模板", &["json"])
-            .pick_file()
-        else {
-            return;
-        };
-        let result = std::fs::read_to_string(path)
-            .map_err(|e| e.to_string())
-            .and_then(|s| TemplateFile::decode(&s))
-            .and_then(|file| self.validate_template_snapshot(&file.config).map(|_| file));
+        let result = self.draft_template_snapshot(cx).and_then(|snapshot| {
+            self.persist_and_commit_template(
+                snapshot,
+                Some((Some(id), existing.name.clone())),
+                window,
+                cx,
+            )
+        });
         match result {
-            Ok(file) => self.load_template_draft(file.config, file.name, None, window, cx),
-            Err(e) => self.show_toast(format!("导入失败：{e}"), cx),
+            Ok(()) => {
+                self.load_templates();
+                self.workspace.selected_template_id = Some(id);
+                self.show_toast(format!("已用当前分流配置更新模板「{}」", existing.name), cx);
+                cx.notify();
+            }
+            Err(error) => {
+                self.template_error = Some(error.clone());
+                self.show_toast(format!("更新模板失败：{error}"), cx);
+                cx.notify();
+            }
         }
     }
 
@@ -3532,12 +2757,6 @@ impl SwiftSubApp {
         }
     }
 
-    pub fn apply_builtin_template(&mut self, preset: Preset, cx: &mut Context<Self>) {
-        self.set_preset(preset, cx);
-        self.page = Page::Generator;
-        cx.notify();
-    }
-
     pub fn set_preset(&mut self, preset: Preset, cx: &mut Context<Self>) {
         self.options.preset = preset;
         self.enabled_modules = catalog::modules_for_preset(preset)
@@ -3549,25 +2768,12 @@ impl SwiftSubApp {
         self.options.rule_order.clear();
         self.options.custom_rules.clear();
         self.options.policy_groups.clear();
+        self.options.group_order.clear();
         self.options.rule_set_targets.clear();
         self.save_module_config();
         self.save_rule_set_config();
         self.regenerate(cx);
         self.show_toast(format!("已切换为{}模板", preset.label()), cx);
-    }
-
-    pub fn toggle_module_category(&mut self, category: &str, cx: &mut Context<Self>) {
-        if !self
-            .module_categories_collapsed
-            .insert(category.to_string())
-        {
-            self.module_categories_collapsed.remove(category);
-        }
-        cx.notify();
-    }
-
-    pub fn is_module_category_open(&self, category: &str) -> bool {
-        !self.module_categories_collapsed.contains(category)
     }
 
     fn save_module_config(&self) {
@@ -3584,6 +2790,9 @@ impl SwiftSubApp {
 
     fn save_rule_set_config(&self) {
         let store = self.store.lock().expect("store mutex poisoned");
+        if let Ok(value) = serde_json::to_string(&self.options.group_order) {
+            let _ = store.set_setting("group_order", &value);
+        }
         if let Ok(value) = serde_json::to_string(&self.options.rule_order) {
             let _ = store.set_setting("rule_order", &value);
         }
@@ -3618,6 +2827,10 @@ impl SwiftSubApp {
             && let Ok(preset) = serde_json::from_str::<Preset>(&value)
         {
             self.options.preset = preset;
+            self.enabled_modules = catalog::modules_for_preset(preset)
+                .into_iter()
+                .map(|module| module.id.to_string())
+                .collect();
         }
         if let Some(value) = store.get_setting("enabled_modules").ok().flatten()
             && let Ok(items) = serde_json::from_str::<Vec<String>>(&value)
@@ -3625,15 +2838,6 @@ impl SwiftSubApp {
         {
             self.enabled_modules = items.into_iter().collect();
         }
-    }
-
-    pub fn is_module_enabled(&self, id: &str) -> bool {
-        matches!(id, "select" | "auto" | "final") || self.enabled_modules.contains(id)
-    }
-
-    pub fn toggle_preview(&mut self, cx: &mut Context<Self>) {
-        self.preview_open = !self.preview_open;
-        cx.notify();
     }
 
     pub fn open_node_rename(
@@ -3673,115 +2877,68 @@ impl SwiftSubApp {
     }
 
     pub fn save_node_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(key), Some(sub_id)) = (self.node_rename_key.clone(), self.node_rename_sub_id)
-        else {
-            return;
-        };
-        let name = self.node_rename_input.read(cx).value().trim().to_string();
-        if name.is_empty() {
-            self.node_rename_error = Some("节点名称不能为空".to_string());
-            cx.notify();
-            return;
-        }
-
-        let yaml = self.node_edit_textarea.read(cx).value().trim().to_string();
-        let mut edited = match Proxy::from_yaml_text(&yaml) {
-            Ok(proxy) => proxy,
-            Err(error) => {
-                self.node_rename_error = Some(format!("节点 YAML 无效：{error}"));
-                cx.notify();
-                return;
-            }
-        };
-        if let Some(issue) = edited.fatal_issue() {
-            self.node_rename_error = Some(issue);
-            cx.notify();
-            return;
-        }
-        edited.set_name(name.clone());
-        let edited_yaml = match edited.to_yaml_text() {
-            Ok(yaml) => yaml,
-            Err(error) => {
-                self.node_rename_error = Some(format!("序列化节点失败：{error}"));
-                cx.notify();
-                return;
-            }
-        };
-
-        {
-            let store = self.store.lock().expect("store mutex poisoned");
-            let _ = store.set_node_override_alias(sub_id, &key, &name);
-            let _ = store.set_node_override_fields(sub_id, &key, &edited_yaml);
-        }
-        self.close_node_rename(window, cx);
-        self.reload_subscriptions(cx);
-        self.show_toast("节点已保存".to_string(), cx);
+        self.save_workspace_node_edit(window, cx);
     }
 
-    pub fn toggle_node(&mut self, key: String, enabled: bool, cx: &mut Context<Self>) {
-        if let Some(node) = self.nodes.iter().find(|node| node.source_key == key)
-            && let Ok(sub_id) = node.source_id.parse::<i64>()
-        {
-            let store = self.store.lock().expect("store mutex poisoned");
-            let _ = store.set_node_override_enabled(sub_id, &key, enabled);
-        }
-        if enabled {
-            self.disabled_nodes.remove(&key);
-        } else {
-            self.disabled_nodes.insert(key);
-        }
-        self.rebuild_nodes(cx);
-    }
-
-    pub fn move_node(&mut self, dragged: String, target: String, cx: &mut Context<Self>) {
-        if dragged == target {
-            return;
-        }
-        let Some(from) = self
-            .nodes
-            .iter()
-            .position(|node| node.source_key == dragged)
-        else {
-            return;
-        };
-        let node = self.nodes.remove(from);
-        let to = self
-            .nodes
-            .iter()
-            .position(|node| node.source_key == target)
-            .unwrap_or(self.nodes.len());
-        self.nodes.insert(to, node);
-        self.node_order = self
-            .nodes
-            .iter()
-            .map(|node| node.source_key.clone())
-            .collect();
-        if let Ok(value) = serde_json::to_string(&self.node_order) {
-            let store = self.store.lock().expect("store mutex poisoned");
-            let _ = store.set_setting("node_order", &value);
-        }
-        self.regenerate(cx);
-    }
-
-    pub fn copy_text(&mut self, text: String, cx: &mut Context<Self>) {
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.show_toast("已复制到剪贴板".to_string(), cx);
+    pub fn toggle_node(
+        &mut self,
+        key: String,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_workspace_node(key, enabled, window, cx);
     }
 
     pub fn copy_server_url(&mut self, cx: &mut Context<Self>) {
-        if let Some(url) = self.server_url.clone() {
-            self.copy_text(url, cx);
+        let id = if self.workspace.saved_editor_open {
+            self.saved_config_id.clone()
         } else {
-            self.show_toast("本地服务未启动".to_string(), cx);
+            self.generated_saved_config
+                .as_ref()
+                .map(|config| config.id.clone())
+        };
+        if let Some(id) = id {
+            self.copy_config_subscription(id, cx);
+        } else {
+            self.show_toast("请先在生成页保存配置".into(), cx);
         }
     }
 
-    pub fn copy_preview(&mut self, cx: &mut Context<Self>) {
-        if self.preview.is_empty() {
-            self.show_toast("暂无可复制的配置".to_string(), cx);
-        } else {
-            self.copy_text(self.preview.clone(), cx);
+    fn prepare_yaml_output(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
+        if !self.nodes.iter().any(|node| node.enabled) {
+            return Err("请先添加并启用节点".into());
         }
+        if let Err(error) = self.autosave_routing(window, cx) {
+            if parse_custom_rule_lines(&self.template_custom_rules.read(cx).value()).is_err() {
+                self.workspace.rule_repair_open = true;
+                self.template_custom_rules
+                    .read(cx)
+                    .focus_handle(cx)
+                    .focus(window, cx);
+            } else if let Some(group) = self
+                .template_policy_edit
+                .and_then(|i| self.template_policy_groups.get(i))
+            {
+                self.workspace.group_settings_open = true;
+                self.workspace
+                    .reveal_group
+                    .replace(Some(group.name.clone()));
+                self.template_policy_rename
+                    .read(cx)
+                    .focus_handle(cx)
+                    .focus(window, cx);
+            }
+            self.template_error = Some(error.clone());
+            cx.notify();
+            return Err(error);
+        }
+        self.workspace_apply_rule_drafts(window, cx)?;
+        saved_configs::generate_yaml_output(&self.nodes, &self.draft_generate_options(cx)?)
     }
 
     pub fn show_toast(&mut self, message: String, cx: &mut Context<Self>) {
@@ -3807,33 +2964,6 @@ impl SwiftSubApp {
         if let Some(server) = &self.server {
             self.server_url =
                 Some(server.profile_url(&self.profile_token, &self.subscription_filename));
-        }
-    }
-
-    pub fn save_subscription_filename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let input = self
-            .subscription_filename_input
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        match normalize_profile_filename(&input) {
-            Ok(filename) => {
-                self.subscription_filename = filename.clone();
-                {
-                    let store = self.store.lock().expect("store mutex poisoned");
-                    let _ = store.set_setting("subscription_filename", &filename);
-                }
-                self.subscription_filename_input
-                    .update(cx, |state, cx| state.set_value(filename, window, cx));
-                self.refresh_server_url();
-                if let Err(e) = self.save_active_profile() {
-                    self.show_toast(e, cx);
-                    return;
-                }
-                self.show_toast("订阅文件名已更新".to_string(), cx);
-            }
-            Err(error) => self.show_toast(error, cx),
         }
     }
 
@@ -3872,49 +3002,6 @@ impl SwiftSubApp {
         self.save_rule_provider(window, cx);
     }
 
-    pub fn change_data_dir(&mut self, cx: &mut Context<Self>) {
-        let Some(selected) = rfd::FileDialog::new().pick_folder() else {
-            return;
-        };
-        if selected == self.data_dir {
-            self.show_toast("已经是当前数据目录".to_string(), cx);
-            return;
-        }
-        if let Err(error) = std::fs::create_dir_all(&selected) {
-            self.show_toast(format!("创建目录失败：{error}"), cx);
-            return;
-        }
-        let target = selected.join("swiftsub.db");
-        if target.exists() {
-            self.show_toast("目标目录已存在 swiftsub.db，请换一个目录".to_string(), cx);
-            return;
-        }
-
-        let result = {
-            let store = self.store.lock().expect("store mutex poisoned");
-            store.backup_to(target.to_string_lossy().as_ref())
-        };
-        match result {
-            Ok(()) => {
-                let bootstrap = bootstrap_dir();
-                if let Err(error) = std::fs::create_dir_all(&bootstrap) {
-                    self.show_toast(format!("写入数据目录配置失败：{error}"), cx);
-                    return;
-                }
-                if let Err(error) = std::fs::write(
-                    bootstrap.join("location.txt"),
-                    selected.display().to_string(),
-                ) {
-                    self.show_toast(format!("写入数据目录配置失败：{error}"), cx);
-                    return;
-                }
-                self.data_dir = selected;
-                self.show_toast("数据目录已更改，重启应用后生效".to_string(), cx);
-            }
-            Err(error) => self.show_toast(format!("复制数据库失败：{error}"), cx),
-        }
-    }
-
     pub fn aggregate_userinfo(&self) -> Option<String> {
         let mut info = SubscriptionInfo::default();
         let mut has_data = false;
@@ -3945,33 +3032,6 @@ impl SwiftSubApp {
 
         (has_data || has_expire).then(|| info.to_header_value())
     }
-
-    pub fn subscriptions_summary(&self) -> (usize, usize) {
-        let enabled = self
-            .subscriptions
-            .iter()
-            .filter(|subscription| subscription.enabled)
-            .count();
-        (enabled, self.subscriptions.len())
-    }
-
-    pub fn aggregate_traffic(&self) -> (u64, u64) {
-        let mut used: u64 = 0;
-        let mut total: u64 = 0;
-        for subscription in self
-            .subscriptions
-            .iter()
-            .filter(|subscription| subscription.enabled)
-        {
-            used = used.saturating_add(
-                subscription
-                    .traffic_upload
-                    .saturating_add(subscription.traffic_download),
-            );
-            total = total.saturating_add(subscription.traffic_total);
-        }
-        (used, total)
-    }
 }
 
 pub fn data_dir() -> PathBuf {
@@ -3991,37 +3051,6 @@ pub fn bootstrap_dir() -> PathBuf {
     } else {
         PathBuf::from(".swiftsub")
     }
-}
-
-fn normalize_profile_filename(input: &str) -> Result<String, String> {
-    let mut name = input.trim().trim_start_matches('/').to_string();
-    if name.is_empty() {
-        return Err("订阅文件名不能为空".to_string());
-    }
-    if name.contains(['/', '\\', '?', '#', '%', ' ']) {
-        return Err("文件名不能包含路径分隔符或空格".to_string());
-    }
-
-    let lower = name.to_lowercase();
-    if lower.ends_with(".yaml") {
-        name = format!("{}.yaml", &name[..name.len() - 5]);
-    } else if lower.ends_with(".yml") {
-        name = format!("{}.yml", &name[..name.len() - 4]);
-    } else {
-        name.push_str(".yaml");
-    }
-
-    let stem = name.trim_end_matches(".yaml").trim_end_matches(".yml");
-    if stem.is_empty() {
-        return Err("订阅文件名不能为空".to_string());
-    }
-    if !name
-        .chars()
-        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
-    {
-        return Err("文件名只能包含字母、数字、-、_ 和 .".to_string());
-    }
-    Ok(name)
 }
 
 fn split_keywords(value: &str) -> Vec<String> {
@@ -4054,24 +3083,6 @@ pub fn default_subscription_name(url: &str) -> String {
     }
 }
 
-pub fn format_bytes(value: u64) -> String {
-    if value == 0 {
-        return "—".to_string();
-    }
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    let mut size = value as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{} {}", value, UNITS[unit])
-    } else {
-        format!("{size:.1} {}", UNITS[unit])
-    }
-}
-
 pub fn format_timestamp(timestamp: Option<i64>) -> String {
     let Some(timestamp) = timestamp else {
         return "从未更新".to_string();
@@ -4080,16 +3091,6 @@ pub fn format_timestamp(timestamp: Option<i64>) -> String {
         return "—".to_string();
     };
     datetime.format("%m-%d %H:%M").to_string()
-}
-
-pub fn format_expire(timestamp: Option<i64>) -> String {
-    let Some(timestamp) = timestamp else {
-        return "—".to_string();
-    };
-    let Some(datetime) = Local.timestamp_opt(timestamp, 0).single() else {
-        return "—".to_string();
-    };
-    datetime.format("%Y-%m-%d").to_string()
 }
 
 #[cfg(test)]
@@ -4109,6 +3110,7 @@ mod routing_template_tests {
     fn old_templates_load_without_new_policy_fields() {
         let snapshot: TemplateSnapshot = serde_json::from_value(legacy_snapshot()).unwrap();
         assert!(snapshot.policy_groups.is_empty());
+        assert!(snapshot.group_order.is_empty());
         assert!(snapshot.rule_set_targets.is_empty());
         assert!(
             snapshot
@@ -4130,10 +3132,12 @@ mod routing_template_tests {
             "format":"yaml", "behavior":"classical", "target":"流媒体", "no_resolve":false
         }]);
         json["custom_rule_lines"] = json!(["DOMAIN-SUFFIX,example.org,测速专线"]);
+        json["group_order"] = json!(["流媒体", "测速专线", "漏网之鱼"]);
         let snapshot: TemplateSnapshot = serde_json::from_value(json).unwrap();
         let restored: TemplateSnapshot =
             serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
         assert_eq!(snapshot.policy_groups, restored.policy_groups);
+        assert_eq!(snapshot.group_order, restored.group_order);
         assert_eq!(snapshot.rule_set_targets, restored.rule_set_targets);
         let parsed = parse_content("trojan://pass@example.com:443#test").unwrap();
         let nodes = build_nodes(parsed.proxies, "fixture", "fixture");
@@ -4144,6 +3148,15 @@ mod routing_template_tests {
                 .unwrap(),
         )
         .unwrap();
+        assert_eq!(
+            profile
+                .groups
+                .iter()
+                .take(3)
+                .map(|group| group.name.as_str())
+                .collect::<Vec<_>>(),
+            ["流媒体", "测速专线", "漏网之鱼"]
+        );
         for rule in [
             "RULE-SET,netflix,流媒体",
             "RULE-SET,netflix-ip,测速专线,no-resolve",

@@ -31,6 +31,8 @@ pub struct ProxyGroup {
     pub url: Option<String>,
     pub interval: Option<u32>,
     pub lazy: bool,
+    pub tolerance: Option<u32>,
+    pub strategy: Option<String>,
 }
 
 impl ProxyGroup {
@@ -42,6 +44,8 @@ impl ProxyGroup {
             url: None,
             interval: None,
             lazy: false,
+            tolerance: None,
+            strategy: None,
         }
     }
 
@@ -81,6 +85,12 @@ impl ProxyGroup {
         }
         if self.lazy {
             map.insert(Value::String("lazy".to_string()), Value::Bool(true));
+        }
+        if let Some(tolerance) = self.tolerance {
+            map.insert(Value::from("tolerance"), Value::from(tolerance));
+        }
+        if let Some(strategy) = &self.strategy {
+            map.insert(Value::from("strategy"), Value::from(strategy.clone()));
         }
         Value::Mapping(map)
     }

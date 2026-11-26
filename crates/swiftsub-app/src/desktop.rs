@@ -139,62 +139,6 @@ fn registry_command() -> std::process::Command {
     cmd.creation_flags(0x08000000);
     cmd
 }
-pub fn autostart_enabled() -> bool {
-    #[cfg(windows)]
-    {
-        registry_command()
-            .args([
-                "query",
-                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                "/v",
-                "SwiftSub",
-            ])
-            .output()
-            .is_ok_and(|o| o.status.success())
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
-pub fn set_autostart(enabled: bool) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        let mut cmd = registry_command();
-        let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-        if enabled {
-            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-            cmd.args([
-                "add",
-                key,
-                "/v",
-                "SwiftSub",
-                "/t",
-                "REG_SZ",
-                "/d",
-                &format!("\"{}\" --background", exe.display()),
-                "/f",
-            ]);
-        } else {
-            if !autostart_enabled() {
-                return Ok(());
-            }
-            cmd.args(["delete", key, "/v", "SwiftSub", "/f"]);
-        }
-        let result = cmd.output().map_err(|e| e.to_string())?;
-        if result.status.success() {
-            Ok(())
-        } else {
-            Err(String::from_utf8_lossy(&result.stderr).into_owned())
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = enabled;
-        Err("当前平台暂不支持开机自启".into())
-    }
-}
-
 /// Open the registered Verge handler, with support for its legacy Clash scheme.
 pub fn open_clash_verge(uri: &str) -> Result<(), String> {
     #[cfg(windows)]
@@ -211,9 +155,10 @@ pub fn open_clash_verge(uri: &str) -> Result<(), String> {
             ) -> isize;
         }
         let operation: Vec<u16> = "open\0".encode_utf16().collect();
+        // Older versions forward only clash: arguments to their existing instance.
         for candidate in [
-            uri.replacen("clash://", "clash-verge://", 1),
             uri.to_string(),
+            uri.replacen("clash://", "clash-verge://", 1),
         ] {
             let scheme = candidate.split_once("://").map(|p| p.0).unwrap_or("clash");
             if !registry_command()
@@ -248,5 +193,48 @@ pub fn open_clash_verge(uri: &str) -> Result<(), String> {
     {
         let _ = uri;
         Err("当前平台暂不支持直接导入，请复制订阅地址".into())
+    }
+}
+
+/// Open an external http/https URL in the system default browser.
+pub fn open_external_url(url: &str) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("仅支持打开 http/https 链接".into());
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut std::ffi::c_void,
+                operation: *const u16,
+                file: *const u16,
+                params: *const u16,
+                directory: *const u16,
+                show: i32,
+            ) -> isize;
+        }
+        let operation: Vec<u16> = "open\0".encode_utf16().collect();
+        let file: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                operation.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+            )
+        };
+        if result > 32 {
+            Ok(())
+        } else {
+            Err("无法调用系统浏览器打开链接".into())
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = url;
+        Err("当前平台暂不支持自动打开浏览器".into())
     }
 }

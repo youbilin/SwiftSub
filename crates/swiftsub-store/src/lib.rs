@@ -1,5 +1,7 @@
+mod history;
 mod saved_configs;
-pub use saved_configs::SavedConfig;
+pub use history::ConfigRevision;
+pub use saved_configs::{SavedConfig, SavedConfigWrite};
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -84,6 +86,17 @@ CREATE TABLE IF NOT EXISTS refresh_logs (
     ok INTEGER NOT NULL,
     message TEXT
 );
+
+CREATE TABLE IF NOT EXISTS config_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    config_id TEXT NOT NULL REFERENCES saved_configs(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    yaml TEXT NOT NULL,
+    source_json TEXT,
+    reason TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS revisions_by_config ON config_revisions(config_id,id DESC);
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -250,27 +263,38 @@ impl Store {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
 
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let migration = conn.unchecked_transaction()?;
+        let version: i64 = migration.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > 4 {
+            return Err(rusqlite::Error::InvalidQuery.into());
+        }
         if version < 1 {
-            conn.execute_batch(SCHEMA)?;
-            conn.pragma_update(None, "user_version", 1)?;
+            migration.execute_batch(SCHEMA)?;
+            migration.pragma_update(None, "user_version", 1)?;
         }
         if version < 2 {
             let has_extras = {
-                let mut statement = conn.prepare("PRAGMA table_info(node_overrides)")?;
+                let mut statement = migration.prepare("PRAGMA table_info(node_overrides)")?;
                 let names = statement.query_map([], |row| row.get::<_, String>(1))?;
                 names.filter_map(Result::ok).any(|name| name == "extras")
             };
             if !has_extras {
-                conn.execute("ALTER TABLE node_overrides ADD COLUMN extras TEXT", [])?;
+                migration.execute("ALTER TABLE node_overrides ADD COLUMN extras TEXT", [])?;
             }
-            conn.pragma_update(None, "user_version", 2)?;
+            migration.pragma_update(None, "user_version", 2)?;
         }
 
         if version < 3 {
-            conn.execute_batch(SCHEMA)?;
-            conn.pragma_update(None, "user_version", 3)?;
+            migration.execute_batch(SCHEMA)?;
+            migration.pragma_update(None, "user_version", 3)?;
         }
+        if version < 4 {
+            migration.execute_batch(SCHEMA)?;
+            migration.execute("INSERT INTO config_revisions(config_id,name,yaml,source_json,reason,created_at) SELECT id,name,yaml,source_json,'升级前配置',updated_at FROM saved_configs WHERE id NOT IN (SELECT config_id FROM config_revisions)", [])?;
+            migration.pragma_update(None, "user_version", 4)?;
+        }
+
+        migration.commit()?;
 
         Ok(Self { conn })
     }
@@ -338,7 +362,10 @@ impl Store {
     ) -> Result<()> {
         self.conn.execute(
             "UPDATE subscriptions
-             SET name = ?1, url = ?2, enabled = ?3, refresh_minutes = ?4,
+             SET etag = CASE WHEN url IS NOT ?2 OR user_agent IS NOT ?5 THEN NULL ELSE etag END,
+                 last_modified = CASE WHEN url IS NOT ?2 OR user_agent IS NOT ?5 THEN NULL ELSE last_modified END,
+                 last_ok_at = CASE WHEN url IS NOT ?2 OR user_agent IS NOT ?5 THEN NULL ELSE last_ok_at END,
+                 name = ?1, url = ?2, enabled = ?3, refresh_minutes = ?4,
                  user_agent = ?5, updated_at = ?6
              WHERE id = ?7",
             params![
@@ -422,6 +449,8 @@ impl Store {
         &self,
         id: i64,
         traffic: Option<&TrafficSnapshot>,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
     ) -> Result<()> {
         let now = now_ts();
         match traffic {
@@ -430,7 +459,8 @@ impl Store {
                     "UPDATE subscriptions
                      SET last_ok_at = ?1, last_error = NULL, traffic_upload = ?2,
                          traffic_download = ?3, traffic_total = ?4, expire_at = ?5,
-                         updated_at = ?1
+                         updated_at = ?1, etag = COALESCE(?7, etag),
+                         last_modified = COALESCE(?8, last_modified)
                      WHERE id = ?6",
                     params![
                         now,
@@ -438,16 +468,19 @@ impl Store {
                         traffic.download as i64,
                         traffic.total as i64,
                         traffic.expire_at,
-                        id
+                        id,
+                        etag,
+                        last_modified
                     ],
                 )?;
             }
             None => {
                 self.conn.execute(
                     "UPDATE subscriptions
-                     SET last_ok_at = ?1, last_error = NULL, updated_at = ?1
+                     SET last_ok_at = ?1, last_error = NULL, updated_at = ?1,
+                         etag = COALESCE(?3, etag), last_modified = COALESCE(?4, last_modified)
                      WHERE id = ?2",
-                    params![now, id],
+                    params![now, id, etag, last_modified],
                 )?;
             }
         }
@@ -473,10 +506,13 @@ impl Store {
     }
 
     pub fn log_refresh(&self, sub_id: Option<i64>, ok: bool, message: Option<&str>) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO refresh_logs (sub_id, at, ok, message) VALUES (?1, ?2, ?3, ?4)",
             params![sub_id, now_ts(), ok as i64, message],
         )?;
+        tx.execute("DELETE FROM refresh_logs WHERE id NOT IN (SELECT id FROM refresh_logs ORDER BY id DESC LIMIT 1000)", [])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -629,15 +665,35 @@ impl Store {
         template: Option<(Option<i64>, &str, &str)>,
         profile: Option<(i64, &str)>,
     ) -> Result<Option<i64>> {
+        self.save_routing_profile_with_node_overrides(settings, template, profile, &[])
+    }
+
+    /// Keep node edits and all references to them in the same transaction.
+    pub fn save_routing_profile_with_node_overrides(
+        &self,
+        settings: &HashMap<String, String>,
+        template: Option<(Option<i64>, &str, &str)>,
+        profile: Option<(i64, &str)>,
+        overrides: &[NodeOverride],
+    ) -> Result<Option<i64>> {
         let tx = self.conn.unchecked_transaction()?;
-        if let Some((id, json)) = profile {
-            if tx.execute(
+        for value in overrides {
+            tx.execute(
+                "INSERT INTO node_overrides (sub_id,node_key,alias,enabled,listen_port,sort_order,extras)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)
+                 ON CONFLICT(sub_id,node_key) DO UPDATE SET alias=excluded.alias,enabled=excluded.enabled,
+                 listen_port=excluded.listen_port,sort_order=excluded.sort_order,extras=excluded.extras",
+                params![value.sub_id, value.node_key, value.alias, value.enabled.map(i64::from),
+                    value.listen_port.map(i64::from), value.sort_order, value.extras],
+            )?;
+        }
+        if let Some((id, json)) = profile
+            && tx.execute(
                 "UPDATE profiles SET options_json=?1,updated_at=?2 WHERE id=?3",
                 params![json, now_ts(), id],
             )? != 1
-            {
-                return Err(rusqlite::Error::QueryReturnedNoRows.into());
-            }
+        {
+            return Err(rusqlite::Error::QueryReturnedNoRows.into());
         }
         let template_id = if let Some((id, name, json)) = template {
             let now = now_ts();
@@ -669,6 +725,20 @@ impl Store {
 
     pub fn backup_to(&self, path: &str) -> Result<()> {
         self.conn.execute("VACUUM INTO ?1", params![path])?;
+        Ok(())
+    }
+
+    pub fn validate_database(&self) -> Result<()> {
+        let integrity: String = self
+            .conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            return Err(rusqlite::Error::InvalidQuery.into());
+        }
+        let mut check = self.conn.prepare("PRAGMA foreign_key_check")?;
+        if check.query([])?.next()?.is_some() {
+            return Err(rusqlite::Error::InvalidQuery.into());
+        }
         Ok(())
     }
 
@@ -760,11 +830,42 @@ impl Store {
 
     pub fn save_profile_yaml(&self, id: i64, yaml: &str) -> Result<()> {
         let now = now_ts();
-        self.conn.execute(
+        let changed = self.conn.execute(
             "UPDATE profiles SET last_yaml = ?1, generated_at = ?2, updated_at = ?2 WHERE id = ?3",
             params![yaml, now, id],
         )?;
+        if changed == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows.into());
+        }
         Ok(())
+    }
+
+    /// Accept a background generation only while all input recipes still match.
+    pub fn save_generated_outputs(
+        &self,
+        outputs: &[(i64, Option<String>, String)],
+    ) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (id, expected_options, _) in outputs {
+            let actual: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT options_json FROM profiles WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if actual.as_ref() != Some(expected_options) {
+                return Ok(false);
+            }
+        }
+        for (id, _, yaml) in outputs {
+            tx.execute(
+                "UPDATE profiles SET last_yaml=?1,generated_at=?2,updated_at=?2 WHERE id=?3",
+                params![yaml, now_ts(), id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn save_profile_options(&self, id: i64, options_json: &str) -> Result<()> {
@@ -875,10 +976,27 @@ mod tests {
             Some("timeout")
         );
 
-        store.save_fetch_not_modified(first, None).unwrap();
+        store
+            .save_fetch_not_modified(first, None, None, None)
+            .unwrap();
         let saved = store.get_subscription(first).unwrap().unwrap();
         assert!(saved.last_error.is_none());
         assert!(saved.last_ok_at.is_some());
+        assert_eq!(saved.etag.as_deref(), Some("etag-1"));
+        store
+            .save_fetch_not_modified(first, None, Some("etag-2"), None)
+            .unwrap();
+        let saved = store.get_subscription(first).unwrap().unwrap();
+        assert_eq!(saved.etag.as_deref(), Some("etag-2"));
+        assert_eq!(saved.last_modified.as_deref(), Some("last-modified"));
+        assert_eq!(saved.payload.as_deref(), Some("proxies: []"));
+        assert_eq!(saved.traffic_total, traffic.total);
+        store
+            .save_fetch_not_modified(first, Some(&traffic), None, Some("new-last-modified"))
+            .unwrap();
+        let saved = store.get_subscription(first).unwrap().unwrap();
+        assert_eq!(saved.etag.as_deref(), Some("etag-2"));
+        assert_eq!(saved.last_modified.as_deref(), Some("new-last-modified"));
 
         store.set_subscription_refresh_minutes(first, 60).unwrap();
         assert_eq!(
@@ -975,6 +1093,77 @@ mod tests {
 mod routing_transaction_tests {
     use super::*;
     #[test]
+    fn node_edit_and_renamed_references_commit_or_roll_back_together() {
+        let store = Store::open_in_memory().unwrap();
+        let sub_id = store
+            .add_subscription(&NewSubscription::url("test", "https://example.org/sub"))
+            .unwrap();
+        let profile = store.get_or_create_profile("test").unwrap();
+        store
+            .set_node_override_alias(sub_id, "stable-key", "original")
+            .unwrap();
+        store
+            .save_profile_options(profile.id, "original references")
+            .unwrap();
+        let edited = NodeOverride {
+            sub_id,
+            node_key: "stable-key".into(),
+            alias: Some("renamed".into()),
+            enabled: Some(true),
+            listen_port: None,
+            sort_order: None,
+            extras: Some("edited fields".into()),
+        };
+        assert!(
+            store
+                .save_routing_profile_with_node_overrides(
+                    &HashMap::new(),
+                    None,
+                    Some((-1, "renamed references")),
+                    std::slice::from_ref(&edited)
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.list_node_overrides(sub_id).unwrap()["stable-key"]
+                .alias
+                .as_deref(),
+            Some("original")
+        );
+        assert_eq!(
+            store
+                .get_profile_by_token(&profile.token)
+                .unwrap()
+                .unwrap()
+                .options_json
+                .as_deref(),
+            Some("original references")
+        );
+        store
+            .save_routing_profile_with_node_overrides(
+                &HashMap::new(),
+                None,
+                Some((profile.id, "renamed references")),
+                &[edited],
+            )
+            .unwrap();
+        assert_eq!(
+            store.list_node_overrides(sub_id).unwrap()["stable-key"]
+                .alias
+                .as_deref(),
+            Some("renamed")
+        );
+        assert_eq!(
+            store
+                .get_profile_by_token(&profile.token)
+                .unwrap()
+                .unwrap()
+                .options_json
+                .as_deref(),
+            Some("renamed references")
+        );
+    }
+    #[test]
     fn template_update_and_settings_commit_or_rollback_together() {
         let store = Store::open_in_memory().unwrap();
         let id = store.add_custom_template("original", "{}").unwrap();
@@ -1049,6 +1238,101 @@ mod routing_transaction_tests {
 #[cfg(test)]
 mod profile_tests {
     use super::*;
+
+    #[test]
+    fn background_outputs_reject_changed_recipes_and_roll_back_write_failures() {
+        let store = Store::open_in_memory().unwrap();
+        let one = store.get_or_create_profile("one").unwrap();
+        let two = store.get_or_create_profile("two").unwrap();
+        store.save_profile_yaml(one.id, "old-one").unwrap();
+        store.save_profile_yaml(two.id, "old-two").unwrap();
+        let outputs = vec![
+            (one.id, None, "new-one".into()),
+            (two.id, None, "new-two".into()),
+        ];
+        store.save_profile_options(two.id, "changed").unwrap();
+        assert!(!store.save_generated_outputs(&outputs).unwrap());
+        assert_eq!(
+            store
+                .get_profile_by_token(&one.token)
+                .unwrap()
+                .unwrap()
+                .last_yaml
+                .as_deref(),
+            Some("old-one")
+        );
+        let outputs = vec![
+            (one.id, None, "new-one".into()),
+            (two.id, Some("changed".into()), "new-two".into()),
+        ];
+        store.conn.execute_batch(&format!("CREATE TRIGGER fail_output BEFORE UPDATE OF last_yaml ON profiles WHEN NEW.id={} BEGIN SELECT RAISE(FAIL,'injected failure'); END;", two.id)).unwrap();
+        assert!(store.save_generated_outputs(&outputs).is_err());
+        assert_eq!(
+            store
+                .get_profile_by_token(&one.token)
+                .unwrap()
+                .unwrap()
+                .last_yaml
+                .as_deref(),
+            Some("old-one")
+        );
+        assert_eq!(
+            store
+                .get_profile_by_token(&two.token)
+                .unwrap()
+                .unwrap()
+                .last_yaml
+                .as_deref(),
+            Some("old-two")
+        );
+    }
+
+    #[test]
+    fn changed_subscription_request_clears_validators_and_keeps_payload() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store
+            .add_subscription(&NewSubscription::url("test", "https://old.example/sub"))
+            .unwrap();
+        store
+            .save_fetch_success(
+                id,
+                "cached",
+                Some("old-etag"),
+                Some("old-date"),
+                &TrafficSnapshot::default(),
+                1,
+            )
+            .unwrap();
+        store
+            .update_subscription_meta(
+                id,
+                "renamed",
+                Some("https://old.example/sub"),
+                true,
+                60,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_subscription(id).unwrap().unwrap().etag.as_deref(),
+            Some("old-etag")
+        );
+        store
+            .update_subscription_meta(
+                id,
+                "renamed",
+                Some("https://new.example/sub"),
+                true,
+                60,
+                Some("custom-agent"),
+            )
+            .unwrap();
+        let subscription = store.get_subscription(id).unwrap().unwrap();
+        assert!(subscription.etag.is_none());
+        assert!(subscription.last_modified.is_none());
+        assert!(subscription.last_ok_at.is_none());
+        assert_eq!(subscription.payload.as_deref(), Some("cached"));
+    }
     #[test]
     fn profiles_preserve_identity_settings_and_last_profile() {
         let store = Store::open_in_memory().unwrap();

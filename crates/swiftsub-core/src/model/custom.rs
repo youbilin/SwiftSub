@@ -92,6 +92,8 @@ impl NodeFilter {
 pub struct CustomGroupSpec {
     pub name: String,
     #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
     pub kind: GroupKind,
     pub filter: NodeFilter,
 }
@@ -100,6 +102,7 @@ impl CustomGroupSpec {
     pub fn new(name: impl Into<String>, filter: NodeFilter) -> Self {
         Self {
             name: name.into(),
+            disabled: false,
             kind: GroupKind::Select,
             filter,
         }
@@ -109,6 +112,8 @@ impl CustomGroupSpec {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChainSpec {
     pub name: String,
+    #[serde(default)]
+    pub disabled: bool,
     #[serde(default)]
     pub entry_node: String,
     #[serde(default)]
@@ -131,6 +136,7 @@ impl ChainSpec {
     ) -> Self {
         Self {
             name: name.into(),
+            disabled: false,
             entry_node: entry_node.into(),
             entry_name: entry_name.into(),
             landing_node: landing_node.into(),
@@ -143,18 +149,46 @@ impl ChainSpec {
 /// A routing policy group with explicit group/policy members and optional all-node membership.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyGroupSpec {
+    #[serde(default)]
+    pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub disabled: bool,
+    /// Preserve a deleted catalog group's identity so it is not regenerated.
+    #[serde(default)]
+    pub removed: bool,
     #[serde(default)]
     pub kind: GroupKind,
     #[serde(default)]
     pub members: Vec<String>,
     #[serde(default)]
     pub include_all_nodes: bool,
-    /// Replace the generated group of the same name. Never creates a missing builtin.
+    /// Replace a catalog group, retaining its original name in `id` as `builtin:<name>`.
     #[serde(default)]
     pub builtin: bool,
     #[serde(default)]
     pub test_url: Option<String>,
     #[serde(default)]
     pub test_interval: Option<u32>,
+    #[serde(default)]
+    pub tolerance: Option<u32>,
+    #[serde(default)]
+    pub strategy: Option<String>,
+}
+
+impl PolicyGroupSpec {
+    /// The catalog identity stays stable when the visible name changes.
+    /// Older configurations without an identity still use their original name.
+    pub fn builtin_name(&self) -> Option<&str> {
+        self.builtin
+            .then(|| self.id.strip_prefix("builtin:").unwrap_or(&self.name))
+    }
+
+    pub fn ensure_id(&mut self) {
+        if self.builtin && !self.id.starts_with("builtin:") {
+            self.id = format!("builtin:{}", self.name);
+        }
+    }
 }

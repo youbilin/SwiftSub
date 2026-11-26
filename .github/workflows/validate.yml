@@ -1,0 +1,45 @@
+name: Validate Windows
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.0'
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: scripts/cargo-msvc.bat clippy --workspace --all-targets --locked -- -D warnings
+      - name: Functional regression
+        run: scripts/cargo-msvc.bat test --workspace --locked
+      - name: Generate and measure 100-node presets
+        run: scripts/cargo-msvc.bat run --release --locked -p swiftsub-core --example benchmark -- target/validation/profiles
+      - name: Mihomo configuration validation
+        shell: pwsh
+        run: |
+          $validationDir = Join-Path $PWD 'target/validation/mihomo'
+          New-Item -ItemType Directory -Force -Path $validationDir | Out-Null
+          Invoke-WebRequest 'https://github.com/MetaCubeX/mihomo/releases/download/v1.19.34/mihomo-windows-amd64-compatible-v1.19.34.zip' -OutFile "$validationDir/mihomo.zip"
+          Expand-Archive "$validationDir/mihomo.zip" -DestinationPath $validationDir
+          Invoke-WebRequest 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat' -OutFile "$validationDir/GeoSite.dat"
+          Invoke-WebRequest 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat' -OutFile "$validationDir/GeoIP.dat"
+          $mihomoPath = (Get-ChildItem $validationDir -Filter '*.exe').FullName
+          python scripts/validate-presets.py --mihomo $mihomoPath --data-dir $validationDir --profiles target/validation/profiles
+      - name: Desktop release build
+        run: scripts/cargo-msvc.bat build --release --locked -p swiftsub-app

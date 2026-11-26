@@ -112,10 +112,8 @@ pub fn merge_manual_proxies_yaml(
     new_proxies: Vec<Proxy>,
 ) -> Result<(String, usize)> {
     let mut all = Vec::new();
-    if let Some(existing) = existing
-        && let Ok(parsed) = parse_content(existing)
-    {
-        all.extend(parsed.proxies);
+    if let Some(existing) = existing.filter(|existing| !existing.trim().is_empty()) {
+        all.extend(parse_content(existing)?.proxies);
     }
     all.extend(new_proxies);
     let (merged, _) = dedupe_proxies(all);

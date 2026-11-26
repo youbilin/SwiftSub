@@ -15,7 +15,7 @@ fn main() {
         init(cx);
         cx.set_window_appearance(Some(WindowAppearance::Dark));
         Theme::change(ThemeMode::Dark, None, cx);
-        configure_theme(cx);
+        configure_theme(cx, false);
 
         let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
         let mut options = TitleBar::window_options();
@@ -34,20 +34,25 @@ fn main() {
     });
 }
 
-pub(crate) fn configure_theme(cx: &mut App) {
+pub(crate) fn configure_theme(cx: &mut App, light: bool) {
+    let (primary, hover, active) = if light {
+        (rgb(0x3b6ef5), rgb(0x2f5ee0), rgb(0x254fc7))
+    } else {
+        (rgb(0x5b8cff), rgb(0x4a7bf0), rgb(0x3d6de0))
+    };
     Theme::update(cx, |theme| {
         theme.font_family = "Microsoft YaHei UI".into();
         theme.font_size = px(14.0);
         theme.mono_font_family = "Consolas".into();
         theme.mono_font_size = px(13.0);
-        theme.primary = Hsla::from(rgb(0x5b8cff));
+        theme.primary = Hsla::from(primary);
         theme.primary_foreground = Hsla::from(rgb(0xffffff));
-        theme.primary_hover = Hsla::from(rgb(0x4a7bf0));
-        theme.primary_active = Hsla::from(rgb(0x3d6de0));
-        theme.button_primary = Hsla::from(rgb(0x5b8cff));
+        theme.primary_hover = Hsla::from(hover);
+        theme.primary_active = Hsla::from(active);
+        theme.button_primary = Hsla::from(primary);
         theme.button_primary_foreground = Hsla::from(rgb(0xffffff));
-        theme.button_primary_hover = Hsla::from(rgb(0x4a7bf0));
-        theme.button_primary_active = Hsla::from(rgb(0x3d6de0));
-        theme.tokens.primary = Hsla::from(rgb(0x5b8cff)).into();
+        theme.button_primary_hover = Hsla::from(hover);
+        theme.button_primary_active = Hsla::from(active);
+        theme.tokens.primary = Hsla::from(primary).into();
     });
 }

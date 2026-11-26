@@ -4950,12 +4950,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "qrcode"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
-
-[[package]]
 name = "quick-error"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6320,20 +6314,22 @@ dependencies = [
 name = "swiftsub-app"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "gpui-kit",
- "qrcode",
  "raw-window-handle",
  "rfd",
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sha2 0.10.9",
  "swiftsub-core",
  "swiftsub-fetch",
  "swiftsub-server",
  "swiftsub-store",
  "tray-icon",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -6351,13 +6347,17 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.21",
  "url",
+ "zstd",
 ]
 
 [[package]]
 name = "swiftsub-fetch"
 version = "0.1.0"
 dependencies = [
+ "encoding_rs",
  "reqwest",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tiny_http",
 ]
@@ -6370,6 +6370,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.21",
  "tiny_http",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8795,6 +8796,34 @@ dependencies = [
  "rustix",
  "socket2",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "zstd"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b04655dc7bf4abd8ebe23dac6bef20fceea52a29ad19e37a4101b3951d7e8b45"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df2575690b2a3eccad509fe7898cdde32a5afca06a06449ff4dcfb318c7b7281"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.2.0+zstd.1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3f4089cda6dda4dc43c43dd9f8964140064fd2f752f3da46c3a483c3c175160"
+dependencies = [
+ "cc",
+ "pkg-config",
 ]
 
 [[package]]
