@@ -3,6 +3,7 @@ mod layout;
 mod lifecycle;
 mod ordering;
 pub(crate) use ordering::{WorkspaceNodeKind, chain_order_key};
+pub mod phase2;
 mod profiles;
 mod publication;
 mod refresh;
@@ -323,6 +324,7 @@ pub enum ChainSide {
 
 pub struct SwiftSubApp {
     pub workspace: workspace::Workspace,
+    pub p1: phase2::Phase2State,
     pub upgrades: upgrades::Upgrades,
     pub desktop: crate::desktop::DesktopIntegration,
     pub close_to_tray: bool,
@@ -460,6 +462,7 @@ impl SwiftSubApp {
         cx: &mut Context<Self>,
     ) -> Self {
         let data_dir = data_dir();
+        let restore_notice = phase2::apply_pending_backup_restore(&data_dir);
         let db_path = data_dir.join("swiftsub.db");
         let (store, store_error) = match Store::open(&db_path) {
             Ok(store) => (store, None),
@@ -678,7 +681,9 @@ impl SwiftSubApp {
                 .searchable(true)
                 .placeholder("选择或保存一份 YAML 配置")
         });
+        let p1 = phase2::Phase2State::new(&store, window, cx);
         let mut app = Self {
+            p1,
             upgrades: upgrades::Upgrades::new(window, cx),
             desktop: crate::desktop::DesktopIntegration::new(window, instance),
             close_to_tray: false,
@@ -1003,6 +1008,9 @@ impl SwiftSubApp {
         }
         app.start_desktop_lifecycle(window, cx);
         app.refresh_lan_interfaces(cx);
+        if let Some(notice) = restore_notice {
+            app.show_toast(notice, cx);
+        }
         app.restore_draft(window, cx);
         if app.page == Page::Generator {
             app.open_template_dialog(window, cx);
@@ -1289,7 +1297,7 @@ impl SwiftSubApp {
                 url,
                 existing.name,
                 CacheValidators::default(),
-                FetchOptions::default(),
+                self.fetch_options(),
                 cx,
             );
             self.show_toast("订阅已存在，正在刷新原订阅".into(), cx);
@@ -1324,7 +1332,7 @@ impl SwiftSubApp {
                     url,
                     name,
                     CacheValidators::default(),
-                    FetchOptions::default(),
+                    self.fetch_options(),
                     cx,
                 );
             }
@@ -1542,22 +1550,26 @@ impl SwiftSubApp {
     }
 
     fn start_server(&mut self) {
-        let preferred_port = {
-            let store = lock_store(&self.store);
-            store
-                .get_setting("server_port")
-                .ok()
-                .flatten()
-                .and_then(|value| value.parse::<u16>().ok())
-        };
         let mut candidates = Vec::new();
-        if let Some(port) = preferred_port.filter(|port| *port > 0) {
-            candidates.push(port);
-        }
-        // Always include fallback ports outside Clash's 7890-7899 range, plus OS-assigned port 0.
-        for port in (17899..=17920).chain(7899..=7910).chain(std::iter::once(0)) {
-            if !candidates.contains(&port) {
+        if let Some(fixed_port) = self.p1.server_fixed_port {
+            candidates.push(fixed_port);
+        } else {
+            let preferred_port = {
+                let store = lock_store(&self.store);
+                store
+                    .get_setting("server_port")
+                    .ok()
+                    .flatten()
+                    .and_then(|value| value.parse::<u16>().ok())
+            };
+            if let Some(port) = preferred_port.filter(|port| *port > 0) {
                 candidates.push(port);
+            }
+            // Always include fallback ports outside Clash's 7890-7899 range, plus OS-assigned port 0.
+            for port in (17899..=17920).chain(7899..=7910).chain(std::iter::once(0)) {
+                if !candidates.contains(&port) {
+                    candidates.push(port);
+                }
             }
         }
 
@@ -1567,6 +1579,7 @@ impl SwiftSubApp {
                 port,
                 token: self.profile_token.clone(),
                 bind_lan: self.server_bind_lan,
+                lan_private_only: self.p1.server_lan_private_only,
                 update_interval_hours: 24,
             };
             let snapshot = ProfileSnapshot {
@@ -1659,14 +1672,15 @@ impl SwiftSubApp {
         self.update_error = None;
         let repo = self.update_repo.clone();
         let current = env!("CARGO_PKG_VERSION").to_string();
+        let fetch_opts = self.fetch_options();
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    swiftsub_fetch::check_github_release(&repo, &current, &FetchOptions::default())
-                })
-                .await;
+            let result =
+                cx.background_executor()
+                    .spawn(async move {
+                        swiftsub_fetch::check_github_release(&repo, &current, &fetch_opts)
+                    })
+                    .await;
             let _ = cx.update(|_, cx| {
                 let _ = this.update(cx, |this, cx| {
                     this.update_checking = false;

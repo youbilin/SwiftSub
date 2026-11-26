@@ -1,4 +1,5 @@
 mod layout;
+mod phase2;
 mod saved_configs;
 mod workspace;
 
@@ -88,7 +89,8 @@ fn rgba(color: u32) -> Rgba {
 
 impl SwiftSubApp {
     fn has_blocking_modal(&self) -> bool {
-        self.add_open
+        self.p1.has_modal()
+            || self.add_open
             || self.node_rename_key.is_some()
             || self.custom_dialog != CustomDialog::None
             || self.generated_save_open
@@ -267,7 +269,21 @@ impl Render for SwiftSubApp {
                         cx.stop_propagation();
                         return;
                     }
-                    if this.workspace.confirm_delete_config.take().is_some() {
+                    if this.p1.qr_modal.take().is_some()
+                        || this.p1.history_modal.take().is_some()
+                        || this.p1.backup_preview.take().is_some()
+                    {
+                        cx.notify();
+                        cx.stop_propagation();
+                    } else if this.p1.batch_rename_open {
+                        this.p1.batch_rename_open = false;
+                        cx.notify();
+                        cx.stop_propagation();
+                    } else if this.p1.sub_logs_open {
+                        this.p1.sub_logs_open = false;
+                        cx.notify();
+                        cx.stop_propagation();
+                    } else if this.workspace.confirm_delete_config.take().is_some() {
                         cx.notify();
                         cx.stop_propagation();
                     } else if this.workspace.rule_content_id.is_some() {
@@ -365,6 +381,7 @@ impl Render for SwiftSubApp {
                 self.workspace.confirm_delete_config.clone(),
                 |this, config_id| this.child(self.confirm_delete_config_dialog(config_id, cx)),
             )
+            .children(self.render_p1_modals(cx))
             .when_some(self.toast.clone(), |this, toast| {
                 this.child(
                     div()

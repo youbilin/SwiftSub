@@ -3,6 +3,7 @@ mod group;
 mod node;
 mod proxy;
 mod rule;
+mod share_link;
 
 pub use custom::{ChainSpec, CustomGroupSpec, NodeFilter, PolicyGroupSpec};
 pub use group::{GroupKind, ProxyGroup};

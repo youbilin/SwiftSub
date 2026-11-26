@@ -241,6 +241,63 @@ impl Store {
         }
         Ok(())
     }
+
+    /// Rotate a saved configuration's UUID token while preserving its YAML, metadata,
+    /// and revision history, replacing the on-disk YAML file atomically.
+    pub fn rotate_saved_config_id(&self, directory: &Path, old_id: &str) -> Result<SavedConfig> {
+        Uuid::parse_str(old_id).map_err(|_| Error::new(ErrorKind::InvalidInput, "无效配置 ID"))?;
+        let existing: SavedConfig = self
+            .conn
+            .query_row(
+                "SELECT id,name,yaml,source_json,created_at,updated_at FROM saved_configs WHERE id=?1",
+                [old_id],
+                row_config,
+            )
+            .map_err(|_| Error::new(ErrorKind::NotFound, "配置不存在"))?;
+        let new_id = Uuid::new_v4().simple().to_string();
+        let now = now_ts();
+        let updated = SavedConfig {
+            id: new_id.clone(),
+            name: existing.name.clone(),
+            yaml: existing.yaml.clone(),
+            source_json: existing.source_json.clone(),
+            created_at: existing.created_at,
+            updated_at: now,
+        };
+        fs::create_dir_all(directory)?;
+        let old_path = existing.path(directory);
+        let new_path = updated.path(directory);
+        atomic_yaml(&new_path, &updated.yaml)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let db_result = (|| -> Result<()> {
+            tx.execute(
+                "INSERT INTO saved_configs(id,name,yaml,source_json,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    updated.id,
+                    updated.name,
+                    updated.yaml,
+                    updated.source_json,
+                    updated.created_at,
+                    updated.updated_at
+                ],
+            )?;
+            tx.execute(
+                "UPDATE config_revisions SET config_id=?1 WHERE config_id=?2",
+                params![updated.id, old_id],
+            )?;
+            tx.execute("DELETE FROM saved_configs WHERE id=?1", [old_id])?;
+            tx.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = db_result {
+            let _ = fs::remove_file(&new_path);
+            return Err(error);
+        }
+        if old_path.exists() {
+            let _ = fs::remove_file(&old_path);
+        }
+        Ok(updated)
+    }
     // Rebuild missing files after migration; existing files may contain external edits.
     pub fn repair_saved_config_files(&self, directory: &Path) -> Result<()> {
         let configs = self.list_saved_configs()?;
@@ -594,5 +651,36 @@ mod tests {
         store.repair_saved_config_files(&dir).unwrap();
         assert_eq!(fs::read_to_string(saved.path(&dir)).unwrap(), "proxies: []");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rotate_config_id_preserves_yaml_history_and_replaces_file() {
+        let root =
+            std::env::temp_dir().join(format!("swiftsub-rotate-{}", Uuid::new_v4().simple()));
+        let dir = root.join("configs");
+        let store = Store::open_in_memory().unwrap();
+        let first = store
+            .save_yaml_config(&dir, None, "home", "proxies: [a]", Some("meta"))
+            .unwrap();
+        store
+            .save_yaml_config(&dir, Some(&first.id), "home", "proxies: [b]", Some("meta"))
+            .unwrap();
+        assert!(first.path(&dir).exists());
+
+        let rotated = store.rotate_saved_config_id(&dir, &first.id).unwrap();
+        assert_ne!(rotated.id, first.id);
+        assert_eq!(rotated.name, "home");
+        assert_eq!(rotated.yaml, "proxies: [b]");
+        assert!(!first.path(&dir).exists());
+        assert_eq!(
+            fs::read_to_string(rotated.path(&dir)).unwrap(),
+            "proxies: [b]"
+        );
+        assert_eq!(store.list_saved_configs().unwrap().len(), 1);
+        assert_eq!(store.list_saved_configs().unwrap()[0].id, rotated.id);
+        assert!(store.config_history(&first.id).unwrap().is_empty());
+        assert!(!store.config_history(&rotated.id).unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(root);
     }
 }

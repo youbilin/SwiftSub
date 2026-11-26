@@ -145,7 +145,7 @@ impl SwiftSubApp {
             etag: subscription.etag.clone(),
             last_modified: subscription.last_modified.clone(),
         };
-        let mut options = FetchOptions::default();
+        let mut options = self.fetch_options();
         if let Some(user_agent) = subscription.user_agent {
             options.user_agent = user_agent;
         }

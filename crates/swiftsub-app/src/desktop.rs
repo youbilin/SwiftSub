@@ -342,6 +342,88 @@ fn registry_command() -> std::process::Command {
     cmd
 }
 
+#[cfg(windows)]
+const AUTO_START_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(windows)]
+const AUTO_START_VALUE_NAME: &str = "SwiftSub";
+
+/// Returns whether Windows user-level background auto-start is currently registered.
+pub fn is_auto_start_enabled() -> bool {
+    #[cfg(windows)]
+    {
+        registry_command()
+            .args(["query", AUTO_START_RUN_KEY, "/v", AUTO_START_VALUE_NAME])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Enable or disable Windows login auto-start (`--background`, minimized to tray).
+pub fn set_auto_start(enabled: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        if enabled {
+            let exe = std::env::current_exe()
+                .map_err(|error| format!("无法获取当前程序路径：{error}"))?;
+            let command = format!("\"{}\" --background", exe.display());
+            let output = registry_command()
+                .args([
+                    "add",
+                    AUTO_START_RUN_KEY,
+                    "/v",
+                    AUTO_START_VALUE_NAME,
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    &command,
+                    "/f",
+                ])
+                .output()
+                .map_err(|error| format!("调用注册表失败：{error}"))?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err("写入开机自启注册表项失败".into())
+            }
+        } else {
+            let output = registry_command()
+                .args([
+                    "delete",
+                    AUTO_START_RUN_KEY,
+                    "/v",
+                    AUTO_START_VALUE_NAME,
+                    "/f",
+                ])
+                .output()
+                .map_err(|error| format!("调用注册表失败：{error}"))?;
+            if output.status.success() || !is_auto_start_enabled() {
+                Ok(())
+            } else {
+                Err("移除开机自启注册表项失败".into())
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = enabled;
+        Err("当前平台暂不支持开机自启".into())
+    }
+}
+
+/// Build a ready-to-run Windows Firewall inbound allow command for the current executable and port.
+pub fn lan_firewall_command(port: u16) -> String {
+    let exe = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "swiftsub.exe".to_string());
+    format!(
+        "netsh advfirewall firewall add rule name=\"SwiftSub LAN ({port})\" dir=in action=allow program=\"{exe}\" protocol=TCP localport={port} profile=private"
+    )
+}
+
 /// Open the registered Verge handler, with support for its legacy Clash scheme.
 pub fn open_clash_verge(uri: &str) -> Result<(), String> {
     #[cfg(windows)]

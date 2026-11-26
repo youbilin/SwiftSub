@@ -43,7 +43,10 @@ pub(crate) fn is_builtin_rule(id: &str) -> bool {
         })
 }
 
-fn fetch_many(bindings: Vec<RuleSetBinding>) -> Vec<(String, Result<Vec<String>, String>)> {
+fn fetch_many(
+    bindings: Vec<RuleSetBinding>,
+    options: &FetchOptions,
+) -> Vec<(String, Result<Vec<String>, String>)> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);
     let results = Mutex::new(Vec::new());
@@ -55,7 +58,7 @@ fn fetch_many(bindings: Vec<RuleSetBinding>) -> Vec<(String, Result<Vec<String>,
                     let Some(binding) = bindings.get(index) else {
                         break;
                     };
-                    let result = fetch_rule_payload(binding);
+                    let result = fetch_rule_payload(binding, options);
                     results
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner())
@@ -136,13 +139,14 @@ impl SwiftSubApp {
         self.workspace.rule_updates_error = None;
         cx.notify();
         let store = Arc::clone(&self.store);
+        let fetch_opts = self.fetch_options();
         cx.spawn(async move |this, cx| {
             let (updated, errors) = cx
                 .background_executor()
                 .spawn(async move {
                     let mut updated = Vec::new();
                     let mut errors = Vec::new();
-                    for (key, result) in fetch_many(bindings) {
+                    for (key, result) in fetch_many(bindings, &fetch_opts) {
                         match result.and_then(|payload| {
                             save_cache(
                                 &*store.lock().map_err(|error| error.to_string())?,
@@ -223,13 +227,14 @@ impl SwiftSubApp {
         self.workspace.rule_content_loading = true;
         self.workspace.rule_content_error = None;
         cx.notify();
+        let fetch_opts = self.fetch_options();
         cx.spawn_in(window, async move |this, cx| {
             let fetch = binding.clone();
             let cache_key = key.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let payload = fetch_rule_payload(&fetch)?;
+                    let payload = fetch_rule_payload(&fetch, &fetch_opts)?;
                     save_cache(
                         &*store.lock().map_err(|error| error.to_string())?,
                         &cache_key,

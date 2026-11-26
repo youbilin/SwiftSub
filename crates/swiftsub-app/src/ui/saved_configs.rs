@@ -1,6 +1,7 @@
 use super::layout::{
     configuration_icon, disclosure_icon, grip_icon, lan_icon, link_icon, swap_icon,
 };
+use super::phase2::{history_icon, qr_icon};
 use super::*;
 use crate::app::SavedEditorTab;
 use crate::saved_document::{SavedDocument, rule_target, text};
@@ -111,7 +112,16 @@ impl SwiftSubApp {
                 )
                 .when_some(self.saved_config_id.clone(), |row, id| {
                     let lan_id = id.clone();
+                    let qr_id = id.clone();
+                    let hist_id = id.clone();
                     row.child(object_action(
+                        "saved-history",
+                        history_icon(),
+                        "历史版本与回滚",
+                        cx,
+                        move |this, _, cx| this.open_config_history(hist_id.clone(), cx),
+                    ))
+                    .child(object_action(
                         "saved-copy-subscription",
                         link_icon(),
                         "复制本机订阅地址",
@@ -128,6 +138,13 @@ impl SwiftSubApp {
                                     this.copy_config_lan_subscription(lan_id.clone(), cx)
                                 })),
                         )
+                        .child(object_action(
+                            "saved-lan-qr",
+                            qr_icon(),
+                            "扫码导入（局域网二维码）",
+                            cx,
+                            move |this, _, cx| this.open_config_lan_qr(qr_id.clone(), cx),
+                        ))
                     })
                 })
                 .child(

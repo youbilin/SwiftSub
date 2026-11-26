@@ -335,10 +335,13 @@ pub fn workspace_category(id: &str) -> &'static str {
     }
 }
 
-fn fetch_rule_payload(binding: &RuleSetBinding) -> Result<Vec<String>, String> {
+fn fetch_rule_payload(
+    binding: &RuleSetBinding,
+    options: &FetchOptions,
+) -> Result<Vec<String>, String> {
     let mut urls = vec![binding.url.clone()];
     if binding.format == "mrs" {
-        if let Ok(bytes) = swiftsub_fetch::fetch_rule_bytes(&binding.url, &FetchOptions::default())
+        if let Ok(bytes) = swiftsub_fetch::fetch_rule_bytes(&binding.url, options)
             && let Ok(payload) =
                 swiftsub_core::generator::decode_mrs_payload(&bytes, &binding.behavior)
         {
@@ -357,7 +360,7 @@ fn fetch_rule_payload(binding: &RuleSetBinding) -> Result<Vec<String>, String> {
     }
     let mut last_error = String::new();
     for url in urls {
-        match fetch_subscription(&url, &FetchOptions::default(), &CacheValidators::default()) {
+        match fetch_subscription(&url, options, &CacheValidators::default()) {
             Ok(FetchOutcome::Fetched(result)) => {
                 match swiftsub_core::generator::parse_rule_set_payload(
                     &result.content,
@@ -1161,10 +1164,11 @@ impl SwiftSubApp {
         self.workspace
             .rule_content
             .update(cx, |s, cx| s.set_value("", window, cx));
+        let fetch_opts = self.fetch_options();
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { fetch_rule_payload(&binding) })
+                .spawn(async move { fetch_rule_payload(&binding, &fetch_opts) })
                 .await;
             let _ = cx.update(|window, cx| {
                 this.update(cx, |this, cx| {

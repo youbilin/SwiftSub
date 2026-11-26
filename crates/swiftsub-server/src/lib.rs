@@ -20,6 +20,7 @@ pub struct ServerConfig {
     pub port: u16,
     pub token: String,
     pub bind_lan: bool,
+    pub lan_private_only: bool,
     pub update_interval_hours: u32,
 }
 
@@ -29,6 +30,7 @@ impl Default for ServerConfig {
             port: 7899,
             token: String::new(),
             bind_lan: false,
+            lan_private_only: true,
             update_interval_hours: 24,
         }
     }
@@ -87,6 +89,7 @@ pub enum ServerError {
 pub struct LocalServer {
     addr: SocketAddr,
     bind_lan: bool,
+    lan_private_only: bool,
     token: String,
     server: Arc<Server>,
     shutdown: Arc<AtomicBool>,
@@ -122,6 +125,22 @@ pub fn is_disallowed_lan_ipv4(ip: Ipv4Addr) -> bool {
 fn is_cgnat(ip: Ipv4Addr) -> bool {
     let [a, b, ..] = ip.octets();
     a == 100 && (64..=127).contains(&b)
+}
+
+/// Returns true when an incoming peer IP belongs to loopback, RFC 1918 private LAN,
+/// link-local, CGNAT/Tailscale (`100.64.0.0/10`), or IPv6 ULA/link-local space.
+pub fn is_private_or_local_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || is_cgnat(v4)
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_private_or_local_ip(std::net::IpAddr::V4(mapped));
+            }
+            v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local()
+        }
+    }
 }
 
 fn is_virtual_adapter_name(name: &str, description: &str) -> bool {
@@ -424,6 +443,7 @@ impl LocalServer {
         let token = config.token.clone();
         let pulls: PullState = Arc::new(RwLock::new(HashMap::new()));
 
+        let enforce_private = config.bind_lan && config.lan_private_only;
         let (tx, rx) = mpsc::sync_channel::<Request>(REQUEST_QUEUE_CAPACITY);
         let shared_rx = Arc::new(Mutex::new(rx));
         let mut workers = Vec::with_capacity(WORKER_COUNT);
@@ -440,7 +460,7 @@ impl LocalServer {
                             guard.recv()
                         };
                         match next {
-                            Ok(request) => handle_request(request, &state, &pulls),
+                            Ok(request) => handle_request(request, &state, &pulls, enforce_private),
                             Err(_) => break,
                         }
                     }
@@ -475,6 +495,7 @@ impl LocalServer {
         Ok(Self {
             addr,
             bind_lan: config.bind_lan,
+            lan_private_only: config.lan_private_only,
             token,
             server,
             shutdown,
@@ -491,6 +512,10 @@ impl LocalServer {
 
     pub fn is_lan_enabled(&self) -> bool {
         self.bind_lan
+    }
+
+    pub fn is_lan_private_only(&self) -> bool {
+        self.lan_private_only
     }
 
     pub fn token(&self) -> &str {
@@ -612,7 +637,15 @@ fn handle_request(
     request: Request,
     state: &Arc<RwLock<HashMap<String, Arc<PublishedProfile>>>>,
     pulls: &PullState,
+    enforce_private: bool,
 ) {
+    if enforce_private
+        && let Some(peer) = request.remote_addr()
+        && !is_private_or_local_ip(peer.ip())
+    {
+        let _ = request.respond(Response::empty(StatusCode(403)));
+        return;
+    }
     if request.method() != &Method::Get && request.method() != &Method::Head {
         let _ = request.respond(Response::empty(StatusCode(405)));
         return;
@@ -860,6 +893,7 @@ mod tests {
             token: "test-token".into(),
             bind_lan: false,
             update_interval_hours: 12,
+            ..Default::default()
         };
         let snapshot = ProfileSnapshot {
             yaml: "proxies: []\nrules:\n  - MATCH,DIRECT\n".into(),
@@ -916,6 +950,7 @@ mod tests {
                 token: "one".into(),
                 bind_lan: false,
                 update_interval_hours: 24,
+                ..Default::default()
             },
             ProfileSnapshot::default(),
         )
@@ -954,6 +989,7 @@ mod tests {
                 token: "lan-token".into(),
                 bind_lan: true,
                 update_interval_hours: 24,
+                ..Default::default()
             },
             ProfileSnapshot {
                 yaml: "proxies: []\nrules:\n  - MATCH,DIRECT\n".into(),
@@ -1031,6 +1067,7 @@ mod tests {
                 token: "pool-token".into(),
                 bind_lan: false,
                 update_interval_hours: 24,
+                ..Default::default()
             },
             ProfileSnapshot {
                 yaml: "proxies: []\nrules:\n  - MATCH,DIRECT\n".into(),
@@ -1068,6 +1105,37 @@ mod tests {
         assert!(request(addr, "/sub/pool-token/a/b.yaml", "").starts_with("HTTP/1.1 404"));
 
         drop(slow_peer);
+    }
+
+    #[test]
+    fn classifies_private_and_public_peer_addresses() {
+        use std::net::{IpAddr, Ipv6Addr};
+        assert!(is_private_or_local_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(is_private_or_local_ip(IpAddr::V4(Ipv4Addr::new(
+            192, 168, 1, 10
+        ))));
+        assert!(is_private_or_local_ip(IpAddr::V4(Ipv4Addr::new(
+            10, 0, 0, 5
+        ))));
+        assert!(is_private_or_local_ip(IpAddr::V4(Ipv4Addr::new(
+            172, 16, 0, 2
+        ))));
+        assert!(is_private_or_local_ip(IpAddr::V4(Ipv4Addr::new(
+            100, 100, 10, 2
+        ))));
+        assert!(!is_private_or_local_ip(IpAddr::V4(Ipv4Addr::new(
+            8, 8, 8, 8
+        ))));
+        assert!(!is_private_or_local_ip(IpAddr::V4(Ipv4Addr::new(
+            1, 1, 1, 1
+        ))));
+        assert!(is_private_or_local_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(is_private_or_local_ip(IpAddr::V6(
+            "fd12:3456:789a::1".parse().unwrap()
+        )));
+        assert!(!is_private_or_local_ip(IpAddr::V6(
+            "2606:4700:4700::1111".parse().unwrap()
+        )));
     }
 
     fn response_etag(response: &str) -> String {

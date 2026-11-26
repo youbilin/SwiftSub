@@ -2,6 +2,7 @@
 
 mod app;
 mod desktop;
+mod qr;
 mod rule_catalog;
 mod saved_document;
 mod ui;

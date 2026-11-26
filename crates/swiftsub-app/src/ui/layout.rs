@@ -1,3 +1,4 @@
+use super::phase2::{history_icon, logs_icon, qr_icon, rotate_icon};
 use super::*;
 use crate::app::{WorkspaceNodeKind, chain_order_key};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -312,6 +313,7 @@ impl SwiftSubApp {
                     .into_any_element(),
             );
         }
+        rows.extend(self.lan_p1_settings_rows(cx));
         rows.extend([
             info_row(
                 "更新方式",
@@ -327,6 +329,8 @@ impl SwiftSubApp {
         for config in &self.saved_configs {
             let id = config.id.clone();
             let lan_id = config.id.clone();
+            let qr_id = config.id.clone();
+            let rotate_id = config.id.clone();
             let lan_url = self.config_lan_subscription_url(&config.id);
             rows.push(
                 h_flex()
@@ -400,7 +404,23 @@ impl SwiftSubApp {
                                     this.copy_config_lan_subscription(lan_id.clone(), cx)
                                 })),
                         )
+                        .child(object_action(
+                            format!("settings-config-qr-{qr_id}"),
+                            qr_icon(),
+                            "扫码导入（局域网二维码）",
+                            cx,
+                            move |this, _, cx| this.open_config_lan_qr(qr_id.clone(), cx),
+                        ))
                     })
+                    .child(object_action(
+                        format!("settings-config-rotate-{rotate_id}"),
+                        rotate_icon(),
+                        "重置订阅地址（旧链接将失效）",
+                        cx,
+                        move |this, window, cx| {
+                            this.rotate_saved_config_token(rotate_id.clone(), window, cx)
+                        },
+                    ))
                     .into_any_element(),
             );
         }
@@ -434,7 +454,7 @@ impl SwiftSubApp {
                 .into_any_element(),
         );
 
-        let app_behavior_rows = vec![
+        let mut app_behavior_rows = vec![
             h_flex()
                 .min_w_0()
                 .py(px(6.))
@@ -500,6 +520,7 @@ impl SwiftSubApp {
                 )
                 .into_any_element(),
         ];
+        app_behavior_rows.extend(self.app_behavior_p1_rows(cx));
 
         let mut update_rows = vec![
             info_row("当前版本", format!("v{}", env!("CARGO_PKG_VERSION")), true),
@@ -573,6 +594,7 @@ impl SwiftSubApp {
             .min_w_0()
             .gap_4()
             .child(settings_section("应用行为", app_behavior_rows, div()))
+            .child(self.fetch_proxy_settings_section(cx))
             .child(settings_section("本地与局域网订阅", rows, div()))
             .child(settings_section(
                 "版本与更新",
@@ -908,8 +930,15 @@ impl SwiftSubApp {
                                 cx.listener(|this, _, window, cx| this.open_add_dialog(window, cx)),
                             ),
                     )
+                    .child(object_action(
+                        "editor-sub-logs",
+                        logs_icon(),
+                        "订阅状态与刷新日志",
+                        cx,
+                        |this, _, cx| this.open_sub_logs(cx),
+                    ))
                     .when(total > 0, |row| {
-                        row.child(
+                        row.child(self.node_batch_menu(cx)).child(
                             div()
                                 .text_size(px(11.5))
                                 .text_color(rgb(MUTED))
@@ -971,6 +1000,7 @@ impl SwiftSubApp {
                             .rounded(px(6.))
                             .invisible()
                             .group_hover(group_id, |style| style.visible())
+                            .child(self.node_share_action(key.clone(), cx))
                             .child(object_action(
                                 format!("rename-node-{key}"),
                                 edit_icon(),
@@ -1832,6 +1862,18 @@ impl SwiftSubApp {
                                         format_timestamp(Some(config.updated_at))
                                     ))
                                     .child(object_action(
+                                        format!("library-history-{copy_id}"),
+                                        history_icon(),
+                                        "历史版本与回滚",
+                                        cx,
+                                        {
+                                            let hist_id = copy_id.clone();
+                                            move |this, _, cx| {
+                                                this.open_config_history(hist_id.clone(), cx)
+                                            }
+                                        },
+                                    ))
+                                    .child(object_action(
                                         format!("library-link-{copy_id}"),
                                         link_icon(),
                                         "复制本机订阅地址",
@@ -1841,6 +1883,7 @@ impl SwiftSubApp {
                                         },
                                     ))
                                     .when(self.server_bind_lan, |row| {
+                                        let qr_id = copy_lan_id.clone();
                                         row.child(
                                             Button::new(format!("library-lan-{copy_lan_id}"))
                                                 .outline()
@@ -1852,6 +1895,17 @@ impl SwiftSubApp {
                                                         cx,
                                                     )
                                                 })),
+                                        )
+                                        .child(
+                                            object_action(
+                                                format!("library-qr-{qr_id}"),
+                                                qr_icon(),
+                                                "扫码导入（局域网二维码）",
+                                                cx,
+                                                move |this, _, cx| {
+                                                    this.open_config_lan_qr(qr_id.clone(), cx)
+                                                },
+                                            ),
                                         )
                                     }),
                             ),
