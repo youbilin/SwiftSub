@@ -65,10 +65,37 @@ impl PublicationWorker {
 }
 
 fn rebuild(revision: u64, job: PublishJob, shared_revision: &Mutex<u64>) -> Result<(), String> {
-    let profiles = {
+    let (profiles, overrides_by_source, deleted_nodes, global_defaults, base_rule_url) = {
         let store = job.store.lock().map_err(|error| error.to_string())?;
-        store.list_profiles().map_err(|error| error.to_string())?
+        let profiles = store.list_profiles().map_err(|error| error.to_string())?;
+        let mut overrides = HashMap::new();
+        for sub in job.subscriptions.iter().filter(|s| s.enabled) {
+            if let Ok(map) = store.list_node_overrides(sub.id) {
+                overrides.insert(sub.id, map);
+            }
+        }
+        let deleted: HashSet<String> = store
+            .get_setting("deleted_nodes")
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default();
+        let defaults = store
+            .get_setting("generation_defaults")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str::<workspace::GenerationDefaults>(&s).ok());
+        let rule_url = store
+            .get_setting("rule_provider_base_url")
+            .ok()
+            .flatten()
+            .filter(|s| !s.trim().is_empty());
+        (profiles, overrides, deleted, defaults, rule_url)
     };
+    let mut base_options = GenerateOptions::default();
+    if let Some(url) = base_rule_url {
+        base_options.rule_provider_base_url = url;
+    }
     let mut published = job.snapshots.clone();
     let mut outputs = Vec::new();
     for profile in profiles
@@ -89,47 +116,28 @@ fn rebuild(revision: u64, job: PublishJob, shared_revision: &Mutex<u64>) -> Resu
         let userinfo = config.as_ref().and_then(|config| {
             profiles::profile_userinfo(&job.subscriptions, config.membership.as_ref())
         });
-        let generated = config
-            .and_then(|config| {
-                let mut options = config
-                    .routing
-                    .generate_options(&GenerateOptions::default())
-                    .ok()?;
-                if let Some(defaults) = workspace::GenerationDefaults::from_store(&job.store) {
-                    defaults.apply(&mut options);
-                }
-                let overrides_by_source = {
-                    let store = job.store.lock().ok()?;
-                    let mut values = HashMap::new();
-                    for sub in &job.subscriptions {
-                        values.insert(sub.id, store.list_node_overrides(sub.id).ok()?);
-                    }
-                    values
-                };
-                let deleted_nodes: HashSet<String> = job
-                    .store
-                    .lock()
-                    .ok()
-                    .and_then(|store| store.get_setting("deleted_nodes").ok().flatten())
-                    .and_then(|value| serde_json::from_str(&value).ok())
-                    .unwrap_or_default();
-                let mut nodes = Vec::new();
-                for sub in job.subscriptions.iter().filter(|s| {
-                    s.enabled
-                        && config
-                            .membership
-                            .as_ref()
-                            .is_none_or(|ids| ids.contains(&s.id))
-                }) {
-                    if let Some(parsed) = sub
-                        .payload
-                        .as_deref()
-                        .and_then(|p| job.parsed_sources.parse(sub.id, p).ok())
-                    {
-                        let mut imported =
-                            build_nodes(parsed.proxies, sub.id.to_string(), sub.name.clone());
-                        imported.retain(|n| !deleted_nodes.contains(&n.source_key));
-                        let overrides = &overrides_by_source[&sub.id];
+        let fresh_yaml = config.and_then(|config| {
+            let mut options = config.routing.generate_options(&base_options).ok()?;
+            if let Some(defaults) = &global_defaults {
+                defaults.apply(&mut options);
+            }
+            let mut nodes = Vec::new();
+            for sub in job.subscriptions.iter().filter(|s| {
+                s.enabled
+                    && config
+                        .membership
+                        .as_ref()
+                        .is_none_or(|ids| ids.contains(&s.id))
+            }) {
+                if let Some(parsed) = sub
+                    .payload
+                    .as_deref()
+                    .and_then(|p| job.parsed_sources.parse(sub.id, p).ok())
+                {
+                    let mut imported =
+                        build_nodes(parsed.proxies, sub.id.to_string(), sub.name.clone());
+                    imported.retain(|n| !deleted_nodes.contains(&n.source_key));
+                    if let Some(overrides) = overrides_by_source.get(&sub.id) {
                         for n in &mut imported {
                             if let Some(o) = overrides.get(&n.source_key) {
                                 if let Some(extras) = &o.extras
@@ -146,31 +154,33 @@ fn rebuild(revision: u64, job: PublishJob, shared_revision: &Mutex<u64>) -> Resu
                                 n.listen_port = o.listen_port;
                             }
                         }
-                        for n in &mut imported {
-                            n.region = detect_region(n.name());
-                        }
-                        nodes.extend(imported);
                     }
+                    for n in &mut imported {
+                        n.region = detect_region(n.name());
+                    }
+                    nodes.extend(imported);
                 }
-                let mut seen = HashSet::new();
-                nodes.retain(|n| seen.insert(n.proxy.identity_key()));
-                let node_order = config.node_order.as_ref().unwrap_or(&job.node_order);
-                if !node_order.is_empty() {
-                    let positions: HashMap<_, _> =
-                        node_order.iter().enumerate().map(|(i, k)| (k, i)).collect();
-                    nodes.sort_by_key(|n| {
-                        positions.get(&n.source_key).copied().unwrap_or(usize::MAX)
-                    });
-                }
-                generate_profile(&nodes, &options).ok().map(|p| p.yaml)
-            })
-            .or_else(|| profile.last_yaml.clone())
-            .unwrap_or_default();
-        outputs.push((profile.id, profile.options_json, generated.clone()));
+            }
+            let mut seen = HashSet::new();
+            nodes.retain(|n| seen.insert(n.proxy.identity_key()));
+            let node_order = config.node_order.as_ref().unwrap_or(&job.node_order);
+            if !node_order.is_empty() {
+                let positions: HashMap<_, _> =
+                    node_order.iter().enumerate().map(|(i, k)| (k, i)).collect();
+                nodes.sort_by_key(|n| positions.get(&n.source_key).copied().unwrap_or(usize::MAX));
+            }
+            generate_profile(&nodes, &options).ok().map(|p| p.yaml)
+        });
+        let served_yaml = if let Some(yaml) = fresh_yaml {
+            outputs.push((profile.id, profile.options_json, yaml.clone()));
+            yaml
+        } else {
+            profile.last_yaml.clone().unwrap_or_default()
+        };
         published.insert(
             profile.token,
             ProfileSnapshot {
-                yaml: generated,
+                yaml: served_yaml,
                 userinfo_header: userinfo,
                 update_interval_hours: 24,
             },

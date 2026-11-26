@@ -341,10 +341,14 @@ impl SwiftSubApp {
         }
     }
     pub(super) fn refresh_config_summaries(&mut self) {
+        use std::hash::{Hash as _, Hasher as _};
         let mut next_cache = HashMap::with_capacity(self.saved_configs.len());
         let mut next_summaries = HashMap::with_capacity(self.saved_configs.len());
         for config in &self.saved_configs {
-            let fingerprint = (config.updated_at, config.yaml.len());
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            config.yaml.hash(&mut hasher);
+            config.source_json.hash(&mut hasher);
+            let fingerprint = (config.updated_at, config.yaml.len(), hasher.finish());
             let summary = self
                 .p1
                 .summary_cache
@@ -791,6 +795,11 @@ impl SwiftSubApp {
             self.show_toast("配置和独立 YAML 文件已保存".into(), cx);
             return true;
         }
+        if name.is_empty() {
+            self.saved_config_error = Some("请输入配置名称".into());
+            cx.notify();
+            return false;
+        }
         let result = validate_yaml(&yaml).and_then(|_| {
             let source = super::saved_editor::saved_edit_source(
                 &config,
@@ -905,7 +914,25 @@ impl SwiftSubApp {
             lock_store(&self.store).delete_saved_config(&self.data_dir.join("configs"), &id);
         match result {
             Ok(()) => {
-                let _ = lock_store(&self.store).set_setting(&format!("yaml-editor:{id}"), "");
+                {
+                    let store = lock_store(&self.store);
+                    for prefix in [
+                        "yaml-editor",
+                        "visual-meta",
+                        "visual-form",
+                        "generation-draft",
+                    ] {
+                        let _ = store.set_setting(&format!("{prefix}:{id}"), "");
+                    }
+                    if self
+                        .generated_saved_config
+                        .as_ref()
+                        .is_some_and(|config| config.id == id)
+                    {
+                        let _ =
+                            store.set_setting(&format!("generated-target:{}", self.profile_id), "");
+                    }
+                }
                 if self.saved_config_id.as_ref() == Some(&id) {
                     self.saved_config_id = None;
                     self.workspace.saved_editor_open = false;

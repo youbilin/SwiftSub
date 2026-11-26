@@ -66,7 +66,7 @@ pub struct Phase2State {
     pub sub_logs_open: bool,
     pub refresh_logs: Vec<RefreshLog>,
     pub theme_mode: crate::ui::AppThemeMode,
-    pub summary_cache: HashMap<String, ((i64, usize), workspace::ConfigSummary)>,
+    pub summary_cache: HashMap<String, ((i64, usize, u64), workspace::ConfigSummary)>,
     pub mihomo_binary_path: Option<PathBuf>,
     pub mihomo_checking: bool,
 }
@@ -181,18 +181,35 @@ pub(super) fn apply_pending_backup_restore(data_dir: &Path) -> Option<String> {
     }
     let db_path = data_dir.join("swiftsub.db");
     let bak_path = data_dir.join("swiftsub.db.bak");
-    for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(data_dir.join(format!("swiftsub.db{suffix}")));
-        let _ = std::fs::remove_file(data_dir.join(format!("restore-pending.db{suffix}")));
-    }
     if db_path.exists() {
+        // Flush any uncheckpointed WAL transactions into swiftsub.db before backing it up.
+        if let Ok(live) = Store::open(&db_path) {
+            drop(live);
+        }
         let _ = std::fs::remove_file(&bak_path);
         if let Err(error) = std::fs::rename(&db_path, &bak_path) {
             return Some(format!("备份旧数据失败，未执行恢复：{error}"));
         }
     }
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(data_dir.join(format!("swiftsub.db{suffix}")));
+        let _ = std::fs::remove_file(data_dir.join(format!("restore-pending.db{suffix}")));
+    }
     match std::fs::rename(&pending, &db_path) {
-        Ok(()) => Some("已从备份恢复全部数据（原数据库已保留为 swiftsub.db.bak）".into()),
+        Ok(()) => {
+            // Remove stale YAML files from before restore so repair_saved_config_files
+            // materializes the restored database cleanly without false external-edit conflicts.
+            let configs_dir = data_dir.join("configs");
+            if let Ok(entries) = std::fs::read_dir(&configs_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("yaml") {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
+            Some("已从备份恢复全部数据（原数据库已保留为 swiftsub.db.bak）".into())
+        }
         Err(error) => {
             if bak_path.exists() && !db_path.exists() {
                 let _ = std::fs::rename(&bak_path, &db_path);
@@ -366,6 +383,21 @@ impl SwiftSubApp {
                 server.stop();
             }
             self.start_server();
+            if self.server.is_none() {
+                let err = self
+                    .server_error
+                    .clone()
+                    .unwrap_or_else(|| "服务重启失败".into());
+                self.p1.server_lan_private_only = !enabled;
+                let _ = lock_store(&self.store).set_setting(
+                    "server_lan_private_only",
+                    if !enabled { "true" } else { "false" },
+                );
+                self.start_server();
+                self.show_toast(format!("切换访问安全限制失败（已恢复）：{err}"), cx);
+                cx.notify();
+                return;
+            }
         }
         self.show_toast(
             if enabled {
@@ -410,6 +442,17 @@ impl SwiftSubApp {
             .map_err(|error| error.to_string());
         match result {
             Ok(rotated) => {
+                {
+                    let store = lock_store(&self.store);
+                    for prefix in [
+                        "yaml-editor",
+                        "visual-meta",
+                        "visual-form",
+                        "generation-draft",
+                    ] {
+                        let _ = store.set_setting(&format!("{prefix}:{id}"), "");
+                    }
+                }
                 if self.saved_config_id.as_deref() == Some(id.as_str()) {
                     self.saved_config_id = Some(rotated.id.clone());
                 }
@@ -419,6 +462,7 @@ impl SwiftSubApp {
                     .is_some_and(|config| config.id == id)
                 {
                     self.generated_saved_config = Some(rotated.clone());
+                    let _ = self.remember_generated_config(&rotated);
                 }
                 self.reload_saved_configs();
                 self.show_toast(
@@ -547,13 +591,20 @@ impl SwiftSubApp {
         else {
             return;
         };
-        if path.exists() {
-            let _ = std::fs::remove_file(&path);
-        }
-        let path_str = path.to_string_lossy().to_string();
+        let tmp_path = path.with_extension(format!("db.tmp-{}", uuid::Uuid::new_v4().simple()));
+        let tmp_str = tmp_path.to_string_lossy().to_string();
         let result = lock_store(&self.store)
-            .backup_to(&path_str)
-            .map_err(|error| error.to_string());
+            .backup_to(&tmp_str)
+            .map_err(|error| error.to_string())
+            .and_then(|()| {
+                if path.exists() {
+                    let _ = std::fs::remove_file(&path);
+                }
+                std::fs::rename(&tmp_path, &path).map_err(|error| error.to_string())
+            });
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
         match result {
             Ok(()) => self.show_toast("完整数据备份已导出（含订阅、配置、模板与历史）".into(), cx),
             Err(error) => self.show_toast(format!("导出备份失败：{error}"), cx),
@@ -685,10 +736,27 @@ impl SwiftSubApp {
                 }
                 self.p1.history_modal = None;
                 let was_open = self.saved_config_id.as_deref() == Some(config_id.as_str());
+                let was_inline = self.workspace.saved_editor_open;
                 self.reload_saved_configs();
+                if self
+                    .generated_saved_config
+                    .as_ref()
+                    .is_some_and(|c| c.id == config_id)
+                    && let Some(updated) = self
+                        .saved_configs
+                        .iter()
+                        .find(|c| c.id == config_id)
+                        .cloned()
+                {
+                    self.generated_saved_config = Some(updated.clone());
+                    let _ = self.remember_generated_config(&updated);
+                }
                 if was_open {
                     self.saved_config_id = None;
                     self.open_saved_config(config_id, window, cx);
+                    if was_inline {
+                        self.page = Page::Generator;
+                    }
                 }
                 self.show_toast("已恢复所选历史版本（原订阅地址保持不变）".into(), cx);
             }
@@ -752,11 +820,7 @@ impl SwiftSubApp {
             self.show_toast("所选节点状态无需变更".into(), cx);
             return;
         }
-        let overrides = match changed
-            .iter()
-            .map(|node| self.workspace_node_override(node))
-            .collect::<Result<Vec<_>, _>>()
-        {
+        let overrides = match self.workspace_node_overrides_batch(&changed) {
             Ok(list) => list,
             Err(error) => {
                 self.nodes = previous_nodes;
@@ -836,6 +900,7 @@ impl SwiftSubApp {
             .map(|n| n.name().to_string())
             .collect();
         let mut changed = Vec::new();
+        let mut rename_pairs: Vec<(String, String)> = Vec::new();
         for node in &mut self.nodes {
             if !keys.contains(&node.source_key) {
                 continue;
@@ -866,14 +931,31 @@ impl SwiftSubApp {
             if unique != old {
                 node.set_name(unique.clone());
                 node.region = detect_region(&unique);
-                super::layout::retarget_snapshot(&mut snapshot, &old, &unique);
-                workspace::retarget_rule_lines(
-                    &mut self.workspace.rule_visibility.disabled_manual,
-                    &old,
-                    &unique,
-                );
+                rename_pairs.push((old, unique));
                 changed.push(node.clone());
             }
+        }
+        // Two-pass retargeting avoids A->B + B->C collisions overwriting A's references to C.
+        let placeholders: Vec<(String, String, String)> = rename_pairs
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (old, new))| (old, format!("__swiftsub_rename_{idx}__"), new))
+            .collect();
+        for (old, tmp, _) in &placeholders {
+            super::layout::retarget_snapshot(&mut snapshot, old, tmp);
+            workspace::retarget_rule_lines(
+                &mut self.workspace.rule_visibility.disabled_manual,
+                old,
+                tmp,
+            );
+        }
+        for (_, tmp, new) in &placeholders {
+            super::layout::retarget_snapshot(&mut snapshot, tmp, new);
+            workspace::retarget_rule_lines(
+                &mut self.workspace.rule_visibility.disabled_manual,
+                tmp,
+                new,
+            );
         }
         if changed.is_empty() {
             self.p1.batch_rename_open = false;
@@ -881,11 +963,7 @@ impl SwiftSubApp {
             cx.notify();
             return;
         }
-        let overrides = match changed
-            .iter()
-            .map(|node| self.workspace_node_override(node))
-            .collect::<Result<Vec<_>, _>>()
-        {
+        let overrides = match self.workspace_node_overrides_batch(&changed) {
             Ok(list) => list,
             Err(error) => {
                 self.nodes = previous_nodes;
@@ -989,10 +1067,15 @@ impl SwiftSubApp {
     ) {
         self.p1.theme_mode = mode;
         let _ = lock_store(&self.store).set_setting("theme", mode.as_str());
-        let system_is_light = matches!(
-            window.appearance(),
-            WindowAppearance::Light | WindowAppearance::VibrantLight
-        );
+        if mode == crate::ui::AppThemeMode::System {
+            cx.set_window_appearance(None);
+        }
+        let system_is_light = crate::desktop::system_prefers_light().unwrap_or_else(|| {
+            matches!(
+                window.appearance(),
+                WindowAppearance::Light | WindowAppearance::VibrantLight
+            )
+        });
         let light = mode.resolve_light(system_is_light);
         self.light_theme = light;
         Theme::change(
@@ -1006,11 +1089,11 @@ impl SwiftSubApp {
         );
         crate::configure_theme(cx, light);
         crate::ui::set_light_theme(light);
-        cx.set_window_appearance(Some(if light {
-            WindowAppearance::Light
-        } else {
-            WindowAppearance::Dark
-        }));
+        cx.set_window_appearance(match mode {
+            crate::ui::AppThemeMode::System => None,
+            crate::ui::AppThemeMode::Light => Some(WindowAppearance::Light),
+            crate::ui::AppThemeMode::Dark => Some(WindowAppearance::Dark),
+        });
         cx.notify();
     }
 

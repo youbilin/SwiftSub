@@ -738,13 +738,20 @@ impl SavedDocument {
     pub fn add_group(&mut self, name: &str, copy: Option<&str>) -> Result<String, String> {
         let name = self.unique_name(name);
         let mut group = copy.and_then(|n| self.group(n)).unwrap_or_else(|| {
+            let mut default_members = Vec::new();
+            for preferred in ["节点选择", "自动选择"] {
+                if self.group(preferred).is_some() {
+                    default_members.push(preferred.to_string());
+                }
+            }
+            default_members.push("DIRECT".into());
+            default_members.extend(self.names("proxies"));
+            let mut seen = HashSet::new();
+            default_members.retain(|member| seen.insert(member.clone()));
             let mut map = Mapping::new();
             map.insert(Value::String("name".into()), Value::String("new".into()));
             map.insert(Value::String("type".into()), Value::String("select".into()));
-            map.insert(
-                Value::String("proxies".into()),
-                values(vec!["DIRECT".into()]),
-            );
+            map.insert(Value::String("proxies".into()), values(default_members));
             Value::Mapping(map)
         });
         put(&mut group, "name", name.clone());
@@ -838,6 +845,26 @@ impl SavedDocument {
             }
         } else {
             members.retain(|m| m != member);
+        }
+        put(&mut value, "proxies", values(members));
+        self.set_editable_group(group, value)
+    }
+    pub fn set_all_nodes_in_group(&mut self, group: &str, enabled: bool) -> Result<(), String> {
+        let mut value = self.editable_group(group).ok_or("组不存在")?;
+        let mut members = strings(value.get("proxies"));
+        let proxy_names = self.names("proxies");
+        if enabled {
+            for proxy in proxy_names {
+                if proxy != group && !members.iter().any(|m| m == &proxy) {
+                    members.push(proxy);
+                }
+            }
+        } else {
+            let proxy_set: HashSet<String> = proxy_names.into_iter().collect();
+            members.retain(|m| !proxy_set.contains(m));
+            if members.is_empty() {
+                members.push("DIRECT".into());
+            }
         }
         put(&mut value, "proxies", values(members));
         self.set_editable_group(group, value)
@@ -1369,7 +1396,9 @@ impl SavedDocument {
             vec!["REJECT".into(), "DIRECT".into()]
         } else {
             self.ensure_target("节点选择")?;
-            vec!["节点选择".into(), "DIRECT".into()]
+            let mut list = vec!["节点选择".into(), "DIRECT".into()];
+            list.extend(self.names("proxies"));
+            list
         };
         let mut group = Value::Mapping(Mapping::new());
         put(&mut group, "name", name);
@@ -1597,12 +1626,9 @@ impl SavedDocument {
                 .map(|s| s.name.clone())
                 .collect::<Vec<_>>();
             for name in &missing {
-                if self.names("proxies").contains(name) {
-                    self.toggle_node(name, false)?;
+                if self.editable_node(name).is_some() {
+                    self.remove_node(name)?;
                 }
-                self.metadata
-                    .disabled_nodes
-                    .retain(|n| text(&n.value, "name") != *name);
             }
             self.metadata
                 .node_sources

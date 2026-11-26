@@ -740,11 +740,13 @@ fn build_groups(
         );
     }
 
-    let service_members = available_members(vec![
+    let mut service_members = available_members(vec![
         SELECT_GROUP.to_string(),
         AUTO_GROUP.to_string(),
         "DIRECT".to_string(),
     ]);
+    service_members.extend(node_names.clone());
+    service_members.extend(options.chains.iter().map(|chain| chain.name.clone()));
 
     for module in modules {
         match module.kind {
@@ -775,11 +777,7 @@ fn build_groups(
         groups.push(ProxyGroup::new(
             FINAL_GROUP,
             GroupKind::Select,
-            available_members(vec![
-                SELECT_GROUP.to_string(),
-                AUTO_GROUP.to_string(),
-                "DIRECT".to_string(),
-            ]),
+            service_members,
         ));
     }
 

@@ -510,6 +510,56 @@ impl SwiftSubApp {
 
     fn template_editor_retarget(&mut self, old: &str, new: &str) {
         let editor = &mut self.workspace.template_editor;
+        for group in &mut editor.policy_groups {
+            let mut next = Vec::with_capacity(group.members.len());
+            let mut seen = HashSet::new();
+            for member in group.members.drain(..) {
+                let replaced = if member == old {
+                    if group.name == new {
+                        continue;
+                    }
+                    new.to_string()
+                } else {
+                    member
+                };
+                if seen.insert(replaced.clone()) {
+                    next.push(replaced);
+                }
+            }
+            if !group.include_all_nodes && next.is_empty() {
+                next.push("DIRECT".into());
+            }
+            group.members = next;
+        }
+        if let Some(base) = &mut editor.base_snapshot {
+            for group in &mut base.policy_groups {
+                let mut next = Vec::with_capacity(group.members.len());
+                let mut seen = HashSet::new();
+                for member in group.members.drain(..) {
+                    let replaced = if member == old {
+                        if group.name == new {
+                            continue;
+                        }
+                        new.to_string()
+                    } else {
+                        member
+                    };
+                    if seen.insert(replaced.clone()) {
+                        next.push(replaced);
+                    }
+                }
+                if !group.include_all_nodes && next.is_empty() && !group.disabled && !group.removed
+                {
+                    next.push("DIRECT".into());
+                }
+                group.members = next;
+            }
+            for listener in &mut base.listeners {
+                if listener.proxy == old {
+                    listener.proxy = new.to_string();
+                }
+            }
+        }
         for binding in &mut editor.custom_rule_sets {
             if binding.target == old {
                 binding.target = new.to_string();
@@ -545,10 +595,18 @@ impl SwiftSubApp {
                 .enabled_modules
                 .remove(&module_id);
             for spec in module.rule_sets {
-                self.workspace
+                if self
+                    .workspace
                     .template_editor
                     .rule_set_targets
-                    .remove(spec.id);
+                    .get(spec.id)
+                    .is_some_and(|target| target == module.name)
+                {
+                    self.workspace
+                        .template_editor
+                        .rule_set_targets
+                        .remove(spec.id);
+                }
             }
             self.template_editor_retarget(module.name, rule_catalog::SELECT_GROUP);
             if self.workspace.template_editor.expanded_group.as_deref() == Some(module.name) {
@@ -599,6 +657,12 @@ impl SwiftSubApp {
         }
         if self.template_editor_targets().iter().any(|t| t == &name)
             || catalog::MODULES.iter().any(|m| m.name == name)
+            || self
+                .workspace
+                .template_editor
+                .base_snapshot
+                .as_ref()
+                .is_some_and(|base| base.custom_groups.iter().any(|g| g.name == name))
         {
             self.workspace.template_editor.error = Some("该名称已存在".into());
             cx.notify();
@@ -632,6 +696,15 @@ impl SwiftSubApp {
             return;
         }
         let removed = self.workspace.template_editor.policy_groups.remove(idx);
+        match self.workspace.template_editor.renaming_group {
+            Some(renaming) if renaming == idx => {
+                self.workspace.template_editor.renaming_group = None;
+            }
+            Some(renaming) if renaming > idx => {
+                self.workspace.template_editor.renaming_group = Some(renaming - 1);
+            }
+            _ => {}
+        }
         self.template_editor_retarget(&removed.name, rule_catalog::SELECT_GROUP);
         let editor = &mut self.workspace.template_editor;
         if editor.expanded_group.as_deref() == Some(&removed.name) {
@@ -715,6 +788,12 @@ impl SwiftSubApp {
             .iter()
             .any(|t| t == &new_name)
             || catalog::MODULES.iter().any(|m| m.name == new_name)
+            || self
+                .workspace
+                .template_editor
+                .base_snapshot
+                .as_ref()
+                .is_some_and(|base| base.custom_groups.iter().any(|g| g.name == new_name))
         {
             self.workspace.template_editor.error = Some("该名称已存在".into());
             cx.notify();

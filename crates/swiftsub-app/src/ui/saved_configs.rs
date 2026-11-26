@@ -849,8 +849,12 @@ impl SwiftSubApp {
             );
         }
         let target = name.to_string();
+        let all_nodes_group = name.to_string();
+        let clear_nodes_group = name.to_string();
+        let has_proxies = !doc.names("proxies").is_empty();
         panel = panel.child(
             h_flex()
+                .flex_wrap()
                 .gap_2()
                 .child(
                     Button::new(format!("saved-group-nodes-{name}"))
@@ -890,7 +894,29 @@ impl SwiftSubApp {
                                 cx.notify();
                             }
                         })),
-                ),
+                )
+                .when(!self.saved_editor.group_rules && has_proxies, |bar| {
+                    bar.child(
+                        Button::new(format!("saved-group-all-nodes-{name}"))
+                            .ghost()
+                            .label("全选节点")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.edit_saved_document(window, cx, |doc| {
+                                    doc.set_all_nodes_in_group(&all_nodes_group, true)
+                                })
+                            })),
+                    )
+                    .child(
+                        Button::new(format!("saved-group-clear-nodes-{name}"))
+                            .ghost()
+                            .label("清空节点")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.edit_saved_document(window, cx, |doc| {
+                                    doc.set_all_nodes_in_group(&clear_nodes_group, false)
+                                })
+                            })),
+                    )
+                }),
         );
         let mut inner = v_flex().gap_2().min_w_0();
         if self.saved_editor.group_rules {
@@ -930,6 +956,15 @@ impl SwiftSubApp {
                         move |this, window, cx| {
                             this.edit_saved_document(window, cx, |doc| {
                                 let mut rules = doc.items("rules");
+                                let Some(line) = rules.get(index).and_then(Value::as_str) else {
+                                    return Err("规则位置已改变，请重试".into());
+                                };
+                                if matches!(
+                                    crate::saved_document::rule_parts(line).first(),
+                                    Some(&"MATCH" | &"FINAL")
+                                ) {
+                                    return Err("兜底规则需要保留，可修改其目标".into());
+                                }
                                 rules.remove(index);
                                 doc.set_items("rules", rules);
                                 Ok(())
@@ -985,6 +1020,9 @@ impl SwiftSubApp {
                             cx,
                             move |this, window, cx| {
                                 this.edit_saved_document(window, cx, |doc| {
+                                    if index >= doc.metadata.disabled_rules.len() {
+                                        return Err("停用规则位置已改变，请重试".into());
+                                    }
                                     doc.metadata.disabled_rules.remove(index);
                                     Ok(())
                                 })
@@ -1449,9 +1487,8 @@ impl SwiftSubApp {
                         Button::new("saved-node-cancel")
                             .ghost()
                             .label("取消")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.saved_editor.editing_node = false;
-                                cx.notify();
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.saved_cancel_node_edit(window, cx);
                             })),
                     )
                     .child(
@@ -1581,17 +1618,60 @@ impl SwiftSubApp {
                             |this, name, window, cx| {
                                 this.saved_editor.rule_scope = Some(name.clone());
                                 if let Some(index) = this.saved_editor.rule_edit {
-                                    this.saved_set_rule_target(index, name, window, cx);
-                                    if this.saved_config_error.is_none()
-                                        && let Some(line) = this
-                                            .saved_editor
-                                            .document
-                                            .as_ref()
-                                            .and_then(|doc| doc.rules().get(index).cloned())
-                                    {
-                                        this.saved_editor.new_rule.update(cx, |input, cx| {
-                                            input.set_value(line, window, cx)
+                                    if this.saved_editor.rule_edit_disabled {
+                                        this.edit_saved_document(window, cx, |doc| {
+                                            let rule = doc
+                                                .metadata
+                                                .disabled_rules
+                                                .get_mut(index)
+                                                .ok_or("停用规则已改变")?;
+                                            if rule_target(&rule.line).is_none() {
+                                                return Err("此规则请在 YAML 中编辑".into());
+                                            }
+                                            let mut parts =
+                                                crate::saved_document::rule_parts(&rule.line);
+                                            let pos = if parts.first().is_some_and(|k| {
+                                                k.eq_ignore_ascii_case("MATCH")
+                                                    || k.eq_ignore_ascii_case("FINAL")
+                                            }) {
+                                                1
+                                            } else {
+                                                2
+                                            };
+                                            if pos < parts.len() {
+                                                parts[pos] = name.as_str();
+                                            }
+                                            rule.line = parts.join(",");
+                                            Ok(())
                                         });
+                                        if this.saved_config_error.is_none()
+                                            && let Some(line) =
+                                                this.saved_editor.document.as_ref().and_then(
+                                                    |doc| {
+                                                        doc.metadata
+                                                            .disabled_rules
+                                                            .get(index)
+                                                            .map(|r| r.line.clone())
+                                                    },
+                                                )
+                                        {
+                                            this.saved_editor.new_rule.update(cx, |input, cx| {
+                                                input.set_value(line, window, cx)
+                                            });
+                                        }
+                                    } else {
+                                        this.saved_set_rule_target(index, name, window, cx);
+                                        if this.saved_config_error.is_none()
+                                            && let Some(line) = this
+                                                .saved_editor
+                                                .document
+                                                .as_ref()
+                                                .and_then(|doc| doc.rules().get(index).cloned())
+                                        {
+                                            this.saved_editor.new_rule.update(cx, |input, cx| {
+                                                input.set_value(line, window, cx)
+                                            });
+                                        }
                                     }
                                 }
                                 cx.notify();

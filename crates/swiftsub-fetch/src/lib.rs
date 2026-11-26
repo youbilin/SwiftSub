@@ -156,7 +156,7 @@ pub fn fetch_subscription(
 
     if !status.is_success() {
         let mut bytes = Vec::new();
-        response.take(1024).read_to_end(&mut bytes)?;
+        let _ = response.take(1024).read_to_end(&mut bytes);
         let message = String::from_utf8_lossy(&bytes);
         return Err(FetchError::HttpStatus(
             status.as_u16(),
@@ -208,8 +208,10 @@ pub fn fetch_subscription(
 
 fn build_client(options: &FetchOptions) -> Result<Client, FetchError> {
     static CLIENTS: OnceLock<Mutex<Vec<(FetchOptions, Client)>>> = OnceLock::new();
+    let cacheable = !matches!(options.proxy, ProxyMode::System);
     let clients = CLIENTS.get_or_init(|| Mutex::new(Vec::new()));
-    if let Ok(cache) = clients.lock()
+    if cacheable
+        && let Ok(cache) = clients.lock()
         && let Some((_, client)) = cache.iter().find(|(key, _)| key == options)
     {
         return Ok(client.clone());
@@ -233,7 +235,10 @@ fn build_client(options: &FetchOptions) -> Result<Client, FetchError> {
     };
 
     let client = builder.build().map_err(FetchError::Network)?;
-    if let Ok(mut cache) = clients.lock() {
+    if cacheable && let Ok(mut cache) = clients.lock() {
+        if let Some((_, existing)) = cache.iter().find(|(key, _)| key == options) {
+            return Ok(existing.clone());
+        }
         if cache.len() >= 8 {
             cache.remove(0);
         }
@@ -250,6 +255,15 @@ pub fn fetch_rule_bytes(url: &str, options: &FetchOptions) -> Result<Vec<u8>, Fe
             response.status().as_u16(),
             "规则集读取失败".into(),
         ));
+    }
+    if let Some(length) = response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        && length > MAX_CONTENT_BYTES
+    {
+        return Err(FetchError::TooLarge);
     }
     let bytes = read_bounded(response, MAX_CONTENT_BYTES)?;
     if bytes.is_empty() {
@@ -340,18 +354,18 @@ struct GithubReleaseAsset {
     browser_download_url: String,
 }
 
-fn parse_semver(raw: &str) -> Option<(u64, u64, u64)> {
-    let clean = raw
-        .trim()
-        .trim_start_matches(['v', 'V'])
-        .split(['-', '+'])
-        .next()
-        .unwrap_or_default();
-    let mut parts = clean.split('.');
+fn parse_semver(raw: &str) -> Option<(u64, u64, u64, bool)> {
+    let trimmed = raw.trim().trim_start_matches(['v', 'V']);
+    let without_build = trimmed.split('+').next().unwrap_or_default();
+    let (core, is_stable) = match without_build.split_once('-') {
+        Some((core, _)) => (core, false),
+        None => (without_build, true),
+    };
+    let mut parts = core.split('.');
     let major = parts.next()?.parse::<u64>().ok()?;
     let minor = parts.next().unwrap_or("0").parse::<u64>().ok()?;
     let patch = parts.next().unwrap_or("0").parse::<u64>().ok()?;
-    Some((major, minor, patch))
+    Some((major, minor, patch, is_stable))
 }
 
 pub fn is_newer_version(latest: &str, current: &str) -> bool {
@@ -693,6 +707,13 @@ mod http_tests {
 
         assert!(matches!(error, FetchError::HttpStatus(500, _)));
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn prerelease_upgrades_to_stable_same_version() {
+        assert!(is_newer_version("1.1.0", "1.1.0-rc.1"));
+        assert!(!is_newer_version("1.1.0-rc.1", "1.1.0"));
+        assert!(is_newer_version("v1.2.0", "1.1.0"));
     }
 
     #[test]

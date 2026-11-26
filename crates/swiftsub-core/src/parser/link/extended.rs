@@ -34,7 +34,11 @@ pub(super) fn parse_ssr(rest: &str) -> Result<Proxy> {
         }
     }
     let decode = |key: &str| -> Result<Option<String>> {
-        values.get(key).map(|v| decode_base64_text(v)).transpose()
+        values
+            .get(key)
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| decode_base64_text(v))
+            .transpose()
     };
     let name = decode("remarks")?
         .filter(|s| !s.is_empty())
@@ -220,9 +224,11 @@ pub(super) fn parse_extended_proxy(scheme: &str, rest: &str) -> Result<Proxy> {
                 query_value(&q, &["address", "ip"]).ok_or(Error::MissingField("address"))?;
             for address in addresses.split(',') {
                 let ip = address
+                    .trim()
                     .split('/')
                     .next()
                     .unwrap_or_default()
+                    .trim()
                     .parse::<std::net::IpAddr>()
                     .map_err(|_| Error::InvalidLink("invalid WireGuard address".into()))?;
                 proxy.insert(if ip.is_ipv4() { "ip" } else { "ipv6" }, ip.to_string());
@@ -230,7 +236,7 @@ pub(super) fn parse_extended_proxy(scheme: &str, rest: &str) -> Result<Proxy> {
             if let Some(v) = q.get("reserved") {
                 let values = v
                     .split(',')
-                    .map(|s| s.parse::<u8>().map(Value::from))
+                    .map(|s| s.trim().parse::<u8>().map(Value::from))
                     .collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(|_| Error::InvalidLink("reserved requires three bytes".into()))?;
                 if values.len() != 3 {
@@ -388,16 +394,16 @@ pub(super) fn parse_juicity(rest: &str) -> Result<Proxy> {
     if let Some(sni) = query_value(&query, &["sni", "servername", "peer"]) {
         proxy.insert("sni", sni.to_string());
     }
-    if let Some(cc) = query_value(&query, &["congestion_control", "congestion-controller"]) {
+    if let Some(cc) = query_value(&query, &["congestion-control", "congestion-controller"]) {
         proxy.insert("congestion-controller", cc.to_string());
     }
-    if let Some(fp) = query_value(&query, &["pinned_certchain_sha256", "fingerprint"]) {
+    if let Some(fp) = query_value(&query, &["pinned-certchain-sha256", "fingerprint"]) {
         proxy.insert("fingerprint", fp.to_string());
     }
     if let Some(alpn) = query_value(&query, &["alpn"]) {
         insert_alpn(&mut proxy, alpn);
     }
-    if query_bool(&query, &["allow_insecure", "insecure", "skip-cert-verify"]) {
+    if query_bool(&query, &["allow-insecure", "insecure", "skip-cert-verify"]) {
         proxy.insert("skip-cert-verify", true);
     }
     apply_common_opts(&mut proxy, &query)?;

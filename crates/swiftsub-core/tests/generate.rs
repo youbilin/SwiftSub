@@ -1147,3 +1147,34 @@ fn picked_rules_and_metadata_are_independent_of_their_original_service_group() {
             .contains("RULE-SET,openai,Media")
     );
 }
+
+#[test]
+fn service_and_final_groups_include_all_nodes_by_default_while_direct_and_reject_stay_focused() {
+    let nodes = sample_nodes();
+    let profile = generate_profile(&nodes, &GenerateOptions::default()).unwrap();
+    let first_node = nodes[0].name().to_string();
+    for service_name in ["AI 服务", "谷歌服务", "全球代理", "漏网之鱼"] {
+        let group = profile
+            .groups
+            .iter()
+            .find(|g| g.name == service_name)
+            .unwrap_or_else(|| panic!("expected group {service_name}"));
+        assert_eq!(group.proxies[0], "节点选择");
+        assert!(
+            group.proxies.contains(&first_node),
+            "{service_name} should include all nodes by default"
+        );
+    }
+    let ad = profile
+        .groups
+        .iter()
+        .find(|g| g.name == "广告拦截")
+        .unwrap();
+    assert!(!ad.proxies.contains(&first_node));
+    let cn = profile
+        .groups
+        .iter()
+        .find(|g| g.name == "国内直连")
+        .unwrap();
+    assert!(!cn.proxies.contains(&first_node));
+}

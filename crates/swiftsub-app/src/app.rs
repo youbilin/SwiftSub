@@ -1,7 +1,7 @@
 mod generation;
 mod layout;
 mod lifecycle;
-mod ordering;
+pub(crate) mod ordering;
 pub(crate) use ordering::{WorkspaceNodeKind, chain_order_key};
 pub mod phase2;
 mod profiles;
@@ -504,16 +504,18 @@ impl SwiftSubApp {
             ),
         };
         let store = Arc::new(Mutex::new(store));
-        let light_theme = {
+        let (theme_mode, light_theme) = {
             let guard = lock_store(&store);
             let mode = crate::ui::AppThemeMode::from_setting(
                 guard.get_setting("theme").ok().flatten().as_deref(),
             );
-            let system_is_light = matches!(
-                window.appearance(),
-                WindowAppearance::Light | WindowAppearance::VibrantLight
-            );
-            mode.resolve_light(system_is_light)
+            let system_is_light = crate::desktop::system_prefers_light().unwrap_or_else(|| {
+                matches!(
+                    window.appearance(),
+                    WindowAppearance::Light | WindowAppearance::VibrantLight
+                )
+            });
+            (mode, mode.resolve_light(system_is_light))
         };
         let (server_bind_lan, server_lan_host, update_repo) = {
             let guard = lock_store(&store);
@@ -866,11 +868,11 @@ impl SwiftSubApp {
         Theme::change(mode, None, cx);
         crate::configure_theme(cx, app.light_theme);
         crate::ui::set_light_theme(app.light_theme);
-        cx.set_window_appearance(Some(if app.light_theme {
-            WindowAppearance::Light
-        } else {
-            WindowAppearance::Dark
-        }));
+        cx.set_window_appearance(match theme_mode {
+            crate::ui::AppThemeMode::System => None,
+            crate::ui::AppThemeMode::Light => Some(WindowAppearance::Light),
+            crate::ui::AppThemeMode::Dark => Some(WindowAppearance::Dark),
+        });
 
         let add_url_sub = cx.subscribe_in(
             &app.add_url,
@@ -932,6 +934,16 @@ impl SwiftSubApp {
             cx.observe_in(&app.workspace.rule_content_search, window, |_, _, _, cx| {
                 cx.notify()
             });
+        let tpl_builtin_search_obs = cx.observe_in(
+            &app.workspace.template_editor.builtin_search,
+            window,
+            |_, _, _, cx| cx.notify(),
+        );
+        let tpl_rule_search_obs = cx.observe_in(
+            &app.workspace.template_editor.rule_search,
+            window,
+            |_, _, _, cx| cx.notify(),
+        );
         let visual_inputs = [
             app.saved_editor.search.clone(),
             app.saved_editor.member_search.clone(),
@@ -956,6 +968,8 @@ impl SwiftSubApp {
             template_rule_search_obs,
             rule_content_obs,
             rule_content_search_obs,
+            tpl_builtin_search_obs,
+            tpl_rule_search_obs,
             member_search_obs,
             saved_yaml_obs,
             saved_name_obs,
@@ -2222,7 +2236,7 @@ impl SwiftSubApp {
                     self.workspace_resolved_group_name("自动选择").into(),
                     "DIRECT".into(),
                 ],
-                include_all_nodes: false,
+                include_all_nodes: true,
                 ..Default::default()
             });
             self.edit_template_policy_group(self.template_policy_groups.len() - 1, window, cx);
@@ -2335,7 +2349,8 @@ impl SwiftSubApp {
             }
         };
         if let Some(group) = profile.groups.iter().find(|g| g.name == name) {
-            let all_nodes = matches!(name.as_str(), "节点选择" | "自动选择");
+            let all_nodes =
+                catalog::module_by_name(&name).is_some_and(catalog::default_includes_all_nodes);
             self.template_policy_groups.push(PolicyGroupSpec {
                 id: format!("builtin:{name}"),
                 name,
@@ -2344,7 +2359,10 @@ impl SwiftSubApp {
                     group
                         .proxies
                         .iter()
-                        .filter(|member| !self.nodes.iter().any(|node| node.name() == *member))
+                        .filter(|member| {
+                            !nodes.iter().any(|node| node.name() == *member)
+                                && !self.chains.iter().any(|chain| chain.name == **member)
+                        })
                         .map(|member| self.workspace_resolved_group_name(member).to_string())
                         .collect()
                 } else {

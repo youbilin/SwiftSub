@@ -404,26 +404,58 @@ impl Store {
         traffic: &TrafficSnapshot,
         node_count: usize,
     ) -> Result<()> {
+        self.save_fetch_success_optional(
+            id,
+            payload,
+            etag,
+            last_modified,
+            Some(traffic),
+            node_count,
+        )
+    }
+
+    pub fn save_fetch_success_optional(
+        &self,
+        id: i64,
+        payload: &str,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+        traffic: Option<&TrafficSnapshot>,
+        node_count: usize,
+    ) -> Result<()> {
         let now = now_ts();
-        self.conn.execute(
-            "UPDATE subscriptions
-             SET payload = ?1, etag = ?2, last_modified = ?3, last_ok_at = ?4,
-                 last_error = NULL, traffic_upload = ?5, traffic_download = ?6,
-                 traffic_total = ?7, expire_at = ?8, node_count = ?9, updated_at = ?4
-             WHERE id = ?10",
-            params![
-                payload,
-                etag,
-                last_modified,
-                now,
-                traffic.upload as i64,
-                traffic.download as i64,
-                traffic.total as i64,
-                traffic.expire_at,
-                node_count as i64,
-                id
-            ],
-        )?;
+        match traffic {
+            Some(traffic) => {
+                self.conn.execute(
+                    "UPDATE subscriptions
+                     SET payload = ?1, etag = ?2, last_modified = ?3, last_ok_at = ?4,
+                         last_error = NULL, traffic_upload = ?5, traffic_download = ?6,
+                         traffic_total = ?7, expire_at = ?8, node_count = ?9, updated_at = ?4
+                     WHERE id = ?10",
+                    params![
+                        payload,
+                        etag,
+                        last_modified,
+                        now,
+                        traffic.upload.min(i64::MAX as u64) as i64,
+                        traffic.download.min(i64::MAX as u64) as i64,
+                        traffic.total.min(i64::MAX as u64) as i64,
+                        traffic.expire_at,
+                        node_count as i64,
+                        id
+                    ],
+                )?;
+            }
+            None => {
+                self.conn.execute(
+                    "UPDATE subscriptions
+                     SET payload = ?1, etag = ?2, last_modified = ?3, last_ok_at = ?4,
+                         last_error = NULL, node_count = ?5, updated_at = ?4
+                     WHERE id = ?6",
+                    params![payload, etag, last_modified, now, node_count as i64, id],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -464,9 +496,9 @@ impl Store {
                      WHERE id = ?6",
                     params![
                         now,
-                        traffic.upload as i64,
-                        traffic.download as i64,
-                        traffic.total as i64,
+                        traffic.upload.min(i64::MAX as u64) as i64,
+                        traffic.download.min(i64::MAX as u64) as i64,
+                        traffic.total.min(i64::MAX as u64) as i64,
                         traffic.expire_at,
                         id,
                         etag,

@@ -55,6 +55,11 @@ fn build_tls_object(proxy: &Proxy, default_enabled: bool) -> Option<JsonValue> {
         && !fp.is_empty()
     {
         tls.insert("utls".into(), json!({ "enabled": true, "fingerprint": fp }));
+    } else if has_reality {
+        tls.insert(
+            "utls".into(),
+            json!({ "enabled": true, "fingerprint": "chrome" }),
+        );
     }
     if let Some(reality) = proxy.fields().get("reality-opts") {
         let mut r = Map::new();
@@ -124,14 +129,32 @@ fn build_transport_object(proxy: &Proxy) -> Option<JsonValue> {
                 .get("h2-opts")
                 .or_else(|| proxy.fields().get("http-opts"))
             {
-                if let Some(path) = yaml_str(opts, "path") {
+                if let Some(path) = yaml_str(opts, "path").or_else(|| {
+                    opts.get("path")
+                        .and_then(YamlValue::as_sequence)
+                        .and_then(|seq| seq.first())
+                        .and_then(YamlValue::as_str)
+                        .filter(|s| !s.is_empty())
+                }) {
                     tr.insert("path".into(), json!(path));
                 }
-                if let Some(hosts) = opts.get("host").and_then(YamlValue::as_sequence) {
-                    let list: Vec<&str> = hosts.iter().filter_map(YamlValue::as_str).collect();
-                    if !list.is_empty() {
-                        tr.insert("host".into(), json!(list));
-                    }
+                let hosts: Vec<&str> = opts
+                    .get("host")
+                    .and_then(YamlValue::as_sequence)
+                    .or_else(|| {
+                        opts.get("headers")
+                            .and_then(|h| h.get("Host").or_else(|| h.get("host")))
+                            .and_then(YamlValue::as_sequence)
+                    })
+                    .map(|seq| seq.iter().filter_map(YamlValue::as_str).collect())
+                    .or_else(|| {
+                        opts.get("headers")
+                            .and_then(|h| yaml_str(h, "Host").or_else(|| yaml_str(h, "host")))
+                            .map(|host| vec![host])
+                    })
+                    .unwrap_or_default();
+                if !hosts.is_empty() {
+                    tr.insert("host".into(), json!(hosts));
                 }
             }
             Some(JsonValue::Object(tr))
@@ -153,6 +176,7 @@ pub fn proxy_to_singbox_outbound(proxy: &Proxy) -> Option<JsonValue> {
 
     if let Some(detour) = proxy.get_str("dialer-proxy")
         && !detour.is_empty()
+        && !detour.eq_ignore_ascii_case("DIRECT")
     {
         out.insert("detour".into(), json!(detour));
     }
@@ -186,7 +210,10 @@ pub fn proxy_to_singbox_outbound(proxy: &Proxy) -> Option<JsonValue> {
         "hysteria2" => {
             out.insert("type".into(), json!("hysteria2"));
             out.insert("password".into(), json!(proxy.get_str("password")?));
-            if let Some(obfs) = proxy.get_str("obfs").filter(|o| *o != "none") {
+            if let Some(obfs) = proxy
+                .get_str("obfs")
+                .filter(|o| !o.is_empty() && !o.eq_ignore_ascii_case("none"))
+            {
                 let mut o = Map::new();
                 o.insert("type".into(), json!(obfs));
                 if let Some(pw) = proxy.get_str("obfs-password") {
@@ -274,12 +301,30 @@ pub fn proxy_to_singbox_outbound(proxy: &Proxy) -> Option<JsonValue> {
 /// Generate a complete, ready-to-use sing-box 1.11+ JSON configuration string
 /// from the current enabled nodes and basic generation options.
 pub fn generate_singbox_json(nodes: &[Node], options: &GenerateOptions) -> Result<String> {
-    let active = enabled_nodes(nodes);
+    let mut active: Vec<Node> = enabled_nodes(nodes)
+        .into_iter()
+        .filter(|node| node.proxy.fatal_issue().is_none())
+        .collect();
+    crate::normalize::ensure_unique_names(&mut active);
     let mut outbounds = Vec::new();
     let mut node_tags = Vec::new();
-    for node in &active {
+    let mut used_tags: std::collections::HashSet<String> = ["direct", "节点选择", "自动选择"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    for node in &mut active {
+        let base = node.name().to_string();
+        let mut tag = base.clone();
+        let mut suffix = 2;
+        while !used_tags.insert(tag.clone()) {
+            tag = format!("{base} {suffix}");
+            suffix += 1;
+        }
+        if tag != base {
+            node.set_name(tag.clone());
+        }
         if let Some(outbound) = proxy_to_singbox_outbound(&node.proxy) {
-            node_tags.push(node.name().to_string());
+            node_tags.push(tag);
             outbounds.push(outbound);
         }
     }
@@ -287,6 +332,17 @@ pub fn generate_singbox_json(nodes: &[Node], options: &GenerateOptions) -> Resul
         return Err(Error::InvalidConfig(
             "没有可导出为 sing-box 的启用节点".into(),
         ));
+    }
+    // Strip dangling detours that do not reference an exported outbound tag.
+    let valid_detours: std::collections::HashSet<&str> =
+        node_tags.iter().map(String::as_str).collect();
+    for outbound in &mut outbounds {
+        if let Some(map) = outbound.as_object_mut()
+            && let Some(detour) = map.get("detour").and_then(JsonValue::as_str)
+            && !valid_detours.contains(detour)
+        {
+            map.remove("detour");
+        }
     }
 
     let mut selector_members = vec!["自动选择".to_string()];
@@ -374,5 +430,54 @@ ss://YWVzLTI1Ni1nY206cGFzcw@ss.example.org:8388#SS-SG";
         assert_eq!(outbounds[2]["tls"]["reality"]["enabled"], true);
         assert_eq!(outbounds[4]["type"], "hysteria2");
         assert_eq!(outbounds[5]["type"], "shadowsocks");
+    }
+
+    #[test]
+    fn singbox_export_dedupes_reserved_tags_handles_http_opts_and_strips_dangling_detour() {
+        let yaml = "\
+proxies:
+  - name: direct
+    type: vless
+    server: r.example.org
+    port: 443
+    uuid: 11111111-2222-3333-4444-555555555555
+    dialer-proxy: 节点选择
+    reality-opts:
+      public-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      short-id: '1234'
+  - name: http-node
+    type: vmess
+    server: h.example.org
+    port: 80
+    uuid: 11111111-2222-3333-4444-555555555555
+    alterId: 0
+    cipher: auto
+    network: http
+    http-opts:
+      path:
+        - /ws
+      headers:
+        Host:
+          - cdn.example.org
+";
+        let parsed = parse_content(yaml).unwrap();
+        let nodes = build_nodes(parsed.proxies, "1", "test");
+        let text = generate_singbox_json(&nodes, &GenerateOptions::default()).unwrap();
+        let doc: JsonValue = serde_json::from_str(&text).unwrap();
+        let outbounds = doc["outbounds"].as_array().unwrap();
+        // Renamed reserved tag "direct" cleanly, stripped dangling detour, added default utls for Reality
+        let vless = outbounds
+            .iter()
+            .find(|o| o["type"] == "vless")
+            .expect("vless outbound");
+        assert_ne!(vless["tag"], "direct");
+        assert!(vless.get("detour").is_none());
+        assert_eq!(vless["tls"]["utls"]["enabled"], true);
+        let vmess = outbounds
+            .iter()
+            .find(|o| o["type"] == "vmess")
+            .expect("vmess outbound");
+        assert_eq!(vmess["transport"]["path"], "/ws");
+        assert_eq!(vmess["transport"]["host"][0], "cdn.example.org");
     }
 }

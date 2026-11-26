@@ -65,17 +65,20 @@ fn fetch_validated_subscription(
         outcome = fetch_subscription(url, options, &empty_cache).map_err(|error| error.to_string());
     }
     match outcome {
-        Ok(FetchOutcome::Fetched(result)) => match parsed_sources.parse(id, &result.content) {
-            Ok(parsed)
-                if parsed
+        Ok(FetchOutcome::Fetched(result)) => match parse_content(&result.content) {
+            Ok(parsed) => {
+                let valid_count = parsed
                     .proxies
                     .iter()
-                    .any(|proxy| proxy.fatal_issue().is_none()) =>
-            {
-                let count = parsed.proxies.len();
-                (Ok(FetchOutcome::Fetched(result)), count)
+                    .filter(|proxy| proxy.fatal_issue().is_none())
+                    .count();
+                if valid_count > 0 {
+                    let _ = parsed_sources.parse(id, &result.content);
+                    (Ok(FetchOutcome::Fetched(result)), valid_count)
+                } else {
+                    (Err("订阅没有可用节点，保留上次成功内容".into()), 0)
+                }
             }
-            Ok(_) => (Err("订阅没有可用节点，保留上次成功内容".into()), 0),
             Err(error) => (Err(format!("订阅解析失败，保留上次成功内容：{error}")), 0),
         },
         Ok(FetchOutcome::NotModified { .. }) if cached.is_none() => (
@@ -265,21 +268,20 @@ impl SwiftSubApp {
                 }
                 match outcome {
                     Ok(FetchOutcome::Fetched(result)) => {
-                        let info = result.info.clone().unwrap_or_default();
-                        let traffic = TrafficSnapshot {
+                        let traffic = result.info.as_ref().map(|info| TrafficSnapshot {
                             upload: info.upload,
                             download: info.download,
                             total: info.total,
                             expire_at: info.expire,
-                        };
+                        });
                         {
                             let store = lock_store(&store);
-                            if let Err(error) = store.save_fetch_success(
+                            if let Err(error) = store.save_fetch_success_optional(
                                 id,
                                 &result.content,
                                 result.etag.as_deref(),
                                 result.last_modified.as_deref(),
-                                &traffic,
+                                traffic.as_ref(),
                                 node_count,
                             ) {
                                 this.show_toast(format!("订阅保存失败，保留上次内容：{error}"), cx);

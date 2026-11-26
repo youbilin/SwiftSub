@@ -353,7 +353,7 @@ pub(super) fn link_compatibility_warnings(line: &str) -> Vec<String> {
         };
         let unsupported: Vec<_> = url
             .query_pairs()
-            .map(|(k, _)| k.to_lowercase())
+            .map(|(k, _)| k.to_lowercase().replace('_', "-"))
             .filter(|k| !supported.contains(&k.as_str()))
             .collect();
         return if unsupported.is_empty() {
@@ -436,7 +436,7 @@ pub(super) fn fragment_name(url: &Url) -> Option<String> {
 }
 
 pub(super) fn split_fragment(input: &str) -> (&str, Option<String>) {
-    match input.rsplit_once('#') {
+    match input.split_once('#') {
         Some((body, name)) => (body, Some(percent_decode(name))),
         None => (input, None),
     }

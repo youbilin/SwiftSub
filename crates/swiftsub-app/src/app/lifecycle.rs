@@ -113,6 +113,7 @@ impl SwiftSubApp {
                             }
                             if let Err(e) = this.checkpoint_draft(cx) {
                                 this.store_error = Some(format!("草稿自动保存失败：{e}"));
+                                cx.notify();
                             }
                         }
                         for action in this.desktop.actions() {

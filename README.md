@@ -14,7 +14,7 @@
 [![Platform](https://img.shields.io/badge/Installer-Windows%2010%2F11%20x64-0078D6?style=flat-square&logo=windows)](https://github.com/youbilin/SwiftSub/releases/latest)
 [![License](https://img.shields.io/badge/License-Apache--2.0-22C55E?style=flat-square)](LICENSE)
 
-[**下载 Windows 安装包 (v1.0.0)**](https://github.com/youbilin/SwiftSub/releases/latest) · [**界面预览**](#-界面预览) · [**核心优势**](#-为什么选择-swiftsub) · [**协议矩阵**](#-协议解析与导出支持) · [**局域网分发**](#-本机与局域网订阅分发) · [**开发构建**](#-工程架构与开发构建)
+[**下载 Windows 安装包 (v1.1.0)**](https://github.com/youbilin/SwiftSub/releases/latest) · [**界面预览**](#-界面预览) · [**核心优势**](#-为什么选择-swiftsub) · [**协议矩阵**](#-协议解析与导出支持) · [**局域网分发**](#-本机与局域网订阅分发) · [**开发构建**](#-工程架构与开发构建)
 
 </div>
 
@@ -71,7 +71,7 @@
 
 ## 为什么选择 SwiftSub
 
-| 维度 | 在线订阅转换服务 | 手工维护 Clash YAML | **SwiftSub v1.0** |
+| 维度 | 在线订阅转换服务 | 手工维护 Clash YAML | **SwiftSub v1.1** |
 |---|---|---|---|
 | **节点隐私与安全** | 订阅链接与密钥需上传第三方服务器 | 本地可控 | **100% 本地解析与托管，私网访问拦截，零外泄** |
 | **最新协议参数准确性** | 后端更新滞后，易漏参或导错字段 | 手写易拼错、难排查 | **深度对齐 Mihomo Schema，覆盖 REALITY / XHTTP / Hy2 / TUIC / ECH** |
@@ -131,7 +131,7 @@ SwiftSub 对常见分享链接与 Mihomo Schema 逐项对齐，自动处理 IPv6
 
 ## 安装与快速上手
 
-1. **下载安装**：前往 [Releases](https://github.com/youbilin/SwiftSub/releases/latest) 下载安装程序 `SwiftSub-v1.0.0-windows-x64-Setup.exe`，运行安装向导完成安装（支持覆盖升级、桌面/开始菜单快捷方式与系统控制面板干净卸载；用户数据持久化于 `%APPDATA%\SwiftSub`，升级自动保留）。
+1. **下载安装**：前往 [Releases](https://github.com/youbilin/SwiftSub/releases/latest) 下载安装程序 `SwiftSub-v1.1.0-windows-x64-Setup.exe`，运行安装向导完成安装（支持覆盖升级、桌面/开始菜单快捷方式与系统控制面板干净卸载；用户数据持久化于 `%APPDATA%\SwiftSub`，升级自动保留）。
 2. **导入节点**：在 **「生成」** 页左侧点击 **「添加节点 / 订阅」**，粘贴机场订阅地址、多行分享链接或导入 Clash YAML。
 3. **编排策略组与模板**：
    - 在 **「设置 → 模板」** 新建或编辑自定义模板，点击任意策略组管理规则后一键 **「应用」**；
@@ -177,8 +177,8 @@ cargo fmt --all -- --check
 # 构建 Release 主程序（启用 thin LTO 与符号剥离）
 .\scripts\cargo-msvc.bat build --release --locked -p swiftsub-app
 
-# 打包 Windows 安装程序（输出 dist\SwiftSub-v1.0.0-windows-x64-Setup.exe）
-iscc /DMyAppVersion=1.0.0 installer\swiftsub.iss
+# 打包 Windows 安装程序（输出 dist\SwiftSub-v1.1.0-windows-x64-Setup.exe）
+iscc /DMyAppVersion=1.1.0 installer\swiftsub.iss
 ```
 
 GitHub Actions 工作流（[.github/workflows/validate.yml](.github/workflows/validate.yml) 与 [.github/workflows/release.yml](.github/workflows/release.yml)）自动执行格式化校验、严格 Clippy、全量测试、100 节点预设基准生成、**真实 Mihomo 内核配置校验**、桌面启动/重启冒烟测试以及 Windows 安装包自动化发布。

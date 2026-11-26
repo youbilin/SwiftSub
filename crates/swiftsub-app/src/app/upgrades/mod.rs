@@ -68,10 +68,7 @@ impl SwiftSubApp {
         if !server.published_matches(token, yaml) {
             return "本地订阅更新中 · 当前修改尚未发布".into();
         }
-        let live = server
-            .profile_pulls()
-            .remove(token)
-            .map(|pull| (pull.at, pull.etag));
+        let live = server.profile_pull(token).map(|pull| (pull.at, pull.etag));
         let previous = self.upgrades.profile_pulls.get(token);
         let pull = live.as_ref().or(previous);
         match pull {

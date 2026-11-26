@@ -1164,9 +1164,14 @@ impl SwiftSubApp {
         })
     }
 
-    pub(super) fn node_share_action(&self, key: String, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn node_share_action(
+        &self,
+        scope: &str,
+        key: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         div()
-            .id(format!("share-node-{key}"))
+            .id(format!("{scope}-share-node-{key}"))
             .cursor_pointer()
             .w(px(32.))
             .h(px(32.))

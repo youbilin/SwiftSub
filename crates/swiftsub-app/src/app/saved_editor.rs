@@ -202,6 +202,23 @@ impl SwiftSubApp {
         cx.notify();
     }
 
+    pub fn saved_cancel_node_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((name, server, port)) = self.saved_editor.node_baseline.clone() {
+            self.saved_editor
+                .node_name
+                .update(cx, |s, cx| s.set_value(name, window, cx));
+            self.saved_editor
+                .node_server
+                .update(cx, |s, cx| s.set_value(server, window, cx));
+            self.saved_editor
+                .node_port
+                .update(cx, |s, cx| s.set_value(port, window, cx));
+        }
+        self.saved_editor.editing_node = false;
+        self.saved_config_error = None;
+        cx.notify();
+    }
+
     pub fn saved_begin_rule(
         &mut self,
         target: String,
@@ -708,6 +725,9 @@ impl SwiftSubApp {
             Ok(())
         })?;
         self.saved_editor.undo.push(before);
+        if self.saved_editor.undo.len() > 32 {
+            self.saved_editor.undo.remove(0);
+        }
         self.saved_editor.redo.clear();
         if group_changed {
             if self.saved_editor.rule_scope == old_group {
@@ -1041,6 +1061,7 @@ impl SwiftSubApp {
         if let Some(current) = self.saved_configs.iter_mut().find(|c| c.id == id) {
             *current = saved;
         }
+        self.refresh_config_summaries();
         self.saved_editor.pending = false;
         self.saved_file_baseline = None;
         self.saved_external_change = false;
@@ -1088,7 +1109,7 @@ impl SwiftSubApp {
                 self.saved_editor
                     .document
                     .as_ref()
-                    .is_some_and(|d| d.group(n).is_some())
+                    .is_some_and(|d| d.editable_group(n).is_some())
             })
             .or_else(|| {
                 self.saved_editor
@@ -1098,6 +1119,10 @@ impl SwiftSubApp {
             });
         if let Some(group) = group {
             self.populate_saved_group(group, window, cx);
+        } else {
+            self.saved_editor.selected_group = None;
+            self.saved_editor.group_expanded = false;
+            self.saved_editor.editing_group = false;
         }
         self.populate_saved_basic(window, cx);
         if let Err(e) = self.write_saved_visual(window, cx) {

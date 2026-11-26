@@ -244,8 +244,9 @@ fn list_lan_interfaces_windows() -> Vec<LanInterface> {
 
     let flags = GAA_FLAG_INCLUDE_GATEWAYS;
     let mut size: u32 = 16 * 1024;
-    let mut buffer: Vec<u8>;
-    loop {
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut succeeded = false;
+    for _ in 0..8 {
         buffer = vec![0u8; size as usize];
         let ret = unsafe {
             GetAdaptersAddresses(
@@ -257,11 +258,15 @@ fn list_lan_interfaces_windows() -> Vec<LanInterface> {
             )
         };
         if ret == ERROR_SUCCESS {
+            succeeded = true;
             break;
         }
         if ret == ERROR_BUFFER_OVERFLOW && size > 0 {
             continue;
         }
+        return Vec::new();
+    }
+    if !succeeded {
         return Vec::new();
     }
 
@@ -546,6 +551,10 @@ impl LocalServer {
             .unwrap_or_default()
     }
 
+    pub fn profile_pull(&self, token: &str) -> Option<ProfilePull> {
+        self.pulls.read().ok()?.get(token).cloned()
+    }
+
     pub fn published_etag(&self, token: &str) -> Option<String> {
         self.state
             .read()
@@ -640,8 +649,9 @@ fn handle_request(
     enforce_private: bool,
 ) {
     if enforce_private
-        && let Some(peer) = request.remote_addr()
-        && !is_private_or_local_ip(peer.ip())
+        && !request
+            .remote_addr()
+            .is_some_and(|peer| is_private_or_local_ip(peer.ip()))
     {
         let _ = request.respond(Response::empty(StatusCode(403)));
         return;
@@ -739,7 +749,22 @@ fn handle_request(
         })
     {
         let mut response = Response::empty(StatusCode(304));
-        if let Ok(header) = Header::from_bytes("ETag", etag.as_bytes()) {
+        for (name, value) in [
+            ("Cache-Control", "no-store".to_string()),
+            ("ETag", etag),
+            (
+                "Profile-Update-Interval",
+                snapshot.update_interval_hours.max(1).to_string(),
+            ),
+        ] {
+            if let Ok(header) = Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+                response.add_header(header);
+            }
+        }
+        if let Some(userinfo) = &snapshot.userinfo_header
+            && let Ok(header) =
+                Header::from_bytes("Subscription-Userinfo".as_bytes(), userinfo.as_bytes())
+        {
             response.add_header(header);
         }
         if request.respond(response).is_ok() {

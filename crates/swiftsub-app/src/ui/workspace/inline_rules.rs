@@ -250,10 +250,19 @@ impl SwiftSubApp {
                             .primary()
                             .label(format!("添加到 {target}"))
                             .on_click(cx.listener(move |this, _, window, cx| {
+                                let previous = this.template_custom_rule_sets.clone();
+                                let previous_url =
+                                    this.template_rule_url.read(cx).value().to_string();
                                 this.template_rules_target_filter = owner.clone();
                                 this.add_template_rule_set_url(window, cx);
-                                if this.template_error.is_none() {
+                                if this.template_error.is_none()
+                                    && this.template_custom_rule_sets.len() != previous.len()
+                                {
                                     if let Err(error) = this.autosave_routing(window, cx) {
+                                        this.template_custom_rule_sets = previous;
+                                        this.template_rule_url.update(cx, |input, cx| {
+                                            input.set_value(previous_url, window, cx)
+                                        });
                                         this.template_error = Some(error);
                                     } else {
                                         this.workspace.rule_picker_open = false;
@@ -832,6 +841,33 @@ impl SwiftSubApp {
             .child(Input::new(&self.template_policy_rename))
             .child(field_label("说明（可选）"))
             .child(Input::new(&self.workspace.description));
+        if group.kind != GroupKind::Select {
+            panel = panel
+                .child(field_label("测速地址（留空使用全局默认）"))
+                .child(Input::new(&self.template_health_url).cleanable(true))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_1()
+                                .child(field_label("测速周期（秒）"))
+                                .child(Input::new(&self.template_health_interval).cleanable(true)),
+                        )
+                        .when(group.kind == GroupKind::UrlTest, |row| {
+                            row.child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .child(field_label("测速容差（毫秒）"))
+                                    .child(Input::new(&self.workspace.tolerance).cleanable(true)),
+                            )
+                        }),
+                );
+        }
         if group.kind == GroupKind::LoadBalance {
             panel = panel.child(field_label("负载均衡策略")).child(
                 self.saved_choice(

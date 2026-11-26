@@ -19,7 +19,6 @@ fn main() {
 
     application().with_assets(assets::Assets).run(move |cx| {
         init(cx);
-        cx.set_window_appearance(Some(WindowAppearance::Dark));
         Theme::change(ThemeMode::Dark, None, cx);
         configure_theme(cx, false);
 

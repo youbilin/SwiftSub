@@ -433,19 +433,22 @@ impl SwiftSubApp {
         self.workspace.group_settings_open = false;
         self.workspace.rule_picker_open = false;
         self.workspace.rule_metadata_id = None;
-        self.workspace.rules_target = Some(name.clone());
         if self.custom_groups.iter().any(|group| group.name == name)
             || self.chains.iter().any(|chain| chain.name == name)
         {
+            let was_expanded = self.workspace.rules_target.as_deref() == Some(name.as_str())
+                && self.template_policy_edit.is_none();
             self.template_tab = if self.chains.iter().any(|chain| chain.name == name) {
                 TemplateTab::Tools
             } else {
                 TemplateTab::PolicyGroups
             };
             self.template_policy_edit = None;
+            self.workspace.rules_target = if was_expanded { None } else { Some(name) };
             cx.notify();
             return;
         }
+        self.workspace.rules_target = Some(name.clone());
         if let Some(index) = self
             .template_policy_groups
             .iter()
@@ -640,13 +643,25 @@ impl SwiftSubApp {
         let previous_visibility = self.workspace.rule_visibility.clone();
         let removed_chain = self.chains.iter().position(|chain| chain.name == name);
         for group in &mut snapshot.policy_groups {
-            for member in &mut group.members {
-                if member == &name {
-                    *member = target.clone();
+            let mut next = Vec::with_capacity(group.members.len());
+            let mut seen = HashSet::new();
+            for member in group.members.drain(..) {
+                let replaced = if member == name {
+                    if group.name == target {
+                        continue;
+                    }
+                    target.clone()
+                } else {
+                    member
+                };
+                if seen.insert(replaced.clone()) {
+                    next.push(replaced);
                 }
             }
-            let mut seen = HashSet::new();
-            group.members.retain(|member| seen.insert(member.clone()));
+            if !group.include_all_nodes && next.is_empty() && !group.disabled && !group.removed {
+                next.push("DIRECT".into());
+            }
+            group.members = next;
         }
         for binding in &mut snapshot.custom_rule_sets {
             if binding.target == name {

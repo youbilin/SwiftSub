@@ -812,6 +812,7 @@ impl SwiftSubApp {
                         let node = &self.nodes[i];
                         node.name().to_lowercase().contains(&query)
                             || node.proxy.kind().to_lowercase().contains(&query)
+                            || node.source_name.to_lowercase().contains(&query)
                     }
                     WorkspaceNodeKind::Chain(i) => {
                         let chain = &self.chains[i];
@@ -851,9 +852,12 @@ impl SwiftSubApp {
                             .map(|idx| {
                                 let (position, item) = &filtered[idx];
                                 let row = match item.kind {
-                                    WorkspaceNodeKind::Node(node_index) => {
-                                        this.clean_node_row(&this.nodes[node_index], *position, cx)
-                                    }
+                                    WorkspaceNodeKind::Node(node_index) => this.clean_node_row(
+                                        &this.nodes[node_index],
+                                        *position,
+                                        "sidebar",
+                                        cx,
+                                    ),
                                     WorkspaceNodeKind::Chain(chain_index) => {
                                         this.clean_chain_row(chain_index, *position, "sidebar", cx)
                                     }
@@ -920,6 +924,7 @@ impl SwiftSubApp {
         &self,
         node: &Node,
         position: usize,
+        scope: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let key = node.source_key.clone();
@@ -927,10 +932,10 @@ impl SwiftSubApp {
         let delete_key = key.clone();
         let name = node.name().to_string();
         let proto = short_protocol(node.proxy.kind());
-        let group_id = SharedString::from(format!("node-row-group-{key}"));
+        let group_id = SharedString::from(format!("{scope}-node-row-group-{key}"));
 
         let row = object_row()
-            .id(format!("node-row-{key}"))
+            .id(format!("{scope}-node-row-{key}"))
             .group(group_id.clone())
             .when(!node.enabled, |row| row.opacity(0.6))
             .hover(|style| style.bg(rgb(SURFACE_2)))
@@ -963,9 +968,9 @@ impl SwiftSubApp {
                             .rounded(px(6.))
                             .invisible()
                             .group_hover(group_id, |style| style.visible())
-                            .child(self.node_share_action(key.clone(), cx))
+                            .child(self.node_share_action(scope, key.clone(), cx))
                             .child(object_action(
-                                format!("rename-node-{key}"),
+                                format!("{scope}-rename-node-{key}"),
                                 edit_icon(),
                                 "编辑节点",
                                 cx,
@@ -974,7 +979,7 @@ impl SwiftSubApp {
                                 },
                             ))
                             .child(danger_action(
-                                format!("delete-node-{key}"),
+                                format!("{scope}-delete-node-{key}"),
                                 delete_icon(),
                                 "删除节点",
                                 cx,
@@ -985,7 +990,7 @@ impl SwiftSubApp {
                     ),
             )
             .child(
-                Switch::new(format!("node-switch-{key}"))
+                Switch::new(format!("{scope}-node-switch-{key}"))
                     .small()
                     .checked(node.enabled)
                     .accessibility_label("启用节点")
@@ -1276,7 +1281,12 @@ impl SwiftSubApp {
             .into_any_element()
     }
 
-    fn group_summary_text(&self, name: &str, index: Option<usize>, module: Option<&str>) -> String {
+    fn group_summary_text(
+        &self,
+        index: Option<usize>,
+        module: Option<&str>,
+        rule_count: usize,
+    ) -> String {
         let kind_label = index
             .and_then(|i| self.template_policy_groups.get(i))
             .map(|group| group_kind_label(group.kind))
@@ -1285,16 +1295,25 @@ impl SwiftSubApp {
             } else {
                 "手动选择"
             });
-        let member_count = index
-            .and_then(|i| self.template_policy_groups.get(i))
-            .map(|group| {
-                if group.include_all_nodes {
-                    self.nodes.iter().filter(|n| n.enabled).count() + group.members.len()
-                } else {
-                    group.members.len()
-                }
-            });
-        let rule_count = self.workspace_owned_rules(name).len();
+        let member_count = if let Some(i) = index {
+            Some(self.workspace_selected_members(i).len())
+        } else if let Some(mod_id) = module
+            && let Some(m) = catalog::module(mod_id)
+        {
+            let active_nodes = self.nodes.iter().filter(|n| n.enabled).count()
+                + self.chains.iter().filter(|c| !c.disabled).count();
+            let base = match m.kind {
+                ModuleKind::Select => 2 + active_nodes, // 自动选择 + DIRECT + nodes
+                ModuleKind::Auto => active_nodes,
+                ModuleKind::Service | ModuleKind::Final => 3 + active_nodes, // 节点选择 + 自动选择 + DIRECT + nodes
+                ModuleKind::DirectFirst => 2,
+                ModuleKind::RejectFirst => 3,
+                ModuleKind::Region(_) => active_nodes,
+            };
+            Some(base)
+        } else {
+            None
+        };
         match (member_count, rule_count) {
             (Some(m), r) if r > 0 => format!("{kind_label} · {m} 节点 · {r} 规则"),
             (Some(m), _) => format!("{kind_label} · {m} 节点"),
@@ -1305,19 +1324,21 @@ impl SwiftSubApp {
 
     pub(super) fn clean_group_card(
         &self,
-        name: &str,
-        index: Option<usize>,
-        module: Option<&str>,
-        enabled: bool,
+        item: &crate::app::ordering::WorkspaceGroupItem,
         position: usize,
+        rule_count: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let name = item.name.as_str();
+        let index = item.index;
+        let module = item.module;
+        let enabled = item.enabled;
         let expanded = index.is_some() && self.template_policy_edit == index;
         let edit_name = name.to_string();
         let settings_name = name.to_string();
         let delete_name = name.to_string();
         let toggle_name = name.to_string();
-        let summary = self.group_summary_text(name, index, module);
+        let summary = self.group_summary_text(index, module, rule_count);
 
         let mut card = v_flex()
             .min_w_0()
@@ -1521,18 +1542,52 @@ impl SwiftSubApp {
             .value()
             .trim()
             .to_lowercase();
-        let mut candidates: Vec<String> = self
+        let active_nodes: HashSet<&str> = self
             .nodes
             .iter()
             .filter(|node| node.enabled)
-            .map(|node| node.name().to_string())
+            .map(Node::name)
+            .collect();
+        let active_chains: HashSet<&str> = self
+            .chains
+            .iter()
+            .filter(|chain| !chain.disabled)
+            .map(|chain| chain.name.as_str())
+            .collect();
+        let active_filters: HashSet<&str> = self
+            .custom_groups
+            .iter()
+            .filter(|filter| !filter.disabled)
+            .map(|filter| filter.name.as_str())
+            .collect();
+        let other_groups: Vec<String> = self
+            .workspace_group_items()
+            .into_iter()
+            .filter(|item| item.enabled && item.name != group.name)
+            .map(|item| item.name)
+            .collect();
+        let mut candidates: Vec<String> = group
+            .members
+            .iter()
+            .cloned()
+            .chain(other_groups)
+            .chain(
+                ["DIRECT", "REJECT", "REJECT-DROP"]
+                    .into_iter()
+                    .map(str::to_string),
+            )
+            .chain(
+                self.nodes
+                    .iter()
+                    .filter(|node| node.enabled)
+                    .map(|node| node.name().to_string()),
+            )
             .chain(
                 self.chains
                     .iter()
                     .filter(|chain| !chain.disabled)
                     .map(|chain| chain.name.clone()),
             )
-            .chain(group.members.iter().cloned())
             .collect();
         let mut seen = HashSet::new();
         candidates.retain(|name| {
@@ -1544,16 +1599,24 @@ impl SwiftSubApp {
                 .position(|member| member == name)
                 .unwrap_or(usize::MAX)
         });
+        let total_candidates = candidates.len();
+        let filtered_node_names: Vec<String> = candidates
+            .iter()
+            .filter(|name| {
+                active_nodes.contains(name.as_str()) || active_chains.contains(name.as_str())
+            })
+            .cloned()
+            .collect();
+        let has_selected_nodes = group.include_all_nodes
+            || group.members.iter().any(|name| {
+                active_nodes.contains(name.as_str()) || active_chains.contains(name.as_str())
+            });
         let mut rows = v_flex().gap_2().min_w_0();
         for name in candidates {
-            let is_node = self
-                .nodes
-                .iter()
-                .any(|node| node.enabled && node.name() == name)
-                || self
-                    .chains
-                    .iter()
-                    .any(|chain| !chain.disabled && chain.name == name);
+            let is_chain = active_chains.contains(name.as_str());
+            let is_node = active_nodes.contains(name.as_str()) || is_chain;
+            let is_policy = matches!(name.as_str(), "DIRECT" | "REJECT" | "REJECT-DROP");
+            let is_filter = active_filters.contains(name.as_str());
             let selected = group.members.contains(&name) || (group.include_all_nodes && is_node);
             let remove_name = name.clone();
             let remove_key = self
@@ -1568,6 +1631,17 @@ impl SwiftSubApp {
                 .iter()
                 .position(|member| member == &name)
                 .unwrap_or_default();
+            let role_badge = if is_chain {
+                Some(("链式", true))
+            } else if is_policy {
+                Some(("策略", false))
+            } else if is_filter {
+                Some(("筛选组", false))
+            } else if !is_node {
+                Some(("策略组", false))
+            } else {
+                None
+            };
             let row = object_row()
                 .id(format!("workspace-member-row-{index}-{name}"))
                 .when(!selected, |row| row.opacity(0.65))
@@ -1590,49 +1664,51 @@ impl SwiftSubApp {
                         .text_color(rgb(if selected { TEXT } else { MUTED }))
                         .child(name.clone()),
                 )
-                .when(
-                    !matches!(name.as_str(), "DIRECT" | "REJECT" | "REJECT-DROP"),
-                    |row| {
-                        row.child(object_action(
-                            format!("member-edit-{name}"),
-                            edit_icon(),
-                            "编辑",
-                            cx,
-                            move |this, window, cx| {
-                                this.edit_workspace_member(edit_name.clone(), window, cx)
-                            },
-                        ))
-                    },
-                )
-                .child(danger_action(
-                    format!("member-remove-{name}"),
-                    delete_icon(),
-                    if remove_key.is_some() {
-                        "删除节点"
-                    } else if remove_chain {
-                        "删除链式节点"
-                    } else {
-                        "从策略组移除"
-                    },
-                    cx,
-                    move |this, window, cx| {
-                        if let Some(key) = &remove_key {
-                            this.remove_workspace_node(key.clone(), window, cx);
+                .when_some(role_badge, |row, (label, accent)| {
+                    row.child(micro_badge(label, accent))
+                })
+                .when(!is_policy, |row| {
+                    row.child(object_action(
+                        format!("member-edit-{index}-{name}"),
+                        edit_icon(),
+                        "编辑",
+                        cx,
+                        move |this, window, cx| {
+                            this.edit_workspace_member(edit_name.clone(), window, cx)
+                        },
+                    ))
+                })
+                .when(remove_key.is_some() || remove_chain || selected, |row| {
+                    row.child(danger_action(
+                        format!("member-remove-{index}-{name}"),
+                        delete_icon(),
+                        if remove_key.is_some() {
+                            "删除节点"
                         } else if remove_chain {
-                            this.workspace_remove_group(remove_name.clone(), window, cx);
+                            "删除链式节点"
                         } else {
-                            this.set_workspace_member(
-                                index,
-                                remove_name.clone(),
-                                false,
-                                window,
-                                cx,
-                            );
-                        }
-                    },
-                ))
+                            "从策略组移除"
+                        },
+                        cx,
+                        move |this, window, cx| {
+                            if let Some(key) = &remove_key {
+                                this.remove_workspace_node(key.clone(), window, cx);
+                            } else if remove_chain {
+                                this.workspace_remove_group(remove_name.clone(), window, cx);
+                            } else {
+                                this.set_workspace_member(
+                                    index,
+                                    remove_name.clone(),
+                                    false,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        },
+                    ))
+                })
                 .child(
-                    Switch::new(format!("member-switch-{name}"))
+                    Switch::new(format!("member-switch-{index}-{name}"))
                         .small()
                         .checked(selected)
                         .accessibility_label("加入策略组")
@@ -1653,12 +1729,99 @@ impl SwiftSubApp {
                 row.into_any_element()
             });
         }
+        let select_filtered = filtered_node_names.clone();
+        let clear_filtered = filtered_node_names;
+        let has_query = !query.is_empty();
         v_flex()
             .min_w_0()
             .gap_2()
-            .when(self.nodes.len() + self.chains.len() > 12, |panel| {
-                panel.child(Input::new(&self.template_member_search).cleanable(true))
-            })
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(rgb(BORDER_ITEM))
+                    .bg(rgb(SURFACE))
+                    .child(
+                        Switch::new(format!("group-include-all-{index}"))
+                            .small()
+                            .checked(group.include_all_nodes)
+                            .accessibility_label("自动包含全部启用节点")
+                            .on_change(cx.listener(move |this, checked, window, cx| {
+                                this.set_workspace_include_all_nodes(index, *checked, window, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(if group.include_all_nodes { TEXT } else { MUTED }))
+                            .child("使用全部节点"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(11.))
+                            .text_color(rgb(MUTED))
+                            .child(format!(
+                                "已选 {} / {}",
+                                selected_members.len(),
+                                total_candidates
+                            )),
+                    )
+                    .when(has_query && !select_filtered.is_empty(), |bar| {
+                        bar.child(
+                            Button::new(format!("group-select-filtered-{index}"))
+                                .ghost()
+                                .label("全选筛选")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.batch_set_workspace_members(
+                                        index,
+                                        select_filtered.clone(),
+                                        true,
+                                        window,
+                                        cx,
+                                    )
+                                })),
+                        )
+                        .child(
+                            Button::new(format!("group-clear-filtered-{index}"))
+                                .ghost()
+                                .label("取消筛选")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.batch_set_workspace_members(
+                                        index,
+                                        clear_filtered.clone(),
+                                        false,
+                                        window,
+                                        cx,
+                                    )
+                                })),
+                        )
+                    })
+                    .when(
+                        !has_query && !group.include_all_nodes && has_selected_nodes,
+                        |bar| {
+                            bar.child(
+                                Button::new(format!("group-clear-nodes-{index}"))
+                                    .ghost()
+                                    .label("清空节点")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.set_workspace_include_all_nodes(
+                                            index, false, window, cx,
+                                        )
+                                    })),
+                            )
+                        },
+                    ),
+            )
+            .when(
+                self.nodes.len() + self.chains.len() > 8 || has_query,
+                |panel| panel.child(Input::new(&self.template_member_search).cleanable(true)),
+            )
             .child(
                 div()
                     .id("workspace-member-list")
@@ -2044,6 +2207,7 @@ impl SwiftSubApp {
         &self,
         index: usize,
         position: usize,
+        rule_count: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let group = &self.custom_groups[index];
@@ -2056,7 +2220,6 @@ impl SwiftSubApp {
             .iter()
             .filter(|node| node.enabled && group.filter.matches(node))
             .count();
-        let rule_count = self.workspace_owned_rules(&name).len();
         let summary = if rule_count > 0 {
             format!("筛选组 · {match_count} 节点 · {rule_count} 规则")
         } else {
@@ -2149,14 +2312,14 @@ impl SwiftSubApp {
             );
         if expanded {
             let target = group.name.clone();
+            let node_items = self.workspace_node_items();
             let mut nodes = v_flex().gap_2();
-            for (pos, node) in self
-                .nodes
-                .iter()
-                .filter(|node| group.filter.matches(node))
-                .enumerate()
-            {
-                nodes = nodes.child(self.clean_node_row(node, pos, cx));
+            for node in self.nodes.iter().filter(|node| group.filter.matches(node)) {
+                let global_pos = node_items
+                    .iter()
+                    .position(|item| item.key == node.source_key)
+                    .unwrap_or_default();
+                nodes = nodes.child(self.clean_node_row(node, global_pos, "filter", cx));
             }
             card = card.child(
                 v_flex()

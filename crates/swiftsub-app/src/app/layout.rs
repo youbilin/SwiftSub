@@ -74,13 +74,25 @@ pub(super) fn retarget_snapshot(snapshot: &mut TemplateSnapshot, old: &str, new:
         }
     }
     for group in &mut snapshot.policy_groups {
-        for member in &mut group.members {
-            if member == old {
-                *member = new.into();
+        let mut next = Vec::with_capacity(group.members.len());
+        let mut seen = HashSet::new();
+        for member in group.members.drain(..) {
+            let replaced = if member == old {
+                if group.name == new {
+                    continue;
+                }
+                new.to_string()
+            } else {
+                member
+            };
+            if seen.insert(replaced.clone()) {
+                next.push(replaced);
             }
         }
-        let mut seen = HashSet::new();
-        group.members.retain(|member| seen.insert(member.clone()));
+        if !group.include_all_nodes && next.is_empty() && !group.disabled && !group.removed {
+            next.push("DIRECT".into());
+        }
+        group.members = next;
     }
     for binding in &mut snapshot.custom_rule_sets {
         if binding.target == old {
@@ -288,7 +300,11 @@ impl SwiftSubApp {
         let previous = self.workspace.rule_visibility.clone();
         self.workspace.rule_visibility.disabled_sets.remove(&id);
         let result = self.draft_template_snapshot(cx).and_then(|mut snapshot| {
-            if !snapshot.disabled_rule_sets.contains(&id) {
+            let was_custom = snapshot.custom_rule_sets.iter().any(|item| item.id == id);
+            if was_custom {
+                snapshot.custom_rule_sets.retain(|item| item.id != id);
+                snapshot.disabled_rule_sets.retain(|item| item != &id);
+            } else if !snapshot.disabled_rule_sets.contains(&id) {
                 snapshot.disabled_rule_sets.push(id.clone());
             }
             self.persist_and_commit_template(snapshot.clone(), None, window, cx)?;
@@ -1235,6 +1251,109 @@ impl SwiftSubApp {
         cx.notify();
     }
 
+    pub fn set_workspace_include_all_nodes(
+        &mut self,
+        index: usize,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.finish_workspace_fields(window, cx) {
+            return;
+        }
+        let node_and_chain_names: HashSet<String> = self
+            .nodes
+            .iter()
+            .filter(|node| node.enabled)
+            .map(|node| node.name().to_string())
+            .chain(
+                self.chains
+                    .iter()
+                    .filter(|chain| !chain.disabled)
+                    .map(|chain| chain.name.clone()),
+            )
+            .collect();
+        let result = self.draft_template_snapshot(cx).and_then(|mut snapshot| {
+            let group = snapshot
+                .policy_groups
+                .get_mut(index)
+                .ok_or("策略组已删除")?;
+            group.include_all_nodes = enabled;
+            group
+                .members
+                .retain(|member| !node_and_chain_names.contains(member));
+            if !enabled && group.members.is_empty() {
+                group.members.push("DIRECT".into());
+            }
+            let mut seen = HashSet::new();
+            group.members.retain(|member| seen.insert(member.clone()));
+            self.persist_and_commit_template(snapshot.clone(), None, window, cx)?;
+            self.sync_workspace_snapshot(snapshot, window, cx);
+            Ok(())
+        });
+        if let Err(error) = result {
+            self.template_error = Some(error);
+        }
+        cx.notify();
+    }
+
+    pub fn batch_set_workspace_members(
+        &mut self,
+        index: usize,
+        names: Vec<String>,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if names.is_empty() || !self.finish_workspace_fields(window, cx) {
+            return;
+        }
+        let inherited: Vec<String> = self
+            .nodes
+            .iter()
+            .filter(|node| node.enabled)
+            .map(|node| node.name().to_string())
+            .chain(
+                self.chains
+                    .iter()
+                    .filter(|chain| !chain.disabled)
+                    .map(|chain| chain.name.clone()),
+            )
+            .collect();
+        let target_set: HashSet<String> = names.iter().cloned().collect();
+        let result = self.draft_template_snapshot(cx).and_then(|mut snapshot| {
+            let group = snapshot
+                .policy_groups
+                .get_mut(index)
+                .ok_or("策略组已删除")?;
+            if group.include_all_nodes && !enabled {
+                group.include_all_nodes = false;
+                group.members.extend(inherited);
+            }
+            if enabled {
+                for name in names {
+                    if name != group.name {
+                        group.members.push(name);
+                    }
+                }
+            } else {
+                group.members.retain(|member| !target_set.contains(member));
+                if !group.include_all_nodes && group.members.is_empty() {
+                    group.members.push("DIRECT".into());
+                }
+            }
+            let mut seen = HashSet::new();
+            group.members.retain(|member| seen.insert(member.clone()));
+            self.persist_and_commit_template(snapshot.clone(), None, window, cx)?;
+            self.sync_workspace_snapshot(snapshot, window, cx);
+            Ok(())
+        });
+        if let Err(error) = result {
+            self.template_error = Some(error);
+        }
+        cx.notify();
+    }
+
     pub fn edit_workspace_member(
         &mut self,
         name: String,
@@ -1281,20 +1400,21 @@ impl SwiftSubApp {
         let previous_visibility = self.workspace.rule_visibility.clone();
         let result = (|| {
             let mut snapshot = self.draft_template_snapshot(cx)?;
+            let select_name = self.workspace_resolved_group_name("节点选择").to_string();
             let fallback = if snapshot
                 .policy_groups
                 .iter()
-                .any(|group| group.name == "节点选择" && (group.disabled || group.removed))
+                .any(|group| group.name == select_name && (group.disabled || group.removed))
             {
-                "DIRECT"
+                "DIRECT".to_string()
             } else {
-                "节点选择"
+                select_name
             };
-            retarget_snapshot(&mut snapshot, node.name(), fallback);
+            retarget_snapshot(&mut snapshot, node.name(), &fallback);
             workspace::retarget_rule_lines(
                 &mut self.workspace.rule_visibility.disabled_manual,
                 node.name(),
-                fallback,
+                &fallback,
             );
             for chain in &mut snapshot.chains {
                 if chain_uses_node(chain, &node) {
@@ -1434,6 +1554,46 @@ impl SwiftSubApp {
         cx.notify();
     }
 
+    pub(super) fn workspace_node_overrides_batch(
+        &self,
+        nodes: &[Node],
+    ) -> Result<Vec<swiftsub_store::NodeOverride>, String> {
+        let store = self.store.lock().map_err(|error| error.to_string())?;
+        let mut by_sub: HashMap<i64, HashMap<String, swiftsub_store::NodeOverride>> =
+            HashMap::new();
+        let mut out = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let sub_id = node
+                .source_id
+                .parse::<i64>()
+                .map_err(|_| "该节点不支持编辑".to_string())?;
+            if let std::collections::hash_map::Entry::Vacant(entry) = by_sub.entry(sub_id) {
+                entry.insert(
+                    store
+                        .list_node_overrides(sub_id)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            let existing = by_sub
+                .get(&sub_id)
+                .and_then(|map| map.get(&node.source_key));
+            out.push(swiftsub_store::NodeOverride {
+                sub_id,
+                node_key: node.source_key.clone(),
+                alias: Some(node.name().into()),
+                enabled: Some(node.enabled),
+                listen_port: node.listen_port,
+                sort_order: existing.and_then(|value| value.sort_order),
+                extras: Some(
+                    node.proxy
+                        .to_yaml_text()
+                        .map_err(|error| error.to_string())?,
+                ),
+            });
+        }
+        Ok(out)
+    }
+
     pub(super) fn workspace_node_override(
         &self,
         node: &Node,
@@ -1511,11 +1671,16 @@ impl SwiftSubApp {
             .into_iter()
             .find(|group| group.name == name)
             .ok_or("没有匹配的策略组")?;
-        let all_nodes = matches!(name, "节点选择" | "自动选择");
+        let all_nodes =
+            catalog::module_by_name(name).is_some_and(catalog::default_includes_all_nodes);
         let members = group
             .proxies
             .into_iter()
-            .filter(|member| !all_nodes || !nodes.iter().any(|node| node.name() == member))
+            .filter(|member| {
+                !all_nodes
+                    || (!nodes.iter().any(|node| node.name() == member)
+                        && !self.chains.iter().any(|chain| chain.name == *member))
+            })
             .map(|member| self.workspace_resolved_group_name(&member).to_string())
             .collect();
         Ok(PolicyGroupSpec {
@@ -1956,5 +2121,30 @@ mod tests {
         .unwrap();
         assert_eq!(saved.workspace_json.as_deref(), Some("still unfinished"));
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn retarget_snapshot_never_creates_self_cycle_in_fallback_group() {
+        let mut snapshot: TemplateSnapshot = serde_json::from_value(serde_json::json!({
+            "preset": "minimal",
+            "enabled_modules": [],
+            "test_url": "https://example.org",
+            "test_interval": 300,
+            "mixed_port": 7897,
+            "allow_lan": false
+        }))
+        .unwrap();
+        snapshot.policy_groups.push(PolicyGroupSpec {
+            id: "builtin:节点选择".into(),
+            name: "节点选择".into(),
+            builtin: true,
+            members: vec!["自动选择".into(), "Node-A".into(), "DIRECT".into()],
+            include_all_nodes: false,
+            ..Default::default()
+        });
+        retarget_snapshot(&mut snapshot, "Node-A", "节点选择");
+        let members = &snapshot.policy_groups[0].members;
+        assert!(!members.contains(&"节点选择".to_string()));
+        assert_eq!(members, &vec!["自动选择".to_string(), "DIRECT".to_string()]);
     }
 }

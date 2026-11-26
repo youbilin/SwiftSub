@@ -424,4 +424,37 @@ mod extended_tests {
         }
         assert!(!link_compatibility_warnings("anytls://p@example.org?unknown=1").is_empty());
     }
+
+    #[test]
+    fn parses_juicity_underscores_hash_fragments_and_empty_ssr_params() {
+        use base64::Engine;
+        let juicity = parse_link(
+            "juicity://11111111-2222-3333-4444-555555555555:secret@example.org:443?congestion_control=bbr&pinned_certchain_sha256=deadbeef&allow_insecure=1#JC",
+        )
+        .unwrap();
+        assert_eq!(juicity.get_str("congestion-controller"), Some("bbr"));
+        assert_eq!(juicity.get_str("fingerprint"), Some("deadbeef"));
+        assert_eq!(juicity.get_bool("skip-cert-verify"), Some(true));
+
+        let ss_hash =
+            parse_link("ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@example.org:8388#HK%20#01").unwrap();
+        assert_eq!(ss_hash.name(), "HK #01");
+
+        let raw =
+            "example.org:8388:origin:aes-256-cfb:plain:cGFzcw/?obfsparam=&protoparam=&remarks=";
+        let ssr = format!(
+            "ssr://{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+        );
+        let parsed_ssr = parse_link(&ssr).unwrap();
+        assert_eq!(parsed_ssr.kind(), "ssr");
+
+        let wg_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA%3D";
+        let wg = parse_link(&format!(
+            "wireguard://{wg_key}@example.org:51820?publickey={wg_key}&address=10.0.0.2%2F32%2C%20fd00%3A%3A2%2F128&reserved=1%2C%202%2C%203"
+        ))
+        .unwrap();
+        assert_eq!(wg.get_str("ip"), Some("10.0.0.2"));
+        assert_eq!(wg.get_str("ipv6"), Some("fd00::2"));
+    }
 }

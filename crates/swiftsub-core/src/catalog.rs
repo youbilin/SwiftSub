@@ -639,6 +639,20 @@ pub fn module(id: &str) -> Option<&'static Module> {
     MODULES.iter().find(|module| module.id == id)
 }
 
+pub fn module_by_name(name: &str) -> Option<&'static Module> {
+    MODULES.iter().find(|module| module.name == name)
+}
+
+/// Whether a built-in module's policy group includes all proxy nodes by default.
+/// Service and Final groups expose all nodes alongside `节点选择` / `自动选择` / `DIRECT`,
+/// while DirectFirst / RejectFirst groups stay focused on direct/reject/select policies.
+pub fn default_includes_all_nodes(module: &Module) -> bool {
+    matches!(
+        module.kind,
+        ModuleKind::Select | ModuleKind::Auto | ModuleKind::Service | ModuleKind::Final
+    )
+}
+
 pub fn modules_for_preset(preset: Preset) -> Vec<&'static Module> {
     MODULES
         .iter()

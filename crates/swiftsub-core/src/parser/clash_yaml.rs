@@ -29,21 +29,16 @@ pub fn parse_clash_yaml(input: &str) -> Result<ClashYamlOutput> {
     for (index, item) in sequence.iter().enumerate() {
         match Proxy::from_value(item.clone()) {
             Ok(proxy) => {
+                let mut messages = Vec::new();
                 if !is_known_protocol(proxy.kind()) {
-                    warnings.push(ParseWarning::new(
-                        Some(index + 1),
-                        format!(
-                            "节点 '{}' 的协议 '{}' 未验证，将原样透传",
-                            proxy.name(),
-                            proxy.kind()
-                        ),
-                    ));
+                    let message = format!(
+                        "节点 '{}' 的协议 '{}' 未验证，将原样透传",
+                        proxy.name(),
+                        proxy.kind()
+                    );
+                    warnings.push(ParseWarning::new(Some(index + 1), message.clone()));
+                    messages.push(message);
                 }
-                let mut messages: Vec<_> = warnings
-                    .iter()
-                    .filter(|w| w.line == Some(index + 1))
-                    .map(|w| w.message.clone())
-                    .collect();
                 let status = if let Some(issue) = proxy.fatal_issue() {
                     messages.push(issue);
                     ImportStatus::Rejected
@@ -88,7 +83,7 @@ pub fn looks_like_clash_yaml(input: &str) -> bool {
         return true;
     }
 
-    for line in input.lines().take(40) {
+    for line in input.lines().take(2000) {
         let line = line.trim_start();
         if line.starts_with('#') || line.is_empty() {
             continue;

@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashMap;
 mod inline_rules;
 mod settings;
 mod template_editor;
@@ -184,25 +185,42 @@ impl SwiftSubApp {
         let reveal = self.workspace.reveal_group.borrow_mut().take();
         let offset = usize::from(self.workspace.new_group_open);
         let group_items = self.workspace_group_items();
+        let all_rule_choices = self.workspace_rule_choices();
+        let manual_rules =
+            crate::app::parse_custom_rule_lines(&self.template_custom_rules.read(cx).value())
+                .unwrap_or_default();
+        let mut rule_counts: HashMap<String, usize> = HashMap::new();
+        for choice in &all_rule_choices {
+            if choice.active {
+                *rule_counts
+                    .entry(choice.binding.target.clone())
+                    .or_default() += 1;
+            }
+        }
+        for rule in &manual_rules {
+            *rule_counts.entry(rule.target.clone()).or_default() += 1;
+        }
         for (index, item) in group_items.into_iter().enumerate() {
             if reveal.as_deref() == Some(&item.name) {
                 self.workspace
                     .group_scroll
                     .scroll_to_top_of_item(index + offset);
             }
+            let rule_count = rule_counts.get(&item.name).copied().unwrap_or(0);
             rows = rows.child(if let Some(filter_index) = item.filter {
-                self.clean_filter_group_card(filter_index, index, cx)
+                self.clean_filter_group_card(filter_index, index, rule_count, cx)
             } else {
-                self.clean_group_card(&item.name, item.index, item.module, item.enabled, index, cx)
+                self.clean_group_card(&item, index, rule_count, cx)
             });
         }
         for target in ["DIRECT", "REJECT", "REJECT-DROP"] {
-            let aux_rules = self.workspace_group_rules(target);
-            if aux_rules.is_empty() {
+            let aux_count = rule_counts.get(target).copied().unwrap_or(0);
+            if aux_count == 0 {
                 continue;
             }
             let target_name = target.to_string();
-            let expanded = self.workspace.rules_target.as_deref() == Some(target);
+            let expanded = self.workspace.rules_target.as_deref() == Some(target)
+                && self.template_policy_edit.is_none();
             rows = rows.child(
                 v_flex()
                     .flex_shrink_0()
@@ -235,11 +253,19 @@ impl SwiftSubApp {
                                 div()
                                     .text_size(px(11.5))
                                     .text_color(rgb(MUTED))
-                                    .child(format!("{} 条规则", aux_rules.len())),
+                                    .child(format!("{aux_count} 条规则")),
                             )
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.workspace_rules_for(target_name.clone(), window, cx);
-                                this.workspace.group_rules_tab = true;
+                                if this.workspace.rules_target.as_deref()
+                                    == Some(target_name.as_str())
+                                    && this.template_policy_edit.is_none()
+                                {
+                                    this.workspace.rules_target = None;
+                                    cx.notify();
+                                } else {
+                                    this.workspace_rules_for(target_name.clone(), window, cx);
+                                    this.workspace.group_rules_tab = true;
+                                }
                             })),
                     )
                     .when(expanded, |card| {

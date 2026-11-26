@@ -103,8 +103,11 @@ pub(super) fn apply_ss_plugin(proxy: &mut Proxy, raw: &str) {
                 Value::String("mode".into()),
                 Value::String(options.remove("mode").unwrap_or_else(|| "websocket".into())),
             );
-            if options.contains_key("tls") {
-                plugin_opts.insert(Value::String("tls".into()), Value::Bool(true));
+            if let Some(tls) = options.remove("tls") {
+                let enabled = !matches!(tls.trim().to_lowercase().as_str(), "0" | "false" | "no");
+                if enabled {
+                    plugin_opts.insert(Value::String("tls".into()), Value::Bool(true));
+                }
             }
             for key in ["host", "path"] {
                 if let Some(value) = options.remove(key)

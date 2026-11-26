@@ -753,3 +753,18 @@ fn source_import_adopts_matching_existing_nodes_without_duplicates() {
     assert_eq!(doc.items("proxies").len(), count);
     assert_eq!(doc.metadata.node_sources[0].name, "node-a");
 }
+
+#[test]
+fn new_group_includes_proxies_by_default_and_supports_batch_node_toggle() {
+    let mut doc = fixture();
+    let created = doc.add_group("自定义组", None).unwrap();
+    let members = doc.members(&created);
+    assert!(members.contains(&"node-a".to_string()));
+    assert!(members.contains(&"DIRECT".to_string()));
+    doc.set_all_nodes_in_group(&created, false).unwrap();
+    let cleared = doc.members(&created);
+    assert!(!cleared.contains(&"node-a".to_string()));
+    assert!(cleared.contains(&"DIRECT".to_string()));
+    doc.set_all_nodes_in_group(&created, true).unwrap();
+    assert!(doc.members(&created).contains(&"node-a".to_string()));
+}

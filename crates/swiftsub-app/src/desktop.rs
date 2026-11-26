@@ -454,6 +454,41 @@ pub fn detect_mihomo_binary() -> Option<std::path::PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
+/// Query the OS preference for light application theme (`AppsUseLightTheme` on Windows).
+pub fn system_prefers_light() -> Option<bool> {
+    #[cfg(windows)]
+    {
+        let output = registry_command()
+            .args([
+                "query",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                "/v",
+                "AppsUseLightTheme",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if line.contains("AppsUseLightTheme") {
+                let value = line.split_whitespace().last()?;
+                return match value {
+                    "0x1" | "1" => Some(true),
+                    "0x0" | "0" => Some(false),
+                    _ => None,
+                };
+            }
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 /// Validate a generated Clash/Mihomo YAML using a local `mihomo` binary (`mihomo -t`).
 pub fn run_mihomo_check(mihomo_path: &Path, yaml: &str) -> Result<String, String> {
     if !mihomo_path.is_file() {
@@ -465,24 +500,51 @@ pub fn run_mihomo_check(mihomo_path: &Path, yaml: &str) -> Result<String, String
     ));
     std::fs::create_dir_all(&work_dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
     let cfg_path = work_dir.join("config.yaml");
-    std::fs::write(&cfg_path, yaml).map_err(|e| format!("写入临时配置失败：{e}"))?;
+    if let Err(e) = std::fs::write(&cfg_path, yaml) {
+        let _ = std::fs::remove_dir_all(&work_dir);
+        return Err(format!("写入临时配置失败：{e}"));
+    }
 
     let mut cmd = std::process::Command::new(mihomo_path);
     cmd.args(["-t", "-d"])
         .arg(&work_dir)
         .arg("-f")
-        .arg(&cfg_path);
+        .arg(&cfg_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000);
     }
-    let output = cmd
-        .output()
-        .map_err(|e| format!("无法执行 Mihomo 内核：{e}"));
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&work_dir);
+            return Err(format!("无法执行 Mihomo 内核：{e}"));
+        }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let timed_out = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break false,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    break true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+            Err(_) => break false,
+        }
+    };
+    let output = child.wait_with_output();
     let _ = std::fs::remove_dir_all(&work_dir);
 
-    let output = output?;
+    if timed_out {
+        return Err("Mihomo 内核校验超时（超过 15 秒）".into());
+    }
+    let output = output.map_err(|e| format!("读取 Mihomo 输出失败：{e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let detail = if !stderr.is_empty() { stderr } else { stdout };
