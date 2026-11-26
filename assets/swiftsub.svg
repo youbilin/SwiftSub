@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3B82F6"/>
+      <stop offset="50%" stop-color="#3B6EF5"/>
+      <stop offset="100%" stop-color="#4F46E5"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.32"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.04"/>
+    </linearGradient>
+    <linearGradient id="ribbon" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#DBEAFE"/>
+    </linearGradient>
+  </defs>
+  <!-- Squircle background -->
+  <rect x="12" y="12" width="232" height="232" rx="56" fill="url(#bg)"/>
+  <rect x="14" y="14" width="228" height="228" rx="54" fill="none" stroke="url(#rim)" stroke-width="4"/>
+  <!-- Routing S-flow ribbon -->
+  <path d="M 168 74 L 106 74 C 82 74 72 90 72 104 C 72 119 84 128 106 128 L 150 128 C 172 128 184 137 184 152 C 184 166 174 182 150 182 L 88 182"
+        fill="none" stroke="url(#ribbon)" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Accent route nodes -->
+  <circle cx="174" cy="74" r="14" fill="#93C5FD"/>
+  <circle cx="174" cy="74" r="7" fill="#FFFFFF"/>
+  <circle cx="82" cy="182" r="14" fill="#93C5FD"/>
+  <circle cx="82" cy="182" r="7" fill="#FFFFFF"/>
+</svg>

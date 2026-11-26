@@ -457,6 +457,35 @@ impl SwiftSubApp {
                         ),
                 )
                 .into_any_element(),
+            h_flex()
+                .min_w_0()
+                .py(px(6.))
+                .gap_4()
+                .child(
+                    div()
+                        .w(px(110.))
+                        .flex_shrink_0()
+                        .text_size(px(12.))
+                        .text_color(rgb(MUTED))
+                        .child("数据目录"),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .font_family("Consolas")
+                        .text_size(px(11.5))
+                        .text_color(rgb(TEXT))
+                        .truncate()
+                        .child(self.data_dir.display().to_string()),
+                )
+                .child(
+                    Button::new("about-open-data-dir")
+                        .outline()
+                        .label("打开目录")
+                        .on_click(cx.listener(|this, _, _, cx| this.open_data_dir(cx))),
+                )
+                .into_any_element(),
         ];
 
         let mut update_rows = vec![
@@ -2174,6 +2203,9 @@ impl SwiftSubApp {
     }
 
     pub(super) fn clean_template_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.workspace.template_editor.open {
+            return self.standalone_template_editor(cx);
+        }
         let preset = self
             .template_base_options
             .as_ref()
@@ -2190,6 +2222,7 @@ impl SwiftSubApp {
             (Preset::Full, "完整", "全量 46 个细分服务分流策略组"),
         ] {
             let active = preset == value && self.workspace.selected_template_id.is_none();
+            let copy_name = format!("{label}自定义");
             rows = rows.child(
                 object_row()
                     .px_3()
@@ -2199,7 +2232,17 @@ impl SwiftSubApp {
                             .flex_1()
                             .min_w_0()
                             .py_1()
-                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(label))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child(label),
+                                    )
+                                    .child(micro_badge("内置", false)),
+                            )
                             .child(div().text_size(px(11.5)).text_color(rgb(MUTED)).child(desc)),
                     )
                     .child(
@@ -2215,13 +2258,13 @@ impl SwiftSubApp {
                             })),
                     )
                     .child(
-                        Button::new(format!("template-customize-{label}"))
-                            .ghost()
-                            .label("去生成页自定义")
+                        Button::new(format!("template-fork-{label}"))
+                            .outline()
+                            .label("复制并编辑")
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.workspace_preset(value, window, cx);
-                                this.page = Page::Generator;
-                                cx.notify();
+                                this.open_template_editor_from_preset(
+                                    value, &copy_name, window, cx,
+                                );
                             })),
                     ),
             );
@@ -2248,11 +2291,16 @@ impl SwiftSubApp {
                             .min_w_0()
                             .py_1()
                             .child(
-                                div()
-                                    .truncate()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(template.name.clone()),
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child(template.name.clone()),
+                                    )
+                                    .child(micro_badge("自定义", true)),
                             )
                             .child(
                                 div()
@@ -2276,21 +2324,10 @@ impl SwiftSubApp {
                     .child(
                         Button::new(format!("template-edit-{id}"))
                             .outline()
+                            .icon(edit_icon())
                             .label("编辑")
-                            .tooltip("载入此模板并跳转到「生成」页修改策略组和规则")
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.workspace_load_template(id, window, cx);
-                                this.page = Page::Generator;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new(format!("template-overwrite-{id}"))
-                            .ghost()
-                            .label("用当前覆盖")
-                            .tooltip("用「生成」页当前的策略组与规则覆盖更新此模板")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.update_custom_template_with_current(id, window, cx);
+                                this.open_edit_custom_template(id, window, cx);
                             })),
                     )
                     .child(danger_action(
@@ -2324,57 +2361,357 @@ impl SwiftSubApp {
                                 div()
                                     .text_size(px(12.))
                                     .text_color(rgb(MUTED))
-                                    .child("模板保存的是「生成」页的策略组、规则集与手写规则结构（不含节点）。在「生成」页调整好分流后，可在此另存为新模板或覆盖已有自定义模板。"),
+                                    .child("模板仅定义策略组与分流规则结构（不含具体节点）。可在此独立新建和编辑模板，需要时再一键「应用」到生成页。"),
                             ),
                     )
                     .child(
-                        Button::new("template-save-current")
-                            .primary()
-                            .label("将当前分流存为新模板")
+                        Button::new("template-new-from-current")
+                            .outline()
+                            .label("从当前生成页导入")
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.template_edit_id = None;
-                                this.template_name.update(cx, |input, cx| {
-                                    input.set_value("", window, cx);
-                                });
-                                this.workspace.save_template_open = true;
-                                cx.notify();
+                                this.open_template_editor_from_current(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("template-new-standalone")
+                            .primary()
+                            .icon(plus_icon())
+                            .label("新建模板")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_template_editor_from_preset(
+                                    Preset::Minimal,
+                                    "",
+                                    window,
+                                    cx,
+                                );
                             })),
                     ),
             )
-            .when(self.workspace.save_template_open, |panel| {
-                panel.child(
+            .child(rows)
+            .into_any_element()
+    }
+
+    fn standalone_template_editor(&self, cx: &mut Context<Self>) -> AnyElement {
+        let editor = &self.workspace.template_editor;
+        let is_edit = editor.edit_id.is_some();
+        let targets = self.template_editor_targets();
+
+        // Group selectable built-in modules by category (excluding region modules and core required modules)
+        let categories = [
+            "核心与基础",
+            "AI 与技术",
+            "影音媒体",
+            "社交与通讯",
+            "游戏",
+            "其他服务",
+        ];
+        let mut modules_panel = v_flex().gap_3().min_w_0();
+        for cat in categories {
+            let items: Vec<_> = catalog::MODULES
+                .iter()
+                .filter(|m| {
+                    !matches!(m.kind, ModuleKind::Region(_))
+                        && !matches!(m.id, "select" | "auto" | "final")
+                        && crate::app::workspace::workspace_category(m.id) == cat
+                })
+                .collect();
+            if items.is_empty() {
+                continue;
+            }
+            let mut chips = div().flex().flex_wrap().gap_2();
+            for module in items {
+                let id = module.id.to_string();
+                let active = editor.enabled_modules.contains(module.id);
+                chips = chips.child(
+                    div()
+                        .id(format!("tpl-mod-{}", module.id))
+                        .cursor_pointer()
+                        .h(px(32.))
+                        .px(px(12.))
+                        .rounded(px(7.))
+                        .border_1()
+                        .flex()
+                        .items_center()
+                        .text_size(px(12.5))
+                        .when(active, |el| {
+                            el.bg(rgb(ACCENT_SOFT))
+                                .border_color(rgb(ACCENT))
+                                .text_color(rgb(TEXT))
+                                .font_weight(FontWeight::MEDIUM)
+                        })
+                        .when(!active, |el| {
+                            el.bg(rgb(SURFACE))
+                                .border_color(rgb(BORDER))
+                                .text_color(rgb(MUTED))
+                                .hover(|s| s.bg(rgb(SURFACE_2)).text_color(rgb(TEXT)))
+                        })
+                        .child(module.name)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let set = &mut this.workspace.template_editor.enabled_modules;
+                            if set.contains(&id) {
+                                set.remove(&id);
+                            } else {
+                                set.insert(id.clone());
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+            modules_panel =
+                modules_panel.child(v_flex().gap_2().child(field_label(cat)).child(chips));
+        }
+
+        // Custom policy groups list
+        let mut custom_groups_rows = v_flex().gap_2().min_w_0();
+        for (idx, group) in editor.policy_groups.iter().enumerate() {
+            custom_groups_rows = custom_groups_rows.child(
+                object_row()
+                    .px_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(group.name.clone()),
+                    )
+                    .child(self.saved_choice(
+                        format!("tpl-group-kind-{idx}"),
+                        group_kind_label(group.kind).into(),
+                        vec![
+                            "手动选择".into(),
+                            "自动选择".into(),
+                            "故障转移".into(),
+                            "负载均衡".into(),
+                        ],
+                        cx,
+                        move |this, value, _, cx| {
+                            if let Some(g) =
+                                this.workspace.template_editor.policy_groups.get_mut(idx)
+                            {
+                                g.kind = match value.as_str() {
+                                    "自动选择" => GroupKind::UrlTest,
+                                    "故障转移" => GroupKind::Fallback,
+                                    "负载均衡" => GroupKind::LoadBalance,
+                                    _ => GroupKind::Select,
+                                };
+                                cx.notify();
+                            }
+                        },
+                    ))
+                    .child(danger_action(
+                        format!("tpl-group-del-{idx}"),
+                        delete_icon(),
+                        "移除策略组",
+                        cx,
+                        move |this, _, cx| {
+                            if idx < this.workspace.template_editor.policy_groups.len() {
+                                this.workspace.template_editor.policy_groups.remove(idx);
+                                cx.notify();
+                            }
+                        },
+                    )),
+            );
+        }
+
+        // Custom rule set links list
+        let mut rule_set_rows = v_flex().gap_2().min_w_0();
+        for (idx, binding) in editor.custom_rule_sets.iter().enumerate() {
+            rule_set_rows = rule_set_rows.child(
+                object_row()
+                    .px_3()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .py_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .truncate()
+                                    .child(format!("{} → {}", binding.name, binding.target)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(MUTED))
+                                    .truncate()
+                                    .child(binding.url.clone()),
+                            ),
+                    )
+                    .child(danger_action(
+                        format!("tpl-ruleset-del-{idx}"),
+                        delete_icon(),
+                        "移除规则集",
+                        cx,
+                        move |this, _, cx| {
+                            if idx < this.workspace.template_editor.custom_rule_sets.len() {
+                                this.workspace.template_editor.custom_rule_sets.remove(idx);
+                                cx.notify();
+                            }
+                        },
+                    )),
+            );
+        }
+
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_4()
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(
+                        Button::new("tpl-editor-back")
+                            .outline()
+                            .label("← 返回模板列表")
+                            .on_click(cx.listener(|this, _, _, cx| this.close_template_editor(cx))),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(15.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(if is_edit {
+                                "编辑自定义模板"
+                            } else {
+                                "新建自定义模板"
+                            }),
+                    )
+                    .child(
+                        Button::new("tpl-editor-save-top")
+                            .primary()
+                            .label("保存模板")
+                            .on_click(cx.listener(|this, _, _, cx| this.save_template_editor(cx))),
+                    ),
+            )
+            .when_some(editor.error.clone(), |panel, error| {
+                panel.child(banner(error, DANGER))
+            })
+            .child(settings_section(
+                "基础信息",
+                vec![
+                    field_label("模板名称").into_any_element(),
+                    Input::new(&editor.name).cleanable(true).into_any_element(),
+                ],
+                div(),
+            ))
+            .child(settings_section(
+                "内置服务分流模块（点击启停，自动附带对应策略组与规则集）",
+                vec![
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(MUTED))
+                        .child("核心基础组（节点选择、自动选择、漏网之鱼）默认保留；以下按需勾选服务分流模块。")
+                        .into_any_element(),
+                    modules_panel.into_any_element(),
+                ],
+                div(),
+            ))
+            .child(settings_section(
+                "自定义策略组",
+                vec![
                     h_flex()
                         .gap_2()
                         .child(
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .child(Input::new(&self.template_name)),
+                                .child(Input::new(&editor.new_group_name).cleanable(true)),
                         )
-                        .child(
-                            Button::new("workspace-save-template")
-                                .primary()
-                                .label("保存")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.save_current_template(window, cx);
-                                    this.page = Page::Settings;
-                                    this.settings_tab = SettingsTab::Templates;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(object_action(
-                            "template-save-close",
-                            close_icon(),
-                            "取消",
+                        .child(self.saved_choice(
+                            "tpl-new-group-kind",
+                            group_kind_label(editor.new_group_kind).into(),
+                            vec![
+                                "手动选择".into(),
+                                "自动选择".into(),
+                                "故障转移".into(),
+                                "负载均衡".into(),
+                            ],
                             cx,
-                            |this, _, cx| {
-                                this.workspace.save_template_open = false;
+                            |this, value, _, cx| {
+                                this.workspace.template_editor.new_group_kind = match value.as_str()
+                                {
+                                    "自动选择" => GroupKind::UrlTest,
+                                    "故障转移" => GroupKind::Fallback,
+                                    "负载均衡" => GroupKind::LoadBalance,
+                                    _ => GroupKind::Select,
+                                };
                                 cx.notify();
                             },
-                        )),
-                )
-            })
-            .child(rows)
+                        ))
+                        .child(
+                            Button::new("tpl-add-group-btn")
+                                .outline()
+                                .icon(plus_icon())
+                                .label("添加策略组")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.template_editor_add_group(window, cx)
+                                })),
+                        )
+                        .into_any_element(),
+                    custom_groups_rows.into_any_element(),
+                ],
+                div(),
+            ))
+            .child(settings_section(
+                "自定义规则集与手写规则",
+                vec![
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(Input::new(&editor.new_rule_set_url).cleanable(true)),
+                        )
+                        .child(self.saved_choice(
+                            "tpl-new-ruleset-target",
+                            editor.new_rule_set_target.clone(),
+                            targets,
+                            cx,
+                            |this, value, _, cx| {
+                                this.workspace.template_editor.new_rule_set_target = value;
+                                cx.notify();
+                            },
+                        ))
+                        .child(
+                            Button::new("tpl-add-ruleset-btn")
+                                .outline()
+                                .icon(plus_icon())
+                                .label("添加规则集")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.template_editor_add_rule_set(window, cx)
+                                })),
+                        )
+                        .into_any_element(),
+                    rule_set_rows.into_any_element(),
+                    field_label("手写规则（每行一条，目标须在上方策略组或 DIRECT / REJECT 中）")
+                        .into_any_element(),
+                    Textarea::new(&editor.custom_rules)
+                        .h(px(140.))
+                        .into_any_element(),
+                ],
+                div(),
+            ))
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("tpl-editor-cancel")
+                            .ghost()
+                            .label("取消")
+                            .on_click(cx.listener(|this, _, _, cx| this.close_template_editor(cx))),
+                    )
+                    .child(
+                        Button::new("tpl-editor-save-bottom")
+                            .primary()
+                            .label("保存模板")
+                            .on_click(cx.listener(|this, _, _, cx| this.save_template_editor(cx))),
+                    ),
+            )
             .into_any_element()
     }
 }

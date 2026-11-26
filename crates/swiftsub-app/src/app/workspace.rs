@@ -113,7 +113,54 @@ impl ConfigSummary {
     }
 }
 
+pub struct TemplateEditor {
+    pub open: bool,
+    pub edit_id: Option<i64>,
+    pub name: Entity<InputState>,
+    pub base_preset: Preset,
+    pub enabled_modules: HashSet<String>,
+    pub policy_groups: Vec<PolicyGroupSpec>,
+    pub new_group_name: Entity<InputState>,
+    pub new_group_kind: GroupKind,
+    pub custom_rule_sets: Vec<RuleSetBinding>,
+    pub new_rule_set_url: Entity<InputState>,
+    pub new_rule_set_target: String,
+    pub custom_rules: Entity<TextareaState>,
+    pub error: Option<String>,
+    pub(crate) base_snapshot: Option<TemplateSnapshot>,
+}
+
+impl TemplateEditor {
+    fn new(window: &mut Window, cx: &mut Context<SwiftSubApp>) -> Self {
+        Self {
+            open: false,
+            edit_id: None,
+            name: cx.new(|cx| InputState::new(window, cx).placeholder("模板名称，例如：日常分流")),
+            base_preset: Preset::Minimal,
+            enabled_modules: HashSet::new(),
+            policy_groups: Vec::new(),
+            new_group_name: cx
+                .new(|cx| InputState::new(window, cx).placeholder("新策略组名称，例如：AI 专线")),
+            new_group_kind: GroupKind::Select,
+            custom_rule_sets: Vec::new(),
+            new_rule_set_url: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("规则集链接（.mrs / .yaml / .txt）")
+            }),
+            new_rule_set_target: rule_catalog::SELECT_GROUP.to_string(),
+            custom_rules: cx.new(|cx| {
+                TextareaState::new(window, cx).placeholder(
+                    "每行一条规则，例如：\nDOMAIN-SUFFIX,openai.com,节点选择\nIP-CIDR,1.1.1.0/24,DIRECT,no-resolve",
+                )
+            }),
+            error: None,
+            base_snapshot: None,
+        }
+    }
+}
+
 pub struct Workspace {
+    pub template_editor: TemplateEditor,
     pub group_rules_tab: bool,
     pub saved_editor_open: bool,
     pub sidebar_width: f32,
@@ -188,6 +235,7 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<SwiftSubApp>) -> Self {
         Self {
+            template_editor: TemplateEditor::new(window, cx),
             group_rules_tab: false,
             saved_editor_open: false,
             sidebar_width: 300.0,

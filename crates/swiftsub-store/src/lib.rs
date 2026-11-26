@@ -649,6 +649,18 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    pub fn update_custom_template(&self, id: i64, name: &str, config_json: &str) -> Result<()> {
+        let now = now_ts();
+        let changed = self.conn.execute(
+            "UPDATE templates SET name = ?1, config_json = ?2, updated_at = ?3 WHERE id = ?4 AND builtin = 0",
+            params![name, config_json, now, id],
+        )?;
+        if changed != 1 {
+            return Err(rusqlite::Error::QueryReturnedNoRows.into());
+        }
+        Ok(())
+    }
+
     /// Persist a routing snapshot and an optional template in one SQLite transaction.
     pub fn save_routing_snapshot(
         &self,

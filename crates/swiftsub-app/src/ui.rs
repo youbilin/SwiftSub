@@ -397,13 +397,36 @@ impl SwiftSubApp {
     }
 
     fn header(&self) -> TitleBar {
+        let logo = gpui_kit::component::Icon::default().data(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M16 6H9.5a3 3 0 0 0 0 6h5a3 3 0 0 1 0 6H8"/><circle cx="17.5" cy="6" r="1.6" fill="currentColor" stroke="none"/><circle cx="6.5" cy="18" r="1.6" fill="currentColor" stroke="none"/></svg>"#,
+        );
         TitleBar::new().child(
-            h_flex().h_full().w_full().gap_3().child(
-                div()
-                    .text_size(px(14.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("SwiftSub"),
-            ),
+            h_flex()
+                .h_full()
+                .w_full()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(20.))
+                        .h(px(20.))
+                        .rounded(px(5.))
+                        .bg(rgb(ACCENT))
+                        .text_color(gpui_kit::rgb(0xffffff))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(logo.with_size(px(14.))),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("SwiftSub"),
+                )
+                .child(micro_badge(
+                    format!("v{}", env!("CARGO_PKG_VERSION")),
+                    false,
+                )),
         )
     }
 

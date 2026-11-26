@@ -30,6 +30,9 @@ impl DesktopIntegration {
                 Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
                 _ => 0,
             };
+            if hwnd != 0 {
+                apply_window_icon(hwnd);
+            }
             let create = || -> Result<TrayIcon, Box<dyn std::error::Error>> {
                 let menu = Menu::new();
                 menu.append_items(&[
@@ -39,22 +42,9 @@ impl DesktopIntegration {
                     &PredefinedMenuItem::separator(),
                     &MenuItem::with_id("exit", "退出", true, None),
                 ])?;
-                let mut pixels = vec![0u8; 32 * 32 * 4];
-                for y in 0..32 {
-                    for x in 0..32 {
-                        let i = (y * 32 + x) * 4;
-                        let stripe =
-                            (8..12).contains(&y) || (14..18).contains(&y) || (20..24).contains(&y);
-                        let white = stripe && (8..24).contains(&x);
-                        pixels[i..i + 4].copy_from_slice(if white {
-                            &[255, 255, 255, 255]
-                        } else {
-                            &[91, 140, 255, 255]
-                        });
-                    }
-                }
+                let pixels = include_bytes!("../../../assets/swiftsub-32.rgba").to_vec();
                 Ok(TrayIconBuilder::new()
-                    .with_tooltip("SwiftSub · 本地订阅服务")
+                    .with_tooltip("SwiftSub · 本地与局域网订阅服务")
                     .with_menu(Box::new(menu))
                     .with_menu_on_left_click(false)
                     .with_icon(Icon::from_rgba(pixels, 32, 32)?)
@@ -125,6 +115,50 @@ impl DesktopIntegration {
         }
     }
 }
+#[cfg(windows)]
+fn apply_window_icon(hwnd: isize) {
+    const IMAGE_ICON: u32 = 1;
+    const LR_DEFAULTSIZE: u32 = 0x0040;
+    const WM_SETICON: u32 = 0x0080;
+    const ICON_SMALL: usize = 0;
+    const ICON_BIG: usize = 1;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleW(module_name: *const u16) -> *mut std::ffi::c_void;
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn LoadImageW(
+            hinst: *mut std::ffi::c_void,
+            name: *const u16,
+            r#type: u32,
+            cx: i32,
+            cy: i32,
+            fu_load: u32,
+        ) -> *mut std::ffi::c_void;
+        fn SendMessageW(
+            hwnd: *mut std::ffi::c_void,
+            msg: u32,
+            wparam: usize,
+            lparam: isize,
+        ) -> isize;
+    }
+
+    unsafe {
+        let hinst = GetModuleHandleW(std::ptr::null());
+        let res_id = std::ptr::without_provenance::<u16>(1);
+        let big = LoadImageW(hinst, res_id, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
+        if !big.is_null() {
+            SendMessageW(hwnd as *mut _, WM_SETICON, ICON_BIG, big as isize);
+        }
+        let small = LoadImageW(hinst, res_id, IMAGE_ICON, 16, 16, 0);
+        if !small.is_null() {
+            SendMessageW(hwnd as *mut _, WM_SETICON, ICON_SMALL, small as isize);
+        }
+    }
+}
+
 #[cfg(windows)]
 #[link(name = "user32")]
 unsafe extern "system" {
@@ -236,5 +270,50 @@ pub fn open_external_url(url: &str) -> Result<(), String> {
     {
         let _ = url;
         Err("当前平台暂不支持自动打开浏览器".into())
+    }
+}
+
+/// Open a local directory in the system file manager.
+pub fn open_folder(path: &std::path::Path) -> Result<(), String> {
+    let _ = std::fs::create_dir_all(path);
+    #[cfg(windows)]
+    {
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut std::ffi::c_void,
+                operation: *const u16,
+                file: *const u16,
+                params: *const u16,
+                directory: *const u16,
+                show: i32,
+            ) -> isize;
+        }
+        let operation: Vec<u16> = "open\0".encode_utf16().collect();
+        let file: Vec<u16> = path
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                operation.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+            )
+        };
+        if result > 32 {
+            Ok(())
+        } else {
+            Err("无法打开目录".into())
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err("当前平台暂不支持打开目录".into())
     }
 }

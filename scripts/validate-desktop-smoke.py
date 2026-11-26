@@ -70,7 +70,7 @@ def main():
             "INSERT INTO saved_configs(id,name,yaml,created_at,updated_at) VALUES(?,?,?,?,?)",
             (config_id, "100-node saved config", saved_yaml, now, now),
         )
-    environment = dict(os.environ, APPDATA=str(fixture))
+    environment = dict(os.environ, SWIFTSUB_DATA_DIR=str(app_directory), APPDATA=str(fixture))
     startup = subprocess.STARTUPINFO()
     startup.dwFlags = subprocess.STARTF_USESHOWWINDOW
     startup.wShowWindow = 0
