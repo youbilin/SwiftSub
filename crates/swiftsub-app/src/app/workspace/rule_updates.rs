@@ -58,13 +58,15 @@ fn fetch_many(bindings: Vec<RuleSetBinding>) -> Vec<(String, Result<Vec<String>,
                     let result = fetch_rule_payload(binding);
                     results
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|poison| poison.into_inner())
                         .push((SwiftSubApp::workspace_rule_cache_key(binding), result));
                 }
             });
         }
     });
-    results.into_inner().unwrap()
+    results
+        .into_inner()
+        .unwrap_or_else(|poison| poison.into_inner())
 }
 
 impl SwiftSubApp {
@@ -153,7 +155,7 @@ impl SwiftSubApp {
                         }
                     }
                     if errors.is_empty() && !updated.is_empty() {
-                        let _ = store.lock().unwrap().set_setting(
+                        let _ = lock_store(&store).set_setting(
                             "builtin-rules-updated-at",
                             &swiftsub_store::now_ts().to_string(),
                         );

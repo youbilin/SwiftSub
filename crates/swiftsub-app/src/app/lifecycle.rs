@@ -37,10 +37,7 @@ struct SavedDraft {
 
 impl SwiftSubApp {
     pub(super) fn start_desktop_lifecycle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_to_tray = self
-            .store
-            .lock()
-            .unwrap()
+        self.close_to_tray = lock_store(&self.store)
             .get_setting("close_to_tray")
             .ok()
             .flatten()
@@ -88,21 +85,27 @@ impl SwiftSubApp {
                                 Some(format!("后台配置更新失败，继续提供上次成功配置：{error}"));
                             cx.notify();
                         }
+                        if this.server_bind_lan && ticks % 60 == 0 {
+                            this.refresh_lan_interfaces(cx);
+                        }
                         if ticks % 4 == 0 {
                             this.persist_profile_pulls(cx);
-                            if let Err(e) = this.autosave_saved_editor(window, cx)
-                                && this.saved_config_error.as_ref() != Some(&e)
-                            {
-                                this.saved_config_error = Some(e);
-                                cx.notify();
+                            if this.saved_config_id.is_some() {
+                                if let Err(e) = this.autosave_saved_editor(window, cx)
+                                    && this.saved_config_error.as_ref() != Some(&e)
+                                {
+                                    this.saved_config_error = Some(e);
+                                    cx.notify();
+                                }
+                                if let Err(e) = this.checkpoint_yaml_editor(cx)
+                                    && this.saved_config_error.as_ref() != Some(&e)
+                                {
+                                    this.saved_config_error = Some(e);
+                                    cx.notify();
+                                }
                             }
-                            if let Err(e) = this.checkpoint_yaml_editor(cx)
-                                && this.saved_config_error.as_ref() != Some(&e)
-                            {
-                                this.saved_config_error = Some(e);
-                                cx.notify();
-                            }
-                            if let Err(e) = this.autosave_routing(window, cx)
+                            if this.template_session_active
+                                && let Err(e) = this.autosave_routing(window, cx)
                                 && this.template_error.as_ref() != Some(&e)
                             {
                                 this.template_error = Some(e);
@@ -193,30 +196,34 @@ impl SwiftSubApp {
             chain_exit_name: self.chain_landing_name.clone(),
         };
         let json = serde_json::to_string(&draft).map_err(|e| e.to_string())?;
-        let store = self.store.lock().unwrap();
         let key = format!("draft:{}", self.profile_id);
+        if self
+            .last_draft_checkpoint
+            .borrow()
+            .as_ref()
+            .is_some_and(|(cached_key, cached_json)| cached_key == &key && cached_json == &json)
+        {
+            return Ok(());
+        }
+        let store = lock_store(&self.store);
         if store
             .get_setting(&key)
             .map_err(|e| e.to_string())?
             .as_deref()
-            == Some(json.as_str())
+            != Some(json.as_str())
         {
-            return Ok(());
+            store.set_setting(&key, &json).map_err(|e| e.to_string())?;
         }
-        store.set_setting(&key, &json).map_err(|e| e.to_string())
+        *self.last_draft_checkpoint.borrow_mut() = Some((key, json));
+        Ok(())
     }
     pub(super) fn clear_saved_draft(&self) {
-        let _ = self
-            .store
-            .lock()
-            .unwrap()
-            .set_setting(&format!("draft:{}", self.profile_id), "");
+        let key = format!("draft:{}", self.profile_id);
+        let _ = lock_store(&self.store).set_setting(&key, "");
+        *self.last_draft_checkpoint.borrow_mut() = None;
     }
     pub(super) fn restore_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let saved = self
-            .store
-            .lock()
-            .unwrap()
+        let saved = lock_store(&self.store)
             .get_setting(&format!("draft:{}", self.profile_id))
             .ok()
             .flatten();

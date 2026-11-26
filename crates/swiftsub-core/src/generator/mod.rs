@@ -447,10 +447,9 @@ pub fn generate_profile(nodes: &[Node], options: &GenerateOptions) -> Result<Gen
             || name != spec.name
             || (!spec.builtin && (used_group_names.contains(name) || aliases.contains_key(name)))
             || (spec.builtin
-                && (!spec
-                    .builtin_name()
-                    .is_some_and(|origin| builtin_names.contains(origin))
-                    || !overridden.insert(spec.builtin_name().unwrap().to_string())))
+                && !spec.builtin_name().is_some_and(|origin| {
+                    builtin_names.contains(origin) && overridden.insert(origin.to_string())
+                }))
             || used_proxy_names.contains(name)
             || [
                 "DIRECT",
@@ -503,10 +502,11 @@ pub fn generate_profile(nodes: &[Node], options: &GenerateOptions) -> Result<Gen
             group = group.with_health_check(url, interval);
         }
         if spec.builtin {
-            let index = groups
-                .iter()
-                .position(|g| g.name == name)
-                .expect("validated builtin");
+            let Some(index) = groups.iter().position(|g| g.name == name) else {
+                return Err(Error::UnknownRuleTarget(format!(
+                    "内置策略组不存在：{name}"
+                )));
+            };
             groups[index] = group;
         } else {
             groups.push(group);
@@ -582,11 +582,11 @@ pub fn generate_profile(nodes: &[Node], options: &GenerateOptions) -> Result<Gen
     if !listeners.is_empty() {
         // Mihomo uses 'type', whereas the Rust/UI field is named 'kind'.
         for value in &mut listeners {
-            let map = value.as_mapping_mut().expect("listener mapping");
-            let kind = map
-                .remove(Value::String("kind".into()))
-                .expect("listener kind");
-            map.insert(Value::String("type".into()), kind);
+            if let Some(map) = value.as_mapping_mut()
+                && let Some(kind) = map.remove(Value::String("kind".into()))
+            {
+                map.insert(Value::String("type".into()), kind);
+            }
         }
         root.insert(
             Value::String("listeners".into()),

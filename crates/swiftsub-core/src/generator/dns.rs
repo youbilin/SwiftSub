@@ -312,9 +312,11 @@ fn validate_dns(dns: &Mapping, hosts: &Mapping) -> crate::Result<()> {
                 return Err(invalid(format!("DNS {key} 的每项须为非空字符串")));
             }
             if key != "fake-ip-filter"
-                && entries
-                    .iter()
-                    .any(|entry| entry.as_str().unwrap().contains([' ', '\t', '\n', '\r']))
+                && entries.iter().any(|entry| {
+                    entry
+                        .as_str()
+                        .is_some_and(|s| s.contains([' ', '\t', '\n', '\r']))
+                })
             {
                 return Err(invalid(format!("DNS {key} 的地址不能包含空白字符")));
             }

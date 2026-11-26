@@ -140,7 +140,7 @@ impl SwiftSubApp {
             return;
         };
         let snapshots = {
-            let store = self.store.lock().expect("store mutex poisoned");
+            let store = lock_store(&self.store);
             let (Ok(profiles), Ok(configs)) = (store.list_profiles(), store.list_saved_configs())
             else {
                 return;

@@ -4,9 +4,13 @@ use std::io::Cursor;
 use std::net::UdpSocket;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::mpsc::{self, TrySendError};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const WORKER_COUNT: usize = 4;
+const REQUEST_QUEUE_CAPACITY: usize = 32;
 
 use sha2::{Digest, Sha256};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
@@ -88,7 +92,8 @@ pub struct LocalServer {
     shutdown: Arc<AtomicBool>,
     state: Arc<RwLock<HashMap<String, Arc<PublishedProfile>>>>,
     pulls: PullState,
-    handle: Option<JoinHandle<()>>,
+    acceptor: Option<JoinHandle<()>>,
+    workers: Vec<JoinHandle<()>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -419,17 +424,46 @@ impl LocalServer {
         let token = config.token.clone();
         let pulls: PullState = Arc::new(RwLock::new(HashMap::new()));
 
-        let handle = {
-            let server = Arc::clone(&server);
-            let shutdown = Arc::clone(&shutdown);
+        let (tx, rx) = mpsc::sync_channel::<Request>(REQUEST_QUEUE_CAPACITY);
+        let shared_rx = Arc::new(Mutex::new(rx));
+        let mut workers = Vec::with_capacity(WORKER_COUNT);
+        for index in 0..WORKER_COUNT {
+            let rx = Arc::clone(&shared_rx);
             let state = Arc::clone(&state);
             let pulls = Arc::clone(&pulls);
+            let worker = thread::Builder::new()
+                .name(format!("swiftsub-http-{index}"))
+                .spawn(move || {
+                    loop {
+                        let next = {
+                            let guard = rx.lock().unwrap_or_else(|poison| poison.into_inner());
+                            guard.recv()
+                        };
+                        match next {
+                            Ok(request) => handle_request(request, &state, &pulls),
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .map_err(|error| ServerError::Start(error.to_string()))?;
+            workers.push(worker);
+        }
+
+        let acceptor = {
+            let server = Arc::clone(&server);
+            let shutdown = Arc::clone(&shutdown);
             thread::Builder::new()
-                .name("swiftsub-http".into())
+                .name("swiftsub-http-accept".into())
                 .spawn(move || {
                     while !shutdown.load(Ordering::Relaxed) {
                         match server.recv_timeout(Duration::from_millis(250)) {
-                            Ok(Some(request)) => handle_request(request, &state, &pulls),
+                            Ok(Some(request)) => match tx.try_send(request) {
+                                Ok(()) => {}
+                                Err(TrySendError::Full(request)) => {
+                                    let _ = request.respond(Response::empty(StatusCode(503)));
+                                }
+                                Err(TrySendError::Disconnected(_)) => break,
+                            },
                             Ok(None) => {}
                             Err(_) => break,
                         }
@@ -446,7 +480,8 @@ impl LocalServer {
             shutdown,
             state,
             pulls,
-            handle: Some(handle),
+            acceptor: Some(acceptor),
+            workers,
         })
     }
 
@@ -551,8 +586,11 @@ impl LocalServer {
     pub fn stop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         self.server.unblock();
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        if let Some(acceptor) = self.acceptor.take() {
+            let _ = acceptor.join();
+        }
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
         }
     }
 }
@@ -566,6 +604,7 @@ impl Drop for LocalServer {
 fn is_valid_profile_filename(name: &str) -> bool {
     !name.is_empty()
         && !name.contains(['/', '\\'])
+        && !name.contains("..")
         && (name.ends_with(".yaml") || name.ends_with(".yml"))
 }
 
@@ -982,6 +1021,53 @@ mod tests {
         if let Some(detected) = detect_lan_ipv4() {
             assert!(!is_disallowed_lan_ipv4(detected));
         }
+    }
+
+    #[test]
+    fn concurrent_requests_and_slow_client_do_not_block_other_clients() {
+        let server = LocalServer::start(
+            ServerConfig {
+                port: 0,
+                token: "pool-token".into(),
+                bind_lan: false,
+                update_interval_hours: 24,
+            },
+            ProfileSnapshot {
+                yaml: "proxies: []\nrules:\n  - MATCH,DIRECT\n".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let addr = server.local_addr();
+
+        // Hold an incomplete HTTP connection open to simulate a stalled LAN peer.
+        let mut slow_peer = TcpStream::connect(addr).unwrap();
+        slow_peer
+            .write_all(b"GET /sub/pool-token/clash.yaml HTTP/1.1\r\nHost: localhost\r\n")
+            .unwrap();
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                thread::spawn(move || {
+                    let response = request(addr, "/sub/pool-token/clash.yaml", "");
+                    assert!(response.starts_with("HTTP/1.1 200"));
+                    assert!(response.contains("MATCH,DIRECT"));
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Reject unsupported methods and traversal filenames.
+        assert!(
+            request_method(addr, "POST", "/sub/pool-token/clash.yaml", "")
+                .starts_with("HTTP/1.1 405")
+        );
+        assert!(request(addr, "/sub/pool-token/..secret.yaml", "").starts_with("HTTP/1.1 404"));
+        assert!(request(addr, "/sub/pool-token/a/b.yaml", "").starts_with("HTTP/1.1 404"));
+
+        drop(slow_peer);
     }
 
     fn response_etag(response: &str) -> String {

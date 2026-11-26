@@ -1,9 +1,182 @@
 //! Windows lifecycle integration, owned by the GPUI thread.
+use std::path::Path;
+
+#[cfg(windows)]
+use sha2::{Digest, Sha256};
 #[cfg(windows)]
 use tray_icon::{
     Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
+
+#[cfg(windows)]
+mod win32 {
+    use std::ffi::c_void;
+
+    pub const ERROR_ALREADY_EXISTS: u32 = 183;
+    pub const WAIT_OBJECT_0: u32 = 0;
+    pub const EVENT_MODIFY_STATE: u32 = 0x0002;
+    pub const IMAGE_ICON: u32 = 1;
+    pub const LR_DEFAULTSIZE: u32 = 0x0040;
+    pub const WM_SETICON: u32 = 0x0080;
+    pub const ICON_SMALL: usize = 0;
+    pub const ICON_BIG: usize = 1;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn GetModuleHandleW(module_name: *const u16) -> *mut c_void;
+        pub fn GetLastError() -> u32;
+        pub fn CreateMutexW(
+            attributes: *const c_void,
+            initial_owner: i32,
+            name: *const u16,
+        ) -> *mut c_void;
+        pub fn CreateEventW(
+            attributes: *const c_void,
+            manual_reset: i32,
+            initial_state: i32,
+            name: *const u16,
+        ) -> *mut c_void;
+        pub fn OpenEventW(
+            desired_access: u32,
+            inherit_handle: i32,
+            name: *const u16,
+        ) -> *mut c_void;
+        pub fn SetEvent(handle: *mut c_void) -> i32;
+        pub fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+        pub fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        pub fn LoadImageW(
+            hinst: *mut c_void,
+            name: *const u16,
+            r#type: u32,
+            cx: i32,
+            cy: i32,
+            fu_load: u32,
+        ) -> *mut c_void;
+        pub fn SendMessageW(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> isize;
+        pub fn ShowWindow(hwnd: *mut c_void, command: i32) -> i32;
+        pub fn SetForegroundWindow(hwnd: *mut c_void) -> i32;
+    }
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        pub fn ShellExecuteW(
+            hwnd: *mut c_void,
+            operation: *const u16,
+            file: *const u16,
+            params: *const u16,
+            directory: *const u16,
+            show: i32,
+        ) -> isize;
+    }
+
+    pub fn to_wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+}
+
+/// Process-level single-instance lock scoped to a data directory.
+///
+/// Separate data directories (such as isolated smoke-test fixtures) can run side by side,
+/// while launching a second process against the same data directory wakes the existing
+/// window and exits cleanly before touching SQLite or local ports.
+pub struct SingleInstanceGuard {
+    #[cfg(windows)]
+    mutex: isize,
+    #[cfg(windows)]
+    wakeup: isize,
+}
+
+impl SingleInstanceGuard {
+    pub fn acquire(data_dir: &Path) -> Option<Self> {
+        #[cfg(windows)]
+        {
+            let key = instance_key(data_dir);
+            let mutex_name = win32::to_wide(&format!("Local\\SwiftSub-Instance-{key}"));
+            let event_name = win32::to_wide(&format!("Local\\SwiftSub-Wakeup-{key}"));
+            let mutex = unsafe { win32::CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr()) };
+            if mutex.is_null() {
+                return Some(Self {
+                    mutex: 0,
+                    wakeup: 0,
+                });
+            }
+            if unsafe { win32::GetLastError() } == win32::ERROR_ALREADY_EXISTS {
+                let existing =
+                    unsafe { win32::OpenEventW(win32::EVENT_MODIFY_STATE, 0, event_name.as_ptr()) };
+                if !existing.is_null() {
+                    unsafe {
+                        win32::SetEvent(existing);
+                        win32::CloseHandle(existing);
+                    }
+                }
+                unsafe {
+                    win32::CloseHandle(mutex);
+                }
+                return None;
+            }
+            let wakeup =
+                unsafe { win32::CreateEventW(std::ptr::null(), 0, 0, event_name.as_ptr()) };
+            Some(Self {
+                mutex: mutex as isize,
+                wakeup: wakeup as isize,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = data_dir;
+            Some(Self {})
+        }
+    }
+
+    pub fn poll_wakeup(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.wakeup != 0
+                && unsafe { win32::WaitForSingleObject(self.wakeup as *mut _, 0) }
+                    == win32::WAIT_OBJECT_0
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+}
+
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        unsafe {
+            if self.wakeup != 0 {
+                win32::CloseHandle(self.wakeup as *mut _);
+            }
+            if self.mutex != 0 {
+                win32::CloseHandle(self.mutex as *mut _);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn instance_key(data_dir: &Path) -> String {
+    let canonical = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    let normalized = canonical
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
+    let digest = Sha256::digest(normalized.as_bytes());
+    let mut hex = String::with_capacity(16);
+    for byte in &digest[..8] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
 
 #[derive(Clone, Copy)]
 pub enum DesktopAction {
@@ -18,11 +191,12 @@ pub struct DesktopIntegration {
     _tray: Option<TrayIcon>,
     #[cfg(windows)]
     hwnd: isize,
+    instance: Option<SingleInstanceGuard>,
     pub available: bool,
 }
 
 impl DesktopIntegration {
-    pub fn new(window: &gpui_kit::Window) -> Self {
+    pub fn new(window: &gpui_kit::Window, instance: Option<SingleInstanceGuard>) -> Self {
         #[cfg(windows)]
         {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -55,17 +229,28 @@ impl DesktopIntegration {
             Self {
                 _tray: tray,
                 hwnd,
+                instance,
                 available,
             }
         }
         #[cfg(not(windows))]
         {
             let _ = window;
-            Self { available: false }
+            Self {
+                instance,
+                available: false,
+            }
         }
     }
     pub fn actions(&self) -> Vec<DesktopAction> {
         let mut actions = Vec::new();
+        if self
+            .instance
+            .as_ref()
+            .is_some_and(SingleInstanceGuard::poll_wakeup)
+        {
+            actions.push(DesktopAction::Show);
+        }
         #[cfg(windows)]
         {
             while let Ok(e) = MenuEvent::receiver().try_recv() {
@@ -101,7 +286,7 @@ impl DesktopIntegration {
         #[cfg(windows)]
         if self.available {
             unsafe {
-                ShowWindow(self.hwnd as *mut _, 0);
+                win32::ShowWindow(self.hwnd as *mut _, 0);
             }
         }
     }
@@ -109,61 +294,44 @@ impl DesktopIntegration {
         #[cfg(windows)]
         if self.hwnd != 0 {
             unsafe {
-                ShowWindow(self.hwnd as *mut _, 9);
-                SetForegroundWindow(self.hwnd as *mut _);
+                win32::ShowWindow(self.hwnd as *mut _, 9);
+                win32::SetForegroundWindow(self.hwnd as *mut _);
             }
         }
     }
 }
+
 #[cfg(windows)]
 fn apply_window_icon(hwnd: isize) {
-    const IMAGE_ICON: u32 = 1;
-    const LR_DEFAULTSIZE: u32 = 0x0040;
-    const WM_SETICON: u32 = 0x0080;
-    const ICON_SMALL: usize = 0;
-    const ICON_BIG: usize = 1;
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetModuleHandleW(module_name: *const u16) -> *mut std::ffi::c_void;
-    }
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn LoadImageW(
-            hinst: *mut std::ffi::c_void,
-            name: *const u16,
-            r#type: u32,
-            cx: i32,
-            cy: i32,
-            fu_load: u32,
-        ) -> *mut std::ffi::c_void;
-        fn SendMessageW(
-            hwnd: *mut std::ffi::c_void,
-            msg: u32,
-            wparam: usize,
-            lparam: isize,
-        ) -> isize;
-    }
-
     unsafe {
-        let hinst = GetModuleHandleW(std::ptr::null());
+        let hinst = win32::GetModuleHandleW(std::ptr::null());
         let res_id = std::ptr::without_provenance::<u16>(1);
-        let big = LoadImageW(hinst, res_id, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
+        let big = win32::LoadImageW(
+            hinst,
+            res_id,
+            win32::IMAGE_ICON,
+            0,
+            0,
+            win32::LR_DEFAULTSIZE,
+        );
         if !big.is_null() {
-            SendMessageW(hwnd as *mut _, WM_SETICON, ICON_BIG, big as isize);
+            win32::SendMessageW(
+                hwnd as *mut _,
+                win32::WM_SETICON,
+                win32::ICON_BIG,
+                big as isize,
+            );
         }
-        let small = LoadImageW(hinst, res_id, IMAGE_ICON, 16, 16, 0);
+        let small = win32::LoadImageW(hinst, res_id, win32::IMAGE_ICON, 16, 16, 0);
         if !small.is_null() {
-            SendMessageW(hwnd as *mut _, WM_SETICON, ICON_SMALL, small as isize);
+            win32::SendMessageW(
+                hwnd as *mut _,
+                win32::WM_SETICON,
+                win32::ICON_SMALL,
+                small as isize,
+            );
         }
     }
-}
-
-#[cfg(windows)]
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn ShowWindow(hwnd: *mut std::ffi::c_void, command: i32) -> i32;
-    fn SetForegroundWindow(hwnd: *mut std::ffi::c_void) -> i32;
 }
 
 #[cfg(windows)]
@@ -173,22 +341,12 @@ fn registry_command() -> std::process::Command {
     cmd.creation_flags(0x08000000);
     cmd
 }
+
 /// Open the registered Verge handler, with support for its legacy Clash scheme.
 pub fn open_clash_verge(uri: &str) -> Result<(), String> {
     #[cfg(windows)]
     {
-        #[link(name = "shell32")]
-        unsafe extern "system" {
-            fn ShellExecuteW(
-                hwnd: *mut std::ffi::c_void,
-                operation: *const u16,
-                file: *const u16,
-                params: *const u16,
-                directory: *const u16,
-                show: i32,
-            ) -> isize;
-        }
-        let operation: Vec<u16> = "open\0".encode_utf16().collect();
+        let operation = win32::to_wide("open");
         // Older versions forward only clash: arguments to their existing instance.
         for candidate in [
             uri.to_string(),
@@ -206,9 +364,9 @@ pub fn open_clash_verge(uri: &str) -> Result<(), String> {
             {
                 continue;
             }
-            let file: Vec<u16> = candidate.encode_utf16().chain(std::iter::once(0)).collect();
+            let file = win32::to_wide(&candidate);
             let result = unsafe {
-                ShellExecuteW(
+                win32::ShellExecuteW(
                     std::ptr::null_mut(),
                     operation.as_ptr(),
                     file.as_ptr(),
@@ -237,21 +395,10 @@ pub fn open_external_url(url: &str) -> Result<(), String> {
     }
     #[cfg(windows)]
     {
-        #[link(name = "shell32")]
-        unsafe extern "system" {
-            fn ShellExecuteW(
-                hwnd: *mut std::ffi::c_void,
-                operation: *const u16,
-                file: *const u16,
-                params: *const u16,
-                directory: *const u16,
-                show: i32,
-            ) -> isize;
-        }
-        let operation: Vec<u16> = "open\0".encode_utf16().collect();
-        let file: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+        let operation = win32::to_wide("open");
+        let file = win32::to_wide(url);
         let result = unsafe {
-            ShellExecuteW(
+            win32::ShellExecuteW(
                 std::ptr::null_mut(),
                 operation.as_ptr(),
                 file.as_ptr(),
@@ -278,25 +425,10 @@ pub fn open_folder(path: &std::path::Path) -> Result<(), String> {
     let _ = std::fs::create_dir_all(path);
     #[cfg(windows)]
     {
-        #[link(name = "shell32")]
-        unsafe extern "system" {
-            fn ShellExecuteW(
-                hwnd: *mut std::ffi::c_void,
-                operation: *const u16,
-                file: *const u16,
-                params: *const u16,
-                directory: *const u16,
-                show: i32,
-            ) -> isize;
-        }
-        let operation: Vec<u16> = "open\0".encode_utf16().collect();
-        let file: Vec<u16> = path
-            .to_string_lossy()
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+        let operation = win32::to_wide("open");
+        let file = win32::to_wide(&path.to_string_lossy());
         let result = unsafe {
-            ShellExecuteW(
+            win32::ShellExecuteW(
                 std::ptr::null_mut(),
                 operation.as_ptr(),
                 file.as_ptr(),
@@ -315,5 +447,39 @@ pub fn open_folder(path: &std::path::Path) -> Result<(), String> {
     {
         let _ = path;
         Err("当前平台暂不支持打开目录".into())
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_instance_blocks_duplicate_and_signals_wakeup() {
+        let dir = std::env::temp_dir().join(format!("swiftsub-lock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let other = std::env::temp_dir().join(format!("swiftsub-lock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&other).unwrap();
+
+        let primary = SingleInstanceGuard::acquire(&dir).expect("primary lock should succeed");
+        assert!(!primary.poll_wakeup());
+
+        // Different data directory remains isolated and can run in parallel.
+        let isolated = SingleInstanceGuard::acquire(&other).expect("other dir lock should succeed");
+        assert!(!isolated.poll_wakeup());
+
+        // Duplicate instance for the same data directory is rejected and wakes primary.
+        assert!(SingleInstanceGuard::acquire(&dir).is_none());
+        assert!(primary.poll_wakeup());
+        // Wakeup event auto-resets after consumption.
+        assert!(!primary.poll_wakeup());
+
+        drop(primary);
+        let reacquired = SingleInstanceGuard::acquire(&dir)
+            .expect("lock should be acquirable after primary exits");
+        drop(reacquired);
+        drop(isolated);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
     }
 }

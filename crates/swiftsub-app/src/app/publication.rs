@@ -21,7 +21,10 @@ pub(super) struct PublicationWorker {
 
 impl PublicationWorker {
     pub(super) fn submit(&self, job: PublishJob) {
-        let mut revision = self.revision.lock().expect("publication revision poisoned");
+        let mut revision = self
+            .revision
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         *revision += 1;
         // Existing persisted bodies are immediately available, including newly saved records.
         job.publisher.replace_profiles(job.snapshots.clone());
@@ -29,7 +32,7 @@ impl PublicationWorker {
         let shared_error = Arc::clone(&self.error);
         let sender = self.sender.get_or_init(|| {
             let (sender, receiver) = mpsc::channel::<(u64, PublishJob)>();
-            std::thread::Builder::new()
+            if let Err(error) = std::thread::Builder::new()
                 .name("swiftsub-publish".into())
                 .spawn(move || {
                     while let Ok(mut pending) = receiver.recv() {
@@ -38,11 +41,19 @@ impl PublicationWorker {
                         }
                         let (revision, job) = pending;
                         if let Err(error) = rebuild(revision, job, &shared_revision) {
-                            *shared_error.lock().expect("publication error poisoned") = Some(error);
+                            *shared_error
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner()) = Some(error);
                         }
                     }
                 })
-                .expect("failed to start publication worker");
+            {
+                *self
+                    .error
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) =
+                    Some(format!("后台发布线程启动失败：{error}"));
+            }
             sender
         });
         let _ = sender.send((*revision, job));
@@ -66,7 +77,7 @@ fn rebuild(revision: u64, job: PublishJob, shared_revision: &Mutex<u64>) -> Resu
     {
         if *shared_revision
             .lock()
-            .expect("publication revision poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             != revision
         {
             return Ok(());
@@ -160,7 +171,7 @@ fn rebuild(revision: u64, job: PublishJob, shared_revision: &Mutex<u64>) -> Resu
     // Serialize acceptance with new submissions so an old task cannot replace newer output.
     let current = shared_revision
         .lock()
-        .expect("publication revision poisoned");
+        .unwrap_or_else(|poison| poison.into_inner());
     if *current != revision {
         return Ok(());
     }

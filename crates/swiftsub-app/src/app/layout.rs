@@ -532,7 +532,11 @@ impl SwiftSubApp {
                         &name,
                     );
                 }
-                snapshot.chains[editing.unwrap()] = chain;
+                if let Some(index) = editing.filter(|&index| index < snapshot.chains.len()) {
+                    snapshot.chains[index] = chain;
+                } else {
+                    snapshot.chains.push(chain);
+                }
             } else {
                 snapshot.chains.push(chain);
             }
@@ -1526,7 +1530,11 @@ impl SwiftSubApp {
                         changed_nodes.push(node.clone());
                     }
                 }
-                snapshot.custom_groups[editing.unwrap()] = group;
+                if let Some(index) = editing.filter(|&index| index < snapshot.custom_groups.len()) {
+                    snapshot.custom_groups[index] = group;
+                } else {
+                    snapshot.custom_groups.push(group);
+                }
             } else {
                 snapshot.custom_groups.push(group);
             }

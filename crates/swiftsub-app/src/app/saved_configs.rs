@@ -149,13 +149,12 @@ impl SwiftSubApp {
     }
 
     pub fn config_lan_subscription_url(&self, id: &str) -> Option<String> {
-        self.server.as_ref().and_then(|server| {
-            server.lan_profile_url_with_host(
-                self.server_lan_host.as_deref(),
-                id,
-                &format!("{id}.yaml"),
-            )
-        })
+        let server = self.server.as_ref()?;
+        if !server.is_lan_enabled() {
+            return None;
+        }
+        let host = self.active_lan_host()?;
+        Some(server.profile_url_for_host(&host, id, &format!("{id}.yaml")))
     }
 
     pub fn copy_config_subscription(&mut self, id: String, cx: &mut Context<Self>) {
@@ -305,7 +304,7 @@ impl SwiftSubApp {
     }
     pub(super) fn reload_saved_configs(&mut self) {
         let result = (|| {
-            let store = self.store.lock().unwrap();
+            let store = lock_store(&self.store);
             let directory = self.data_dir.join("configs");
             // Preserve each existing profile's latest output once when upgrading.
             for profile in store.list_profiles()? {
@@ -385,7 +384,7 @@ impl SwiftSubApp {
         self.saved_draft_corrupt = false;
         self.saved_config_delete_armed = false;
         self.saved_config_error = None;
-        let draft = match files::read_yaml_draft(&self.store.lock().unwrap(), &id) {
+        let draft = match files::read_yaml_draft(&lock_store(&self.store), &id) {
             Ok(draft) => draft,
             Err(error) => {
                 self.saved_draft_corrupt = true;
@@ -435,7 +434,7 @@ impl SwiftSubApp {
             } else {
                 String::new()
             };
-            let store = self.store.lock().unwrap();
+            let store = lock_store(&self.store);
             files::read_yaml_draft(&store, id)?;
             if store
                 .get_setting(&key)
@@ -646,7 +645,17 @@ impl SwiftSubApp {
                 return;
             }
         };
-        let observer = self.server.as_ref().unwrap().publisher();
+        let Some(observer) = self.server.as_ref().map(LocalServer::publisher) else {
+            let message = "本地订阅服务未运行，无法推送到 Clash Verge".to_string();
+            if generated {
+                self.generated_save_error = Some(message.clone());
+            } else {
+                self.saved_config_error = Some(message.clone());
+            }
+            self.show_toast(message, cx);
+            cx.notify();
+            return;
+        };
         let previous_pull = observer
             .profile_pull(&config.id)
             .map_or(0, |pull| pull.requests);
@@ -784,9 +793,7 @@ impl SwiftSubApp {
                 self.saved_editor.tab == SavedEditorTab::Yaml,
                 self.saved_editor.pending,
             )?;
-            self.store
-                .lock()
-                .unwrap()
+            lock_store(&self.store)
                 .save_yaml_config(
                     &self.data_dir.join("configs"),
                     None,
@@ -851,9 +858,7 @@ impl SwiftSubApp {
             .map_err(|e| e.to_string())
             .and_then(|yaml| {
                 validate_yaml(&yaml)?;
-                self.store
-                    .lock()
-                    .unwrap()
+                lock_store(&self.store)
                     .save_yaml_config(&self.data_dir.join("configs"), None, name, &yaml, None)
                     .map_err(|e| e.to_string())
             });
@@ -890,18 +895,11 @@ impl SwiftSubApp {
         }
     }
     pub fn delete_library_config(&mut self, id: String, cx: &mut Context<Self>) {
-        let result = self
-            .store
-            .lock()
-            .unwrap()
-            .delete_saved_config(&self.data_dir.join("configs"), &id);
+        let result =
+            lock_store(&self.store).delete_saved_config(&self.data_dir.join("configs"), &id);
         match result {
             Ok(()) => {
-                let _ = self
-                    .store
-                    .lock()
-                    .unwrap()
-                    .set_setting(&format!("yaml-editor:{id}"), "");
+                let _ = lock_store(&self.store).set_setting(&format!("yaml-editor:{id}"), "");
                 if self.saved_config_id.as_ref() == Some(&id) {
                     self.saved_config_id = None;
                     self.workspace.saved_editor_open = false;

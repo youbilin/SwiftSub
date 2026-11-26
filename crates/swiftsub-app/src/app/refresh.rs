@@ -259,7 +259,7 @@ impl SwiftSubApp {
                             expire_at: info.expire,
                         };
                         {
-                            let store = store.lock().expect("store mutex poisoned");
+                            let store = lock_store(&store);
                             if let Err(error) = store.save_fetch_success(
                                 id,
                                 &result.content,
@@ -301,7 +301,7 @@ impl SwiftSubApp {
                             expire_at: info.expire,
                         });
                         {
-                            let store = store.lock().expect("store mutex poisoned");
+                            let store = lock_store(&store);
                             if let Err(error) = store.save_fetch_not_modified(
                                 id,
                                 traffic.as_ref(),
@@ -333,7 +333,7 @@ impl SwiftSubApp {
                     Err(error) => {
                         let message = error.to_string();
                         {
-                            let store = store.lock().expect("store mutex poisoned");
+                            let store = lock_store(&store);
                             if let Err(error) = store
                                 .save_fetch_error(id, &message)
                                 .and_then(|_| store.log_refresh(Some(id), false, Some(&message)))
@@ -351,11 +351,7 @@ impl SwiftSubApp {
                         this.show_toast(format!("{name} 更新失败：{message}"), cx);
                     }
                 }
-                match store
-                    .lock()
-                    .expect("store mutex poisoned")
-                    .get_subscription(id)
-                {
+                match lock_store(&store).get_subscription(id) {
                     Ok(Some(subscription)) => {
                         if let Some(current) =
                             this.subscriptions.iter_mut().find(|sub| sub.id == id)

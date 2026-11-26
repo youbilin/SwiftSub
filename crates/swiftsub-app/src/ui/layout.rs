@@ -188,7 +188,7 @@ fn group_kind_label(kind: GroupKind) -> &'static str {
 
 impl SwiftSubApp {
     pub(super) fn config_subscription_settings(&self, cx: &mut Context<Self>) -> AnyElement {
-        let interfaces = swiftsub_server::list_lan_interfaces();
+        let interfaces = &self.lan_interfaces;
         let auto_iface = interfaces.first().cloned();
         let active_ip = self.active_lan_host();
         let active_iface_label = active_ip.as_deref().map(|ip| {
@@ -268,7 +268,7 @@ impl SwiftSubApp {
             let mut options = vec![auto_label.clone()];
             let mut label_to_ip: std::collections::HashMap<String, Option<String>> =
                 std::collections::HashMap::from([(auto_label, None)]);
-            for iface in &interfaces {
+            for iface in interfaces {
                 let label = format!("{} · {}", iface.name, iface.ip);
                 label_to_ip.insert(label.clone(), Some(iface.ip.to_string()));
                 options.push(label);
@@ -296,6 +296,19 @@ impl SwiftSubApp {
                             this.set_server_lan_host(host, cx);
                         },
                     ))
+                    .child(
+                        Button::new("about-refresh-lan-interfaces")
+                            .outline()
+                            .disabled(self.lan_interfaces_refreshing)
+                            .label(if self.lan_interfaces_refreshing {
+                                "探测中…"
+                            } else {
+                                "刷新网卡"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.refresh_lan_interfaces(cx);
+                            })),
+                    )
                     .into_any_element(),
             );
         }

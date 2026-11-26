@@ -186,10 +186,9 @@ impl DnsEditor {
                 dns.insert(key.into(), parsed);
             }
         }
-        value
-            .as_mapping_mut()
-            .unwrap()
-            .insert("hosts".into(), Value::Mapping(hosts));
+        if let Some(map) = value.as_mapping_mut() {
+            map.insert("hosts".into(), Value::Mapping(hosts));
+        }
         Ok(value)
     }
 

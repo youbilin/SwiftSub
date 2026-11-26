@@ -896,26 +896,26 @@ impl SwiftSubApp {
     }
 
     pub fn workspace_save_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let port = self
+        let Some(port) = self
             .workspace
             .mixed_port
             .read(cx)
             .value()
             .parse::<u16>()
             .ok()
-            .filter(|port| *port > 0);
-        if port.is_none() {
+            .filter(|port| *port > 0)
+        else {
             self.template_error = Some("端口须为 1–65535".into());
             cx.notify();
             return;
-        }
+        };
         let mut defaults = self
             .workspace
             .global_defaults
             .clone()
             .unwrap_or_else(|| GenerationDefaults::from_options(&self.options));
         let base = &mut defaults;
-        base.mixed_port = port.unwrap();
+        base.mixed_port = port;
         base.dns = match self.workspace.dns_editor.read(cx) {
             Ok(dns) => dns,
             Err(error) => {
@@ -951,10 +951,15 @@ impl SwiftSubApp {
             .value()
             .trim()
             .parse::<u32>();
+        let (Ok(interval), Ok(tolerance)) = (interval, tolerance) else {
+            self.template_error =
+                Some("测速地址须为 HTTP / HTTPS，周期须为正整数，容差须为非负整数".into());
+            cx.notify();
+            return;
+        };
         if !url::Url::parse(&url)
             .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
-            || !matches!(interval, Ok(n) if n > 0)
-            || tolerance.is_err()
+            || interval == 0
         {
             self.template_error =
                 Some("测速地址须为 HTTP / HTTPS，周期须为正整数，容差须为非负整数".into());
@@ -968,8 +973,8 @@ impl SwiftSubApp {
             .unwrap_or_else(|| GenerationDefaults::from_options(&self.options));
         let base = &mut defaults;
         base.test_url = url;
-        base.test_interval = interval.unwrap();
-        base.test_tolerance = tolerance.unwrap();
+        base.test_interval = interval;
+        base.test_tolerance = tolerance;
         self.workspace_save_defaults(defaults, window, cx);
         cx.notify();
     }
@@ -1001,9 +1006,7 @@ impl SwiftSubApp {
         let result = serde_json::to_string(&defaults)
             .map_err(|e| e.to_string())
             .and_then(|json| {
-                self.store
-                    .lock()
-                    .unwrap()
+                lock_store(&self.store)
                     .set_setting("generation_defaults", &json)
                     .map_err(|e| e.to_string())
             });

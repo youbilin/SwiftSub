@@ -19,10 +19,9 @@ pub fn unsigned(value: Option<&Value>) -> Option<u64> {
     }
 }
 fn put(value: &mut Value, key: &str, data: impl Into<Value>) {
-    value
-        .as_mapping_mut()
-        .expect("validated mapping")
-        .insert(Value::String(key.into()), data.into());
+    if let Some(map) = value.as_mapping_mut() {
+        map.insert(Value::String(key.into()), data.into());
+    }
 }
 fn strings(value: Option<&Value>) -> Vec<String> {
     value
@@ -939,7 +938,14 @@ impl SavedDocument {
     pub fn add_group(&mut self, name: &str, copy: Option<&str>) -> Result<String, String> {
         let name = self.unique_name(name);
         let mut group = copy.and_then(|n| self.group(n)).unwrap_or_else(|| {
-            serde_yaml_ng::from_str("name: new\ntype: select\nproxies: [DIRECT]\n").unwrap()
+            let mut map = Mapping::new();
+            map.insert(Value::String("name".into()), Value::String("new".into()));
+            map.insert(Value::String("type".into()), Value::String("select".into()));
+            map.insert(
+                Value::String("proxies".into()),
+                values(vec!["DIRECT".into()]),
+            );
+            Value::Mapping(map)
         });
         put(&mut group, "name", name.clone());
         let mut groups = self.items("proxy-groups");

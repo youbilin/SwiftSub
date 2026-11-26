@@ -680,7 +680,9 @@ impl SwiftSubApp {
         }
         let old_group = self.saved_editor.selected_group.clone();
         let old_node = self.saved_editor.selected_node.clone();
-        let doc = self.saved_editor.document.as_mut().unwrap();
+        let Some(doc) = self.saved_editor.document.as_mut() else {
+            return Ok(());
+        };
         let before = doc.clone();
         doc.transaction(|doc| {
             if group_changed {
@@ -881,7 +883,7 @@ impl SwiftSubApp {
             String::new()
         };
         {
-            let store = self.store.lock().unwrap();
+            let store = lock_store(&self.store);
             if store
                 .get_setting(&meta_key)
                 .map_err(|e| e.to_string())?
@@ -894,7 +896,7 @@ impl SwiftSubApp {
             }
         }
         let key = format!("visual-form:{id}");
-        let store = self.store.lock().unwrap();
+        let store = lock_store(&self.store);
         if store
             .get_setting(&key)
             .map_err(|e| e.to_string())?
@@ -911,7 +913,7 @@ impl SwiftSubApp {
         let Some(id) = &self.saved_config_id else {
             return;
         };
-        let drafts = read_visual_drafts(&self.store.lock().unwrap(), id);
+        let drafts = read_visual_drafts(&lock_store(&self.store), id);
         let drafts = match drafts {
             Ok(drafts) => drafts,
             Err(error) => {
@@ -970,13 +972,12 @@ impl SwiftSubApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        if self.saved_config_id.is_none() {
+        let Some(id) = self.saved_config_id.clone() else {
             return Ok(());
-        }
+        };
         if self.saved_draft_corrupt {
             return Err("编辑草稿读取失败，原数据已保留，请恢复保存的配置后继续".into());
         }
-        let id = self.saved_config_id.clone().unwrap();
         let draft_state = self.check_yaml_draft_storage().and_then(|_| {
             let store = self.store.lock().map_err(|error| error.to_string())?;
             read_visual_drafts(&store, &id).map(|_| ())
@@ -1044,21 +1045,18 @@ impl SwiftSubApp {
         self.saved_file_baseline = None;
         self.saved_external_change = false;
         self.saved_config_error = None;
-        self.store
-            .lock()
-            .unwrap()
-            .set_setting(&format!("visual-meta:{id}"), "")
-            .map_err(|e| e.to_string())?;
-        self.store
-            .lock()
-            .unwrap()
-            .set_setting(&format!("visual-form:{id}"), "")
-            .map_err(|e| e.to_string())?;
-        self.store
-            .lock()
-            .unwrap()
-            .set_setting(&format!("yaml-editor:{id}"), "")
-            .map_err(|e| e.to_string())?;
+        {
+            let store = lock_store(&self.store);
+            store
+                .set_setting(&format!("visual-meta:{id}"), "")
+                .map_err(|e| e.to_string())?;
+            store
+                .set_setting(&format!("visual-form:{id}"), "")
+                .map_err(|e| e.to_string())?;
+            store
+                .set_setting(&format!("yaml-editor:{id}"), "")
+                .map_err(|e| e.to_string())?;
+        }
         self.publish_profiles();
         cx.notify();
         Ok(())

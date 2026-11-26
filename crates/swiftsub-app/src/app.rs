@@ -43,6 +43,10 @@ use swiftsub_store::{
 
 use crate::rule_catalog;
 
+pub(crate) fn lock_store(store: &Mutex<Store>) -> std::sync::MutexGuard<'_, Store> {
+    store.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
 fn default_test_tolerance() -> u32 {
     50
 }
@@ -323,6 +327,7 @@ pub struct SwiftSubApp {
     pub desktop: crate::desktop::DesktopIntegration,
     pub close_to_tray: bool,
     pub recovered_draft: bool,
+    pub(super) last_draft_checkpoint: std::cell::RefCell<Option<(String, String)>>,
     pub page: Page,
     pub light_theme: bool,
     pub store: Arc<Mutex<Store>>,
@@ -424,6 +429,8 @@ pub struct SwiftSubApp {
     pub server: Option<LocalServer>,
     pub server_bind_lan: bool,
     pub server_lan_host: Option<String>,
+    pub lan_interfaces: Vec<swiftsub_server::LanInterface>,
+    pub lan_interfaces_refreshing: bool,
     pub server_url: Option<String>,
     pub server_error: Option<String>,
     pub update_repo: String,
@@ -447,7 +454,11 @@ pub struct SwiftSubApp {
 }
 
 impl SwiftSubApp {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        window: &mut Window,
+        instance: Option<crate::desktop::SingleInstanceGuard>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let data_dir = data_dir();
         let db_path = data_dir.join("swiftsub.db");
         let (store, store_error) = match Store::open(&db_path) {
@@ -459,11 +470,11 @@ impl SwiftSubApp {
         };
         let store = Arc::new(Mutex::new(store));
         let light_theme = {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = lock_store(&store);
             guard.get_setting("theme").ok().flatten().as_deref() != Some("dark")
         };
         let (server_bind_lan, server_lan_host, update_repo) = {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = lock_store(&store);
             let bind_lan = guard
                 .get_setting("server_bind_lan")
                 .ok()
@@ -493,7 +504,7 @@ impl SwiftSubApp {
             .unwrap_or_default();
 
         let (profile_id, profile_token) = {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = lock_store(&store);
             let active = guard
                 .get_setting("active_profile")
                 .ok()
@@ -514,7 +525,7 @@ impl SwiftSubApp {
             }
         };
         let (subscription_filename, rule_provider_base_url) = {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = lock_store(&store);
             let filename = guard
                 .get_setting("subscription_filename")
                 .ok()
@@ -579,7 +590,7 @@ impl SwiftSubApp {
             .map(|module| module.id.to_string())
             .collect();
         let node_order = {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = lock_store(&store);
             guard
                 .get_setting("node_order")
                 .ok()
@@ -588,7 +599,7 @@ impl SwiftSubApp {
                 .unwrap_or_default()
         };
         let disabled_rule_sets = {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = lock_store(&store);
             guard
                 .get_setting("disabled_rule_sets")
                 .ok()
@@ -599,7 +610,7 @@ impl SwiftSubApp {
                 .collect()
         };
         let (custom_rule_sets, custom_rule_lines) = {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = lock_store(&store);
             let rule_sets = guard
                 .get_setting("custom_rule_sets")
                 .ok()
@@ -617,7 +628,7 @@ impl SwiftSubApp {
         let custom_rules =
             parse_custom_rule_lines(&custom_rule_lines.join("\n")).unwrap_or_default();
         let (policy_groups, rule_set_targets) = {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = lock_store(&store);
             (
                 guard
                     .get_setting("policy_groups")
@@ -633,9 +644,7 @@ impl SwiftSubApp {
                     .unwrap_or_default(),
             )
         };
-        let rule_order = store
-            .lock()
-            .expect("store mutex poisoned")
+        let rule_order = lock_store(&store)
             .get_setting("rule_order")
             .ok()
             .flatten()
@@ -644,9 +653,7 @@ impl SwiftSubApp {
         let options = GenerateOptions {
             preset: Preset::Minimal,
             rule_order,
-            group_order: store
-                .lock()
-                .expect("store mutex poisoned")
+            group_order: lock_store(&store)
                 .get_setting("group_order")
                 .ok()
                 .flatten()
@@ -660,11 +667,7 @@ impl SwiftSubApp {
             ..Default::default()
         };
 
-        let profiles = store
-            .lock()
-            .expect("store mutex poisoned")
-            .list_profiles()
-            .unwrap_or_default();
+        let profiles = lock_store(&store).list_profiles().unwrap_or_default();
         let profile_name_input = cx.new(|cx| InputState::new(window, cx).placeholder("配置名称"));
         let generated_config_name =
             cx.new(|cx| InputState::new(window, cx).placeholder("配置名称"));
@@ -677,9 +680,10 @@ impl SwiftSubApp {
         });
         let mut app = Self {
             upgrades: upgrades::Upgrades::new(window, cx),
-            desktop: crate::desktop::DesktopIntegration::new(window),
+            desktop: crate::desktop::DesktopIntegration::new(window, instance),
             close_to_tray: false,
             recovered_draft: false,
+            last_draft_checkpoint: std::cell::RefCell::new(None),
             page: Page::Generator,
             light_theme,
             store,
@@ -786,6 +790,8 @@ impl SwiftSubApp {
             server: None,
             server_bind_lan,
             server_lan_host,
+            lan_interfaces: Vec::new(),
+            lan_interfaces_refreshing: false,
             server_url: None,
             server_error: None,
             update_repo,
@@ -924,10 +930,7 @@ impl SwiftSubApp {
             .find_map(|arg| arg.strip_prefix("--dialog=").map(str::to_string));
 
         app.load_custom_config();
-        let recovered = app
-            .store
-            .lock()
-            .expect("store mutex poisoned")
+        let recovered = lock_store(&app.store)
             .get_setting("routing_snapshot")
             .ok()
             .flatten()
@@ -999,6 +1002,7 @@ impl SwiftSubApp {
             app.open_saved_config(config.id.clone(), window, cx);
         }
         app.start_desktop_lifecycle(window, cx);
+        app.refresh_lan_interfaces(cx);
         app.restore_draft(window, cx);
         if app.page == Page::Generator {
             app.open_template_dialog(window, cx);
@@ -1026,7 +1030,7 @@ impl SwiftSubApp {
         }
 
         {
-            let store = self.store.lock().expect("store mutex poisoned");
+            let store = lock_store(&self.store);
             for (id, count) in &updates {
                 let _ = store.set_subscription_node_count(*id, *count);
             }
@@ -1044,7 +1048,7 @@ impl SwiftSubApp {
         }
         self.light_theme = light;
         {
-            let store = self.store.lock().expect("store mutex poisoned");
+            let store = lock_store(&self.store);
             let _ = store.set_setting("theme", if light { "light" } else { "dark" });
         }
         Theme::change(
@@ -1117,7 +1121,7 @@ impl SwiftSubApp {
     }
 
     fn append_manual_proxies(&mut self, proxies: Vec<Proxy>) -> Result<usize, String> {
-        let store = self.store.lock().expect("store mutex poisoned");
+        let store = lock_store(&self.store);
 
         let existing_id = store
             .get_setting("manual_subscription_id")
@@ -1218,7 +1222,7 @@ impl SwiftSubApp {
     }
 
     fn load_custom_config(&mut self) {
-        let store = self.store.lock().expect("store mutex poisoned");
+        let store = lock_store(&self.store);
         if let Some(value) = store.get_setting("custom_groups").ok().flatten()
             && let Ok(items) = serde_json::from_str::<Vec<CustomGroupSpec>>(&value)
         {
@@ -1299,7 +1303,7 @@ impl SwiftSubApp {
         };
 
         let result = {
-            let store = self.store.lock().expect("store mutex poisoned");
+            let store = lock_store(&self.store);
             store.add_subscription(&NewSubscription::url(name.clone(), url.clone()))
         };
 
@@ -1441,7 +1445,7 @@ impl SwiftSubApp {
             .map(|parsed| parsed.proxies.len())
             .unwrap_or_default();
         let result = {
-            let store = self.store.lock().expect("store mutex poisoned");
+            let store = lock_store(&self.store);
             store
                 .add_subscription(&NewSubscription::manual(
                     "示例订阅（可删除）",
@@ -1493,14 +1497,14 @@ impl SwiftSubApp {
                     swiftsub_store::SubscriptionKind::Links
                 };
                 let result = {
-                    let store = self.store.lock().expect("store mutex poisoned");
+                    let store = lock_store(&self.store);
                     store.add_subscription(&NewSubscription::manual(name, kind, content))
                 };
                 match result {
                     Ok(id) => {
                         let count = parsed.proxies.len();
                         {
-                            let store = self.store.lock().expect("store mutex poisoned");
+                            let store = lock_store(&self.store);
                             let _ = store.set_subscription_node_count(id, count);
                         }
                         self.close_add_dialog(window, cx);
@@ -1526,7 +1530,7 @@ impl SwiftSubApp {
 
     pub fn reload_subscriptions(&mut self, cx: &mut Context<Self>) {
         let result = {
-            let store = self.store.lock().expect("store mutex poisoned");
+            let store = lock_store(&self.store);
             store.list_subscriptions()
         };
         match result {
@@ -1539,7 +1543,7 @@ impl SwiftSubApp {
 
     fn start_server(&mut self) {
         let preferred_port = {
-            let store = self.store.lock().expect("store mutex poisoned");
+            let store = lock_store(&self.store);
             store
                 .get_setting("server_port")
                 .ok()
@@ -1574,7 +1578,7 @@ impl SwiftSubApp {
                 Ok(server) => {
                     let bound_port = server.local_addr().port();
                     {
-                        let store = self.store.lock().expect("store mutex poisoned");
+                        let store = lock_store(&self.store);
                         let _ = store.set_setting("server_port", &bound_port.to_string());
                     }
                     self.server_url =
@@ -1612,7 +1616,7 @@ impl SwiftSubApp {
             return;
         }
         {
-            let store = self.store.lock().expect("store mutex poisoned");
+            let store = lock_store(&self.store);
             let _ = store.set_setting(
                 "server_bind_lan",
                 if self.server_bind_lan {
@@ -1625,6 +1629,11 @@ impl SwiftSubApp {
         let message = if let Some(error) = &self.server_error {
             format!("重启本地订阅服务失败：{error}")
         } else if self.server_bind_lan {
+            if self.lan_interfaces.is_empty() {
+                self.lan_interfaces = swiftsub_server::list_lan_interfaces();
+            } else {
+                self.refresh_lan_interfaces(cx);
+            }
             let port = self
                 .server
                 .as_ref()
@@ -1705,6 +1714,30 @@ impl SwiftSubApp {
         }
     }
 
+    pub fn refresh_lan_interfaces(&mut self, cx: &mut Context<Self>) {
+        if self.lan_interfaces_refreshing {
+            return;
+        }
+        self.lan_interfaces_refreshing = true;
+        cx.spawn(async move |this, cx| {
+            let interfaces = cx
+                .background_executor()
+                .spawn(async move { swiftsub_server::list_lan_interfaces() })
+                .await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.lan_interfaces_refreshing = false;
+                if this.lan_interfaces != interfaces {
+                    this.lan_interfaces = interfaces;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub fn active_lan_host(&self) -> Option<String> {
         if let Some(host) = self
             .server_lan_host
@@ -1714,19 +1747,22 @@ impl SwiftSubApp {
         {
             return Some(host.to_string());
         }
-        swiftsub_server::detect_lan_ipv4().map(|ip| ip.to_string())
+        self.lan_interfaces
+            .first()
+            .map(|iface| iface.ip.to_string())
     }
 
     pub fn set_server_lan_host(&mut self, host: Option<String>, cx: &mut Context<Self>) {
         let host = host.map(|h| h.trim().to_string()).filter(|h| !h.is_empty());
         self.server_lan_host = host.clone();
         {
-            let store = self.store.lock().expect("store mutex poisoned");
+            let store = lock_store(&self.store);
             let _ = store.set_setting("server_lan_host", host.as_deref().unwrap_or(""));
         }
         let label = host.unwrap_or_else(|| {
-            swiftsub_server::detect_lan_ipv4()
-                .map(|ip| format!("自动（{ip}）"))
+            self.lan_interfaces
+                .first()
+                .map(|iface| format!("自动（{}）", iface.ip))
                 .unwrap_or_else(|| "自动".into())
         });
         self.show_toast(format!("局域网订阅地址已切换为 {label}"), cx);
@@ -1735,7 +1771,7 @@ impl SwiftSubApp {
 
     fn load_templates(&mut self) {
         let templates = {
-            let store = self.store.lock().expect("store mutex poisoned");
+            let store = lock_store(&self.store);
             store.list_custom_templates().unwrap_or_default()
         };
         self.custom_templates = templates;
@@ -2567,7 +2603,10 @@ impl SwiftSubApp {
         let json = serde_json::to_string(&snapshot).map_err(|e| e.to_string())?;
         let value = serde_json::to_value(&snapshot).map_err(|e| e.to_string())?;
         let mut settings = HashMap::new();
-        for (key, value) in value.as_object().expect("snapshot is object") {
+        let Some(object) = value.as_object() else {
+            return Err("模板快照序列化格式无效".into());
+        };
+        for (key, value) in object {
             settings.insert(
                 key.clone(),
                 if key == "rule_provider_base_url" || key == "test_url" {
@@ -2593,10 +2632,7 @@ impl SwiftSubApp {
                 .map_err(|error| error.to_string())?,
         );
         let profile_json = self.profile_snapshot_json(snapshot.clone())?;
-        let saved_template_id = self
-            .store
-            .lock()
-            .expect("store mutex poisoned")
+        let saved_template_id = lock_store(&self.store)
             .save_routing_profile_with_node_overrides(
                 &settings,
                 save.as_ref()
@@ -2991,7 +3027,7 @@ impl SwiftSubApp {
             }
         };
         let result = {
-            let store = self.store.lock().expect("store mutex poisoned");
+            let store = lock_store(&self.store);
             if let Some(id) = edit_id {
                 store.update_custom_template(id, &name, &json)
             } else {
@@ -3021,11 +3057,7 @@ impl SwiftSubApp {
     }
 
     pub fn delete_custom_template(&mut self, id: i64, cx: &mut Context<Self>) {
-        let result = self
-            .store
-            .lock()
-            .expect("store mutex poisoned")
-            .delete_custom_template(id);
+        let result = lock_store(&self.store).delete_custom_template(id);
         match result {
             Ok(()) => {
                 self.load_templates();
@@ -3055,7 +3087,7 @@ impl SwiftSubApp {
     }
 
     fn save_module_config(&self) {
-        let store = self.store.lock().expect("store mutex poisoned");
+        let store = lock_store(&self.store);
         if let Ok(value) =
             serde_json::to_string(&self.enabled_modules.iter().cloned().collect::<Vec<_>>())
         {
@@ -3067,7 +3099,7 @@ impl SwiftSubApp {
     }
 
     fn save_rule_set_config(&self) {
-        let store = self.store.lock().expect("store mutex poisoned");
+        let store = lock_store(&self.store);
         if let Ok(value) = serde_json::to_string(&self.options.group_order) {
             let _ = store.set_setting("group_order", &value);
         }
@@ -3100,7 +3132,7 @@ impl SwiftSubApp {
     }
 
     fn load_module_config(&mut self) {
-        let store = self.store.lock().expect("store mutex poisoned");
+        let store = lock_store(&self.store);
         if let Some(value) = store.get_setting("preset").ok().flatten()
             && let Ok(preset) = serde_json::from_str::<Preset>(&value)
         {
@@ -3259,7 +3291,7 @@ impl SwiftSubApp {
         }
         self.options.rule_provider_base_url = base.clone();
         {
-            let store = self.store.lock().expect("store mutex poisoned");
+            let store = lock_store(&self.store);
             let _ = store.set_setting("rule_provider_base_url", &base);
         }
         self.rule_provider_input

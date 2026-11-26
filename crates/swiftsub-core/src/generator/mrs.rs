@@ -137,8 +137,14 @@ fn networks(reader: &mut Cursor<&[u8]>) -> Result<Vec<String>> {
     let mut payload = Vec::new();
     let mut size = 0;
     for range in ranges.as_chunks::<32>().0 {
-        let mut from = u128::from_be_bytes(range[..16].try_into().unwrap());
-        let to = u128::from_be_bytes(range[16..].try_into().unwrap());
+        let Ok(from_bytes) = <[u8; 16]>::try_from(&range[..16]) else {
+            return Err(invalid());
+        };
+        let Ok(to_bytes) = <[u8; 16]>::try_from(&range[16..]) else {
+            return Err(invalid());
+        };
+        let mut from = u128::from_be_bytes(from_bytes);
+        let to = u128::from_be_bytes(to_bytes);
         if from > to {
             return Err(invalid());
         }

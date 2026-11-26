@@ -108,7 +108,7 @@ impl SwiftSubApp {
         let subscriptions = self.subscriptions.clone();
 
         let overrides_by_source = {
-            let store = self.store.lock().expect("store mutex poisoned");
+            let store = lock_store(&self.store);
             let mut overrides = HashMap::new();
             for subscription in &subscriptions {
                 match store.list_node_overrides(subscription.id) {
@@ -263,11 +263,7 @@ impl SwiftSubApp {
     }
 
     fn restore_last_output(&mut self) {
-        let result = self
-            .store
-            .lock()
-            .expect("store mutex poisoned")
-            .get_profile_by_token(&self.profile_token);
+        let result = lock_store(&self.store).get_profile_by_token(&self.profile_token);
         match result {
             Ok(Some(profile)) => self.preview = profile.last_yaml.unwrap_or_default(),
             Ok(None) => self.preview.clear(),

@@ -14,7 +14,7 @@ impl Upgrades {
 
 impl SwiftSubApp {
     pub(in crate::app) fn load_profile_pull_history(&mut self) {
-        let store = self.store.lock().unwrap();
+        let store = lock_store(&self.store);
         for token in self
             .profiles
             .iter()
@@ -34,7 +34,7 @@ impl SwiftSubApp {
             return;
         };
         let pulls = server.profile_pulls();
-        let store = self.store.lock().unwrap();
+        let store = lock_store(&self.store);
         let mut changed = false;
         for (token, pull) in pulls {
             let value = (pull.at, pull.etag);

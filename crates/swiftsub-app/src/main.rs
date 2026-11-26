@@ -11,7 +11,12 @@ use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 use gpui_kit::*;
 
 fn main() {
-    application().with_assets(assets::Assets).run(|cx| {
+    let Some(instance_guard) = desktop::SingleInstanceGuard::acquire(&app::data_dir()) else {
+        return;
+    };
+    let mut instance_guard = Some(instance_guard);
+
+    application().with_assets(assets::Assets).run(move |cx| {
         init(cx);
         cx.set_window_appearance(Some(WindowAppearance::Dark));
         Theme::change(ThemeMode::Dark, None, cx);
@@ -27,8 +32,9 @@ fn main() {
             ..Default::default()
         });
 
-        open_window(options, cx, |window, cx| {
-            cx.new(|cx| SwiftSubApp::new(window, cx))
+        let guard = instance_guard.take();
+        open_window(options, cx, move |window, cx| {
+            cx.new(|cx| SwiftSubApp::new(window, guard, cx))
         })
         .expect("failed to open SwiftSub window");
     });
