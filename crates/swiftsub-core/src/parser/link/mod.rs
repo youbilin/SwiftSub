@@ -4,7 +4,9 @@ mod protocols;
 #[cfg(test)]
 mod tests;
 
-use extended::{parse_extended_proxy, parse_simple_proxy, parse_ssr};
+use extended::{
+    parse_extended_proxy, parse_hysteria_v1, parse_juicity, parse_simple_proxy, parse_ssr,
+};
 use helpers::{link_compatibility_warnings, truncate};
 use protocols::{parse_hysteria2, parse_ss, parse_trojan, parse_tuic, parse_vless, parse_vmess};
 
@@ -97,7 +99,9 @@ fn parse_link(line: &str) -> Result<Proxy> {
         "vmess" => parse_vmess(rest),
         "vless" => parse_vless(rest),
         "trojan" => parse_trojan(rest),
+        "hysteria" => parse_hysteria_v1(rest),
         "hysteria2" | "hy2" => parse_hysteria2(rest),
+        "juicity" => parse_juicity(rest),
         "tuic" => parse_tuic(rest),
         "http" | "https" | "socks" | "socks5" | "socks4" => parse_simple_proxy(scheme, rest),
         other => Err(Error::UnsupportedProtocol(other.to_string())),

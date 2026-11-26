@@ -2,9 +2,11 @@ mod dns;
 mod mrs;
 mod rule_content;
 mod rule_validation;
+pub mod singbox;
 pub use mrs::decode_mrs_payload;
 pub use rule_content::parse_rule_set_payload;
 pub use rule_validation::validate_rule_definitions;
+pub use singbox::{generate_singbox_json, proxy_to_singbox_outbound};
 
 use std::collections::{HashMap, HashSet};
 

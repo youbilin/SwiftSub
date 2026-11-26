@@ -1,0 +1,68 @@
+name: Release Windows
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.0'
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Strict Clippy
+        run: scripts/cargo-msvc.bat clippy --workspace --all-targets --locked -- -D warnings
+      - name: Full workspace tests
+        run: scripts/cargo-msvc.bat test --workspace --locked
+      - name: Build release binary
+        run: scripts/cargo-msvc.bat build --release --locked -p swiftsub-app
+      - name: Desktop startup/restart smoke test
+        run: python scripts/validate-desktop-smoke.py --binary target/release/swiftsub.exe
+
+      - name: Package portable artifacts and SHA-256 checksums
+        shell: pwsh
+        run: |
+          $tag = if ($env:GITHUB_REF_NAME -and $env:GITHUB_REF_NAME.StartsWith('v')) { $env:GITHUB_REF_NAME } else { "v" + ((Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value) }
+          $dist = Join-Path $PWD "dist"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+
+          $exeName = "swiftsub-$tag-windows-x64.exe"
+          $zipName = "SwiftSub-$tag-windows-x64-portable.zip"
+          Copy-Item "target/release/swiftsub.exe" (Join-Path $dist $exeName)
+
+          $stage = Join-Path $dist "stage"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/release/swiftsub.exe" (Join-Path $stage "swiftsub.exe")
+          Copy-Item "README.md" (Join-Path $stage "README.md")
+          Copy-Item "LICENSE" (Join-Path $stage "LICENSE")
+          Compress-Archive -Path "$stage/*" -DestinationPath (Join-Path $dist $zipName)
+          Remove-Item -Recurse -Force $stage
+
+          $hashes = Get-ChildItem $dist -File | Sort-Object Name | ForEach-Object {
+            $h = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLower()
+            "$h  $($_.Name)"
+          }
+          $hashes | Out-File -FilePath (Join-Path $dist "SHA256SUMS.txt") -Encoding ascii
+          Get-Content (Join-Path $dist "SHA256SUMS.txt")
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.exe
+            dist/*.zip
+            dist/SHA256SUMS.txt

@@ -139,6 +139,47 @@ impl SwiftSubApp {
                         ),
                 )
                 .into_any_element(),
+            h_flex()
+                .min_w_0()
+                .py(px(6.))
+                .gap_4()
+                .child(
+                    div()
+                        .w(px(110.))
+                        .flex_shrink_0()
+                        .text_size(px(12.))
+                        .text_color(rgb(MUTED))
+                        .child("Mihomo 内核"),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .font_family("Consolas")
+                        .text_size(px(11.5))
+                        .text_color(rgb(if self.p1.mihomo_binary_path.is_some() {
+                            TEXT
+                        } else {
+                            MUTED
+                        }))
+                        .truncate()
+                        .child(
+                            self.p1
+                                .mihomo_binary_path
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| {
+                                    "未检测到（可选，用于本机内核级配置预检）".into()
+                                }),
+                        ),
+                )
+                .child(
+                    Button::new("about-pick-mihomo")
+                        .outline()
+                        .label("选择内核")
+                        .on_click(cx.listener(|this, _, _, cx| this.pick_mihomo_binary(cx))),
+                )
+                .into_any_element(),
         ];
         if self.p1.backup_restore_pending {
             rows.push(banner(

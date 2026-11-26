@@ -43,3 +43,5 @@ jobs:
           python scripts/validate-presets.py --mihomo $mihomoPath --data-dir $validationDir --profiles target/validation/profiles
       - name: Desktop release build
         run: scripts/cargo-msvc.bat build --release --locked -p swiftsub-app
+      - name: Desktop startup and restart smoke test
+        run: python scripts/validate-desktop-smoke.py --binary target/release/swiftsub.exe

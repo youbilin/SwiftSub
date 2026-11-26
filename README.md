@@ -70,21 +70,21 @@ SwiftSub 对常见分享链接与 Mihomo Schema 逐项对齐，避免导入导�
 | **TUIC** | TUIC v5（`uuid:password`）与 v4（`token`）、`congestion-controller`、`udp-relay-mode`、`sni`、`disable-sni`、`reduce-rtt`、`heartbeat-interval`、`request-timeout`、`alpn`、`client-fingerprint`、`ECH`、`TFO` |
 | **Shadowsocks / SSR** | SIP002 & Legacy Base64、`obfs`、`v2ray-plugin`（布尔型 `mux`、`skip-cert-verify`、`fingerprint`）、`shadow-tls`、`restls`、`udp-over-tcp`（`uot`）、`TFO`；SSR 完整协议与混淆参数 |
 | **VMess** | 标准 V2RayN JSON 与 Shadowrocket URI 格式、`WS`（含 `?ed=`）、`gRPC`、`H2`、`HTTP`、`XHTTP`、`packet-encoding`、`ECH`、`TFO` |
-| **其他与 Clash YAML** | `AnyTLS`、`Snell`（v1–v3）、`WireGuard`（`wg://`）、`SSH`、`HTTP / HTTPS`、`SOCKS4 / SOCKS5`（支持 Base64 凭据与 TLS/SNI）；导入 Clash YAML 原样保留 `mieru`、`juicity`、`masque`、`direct`、`dns`、`reject` 及未知扩展字段 |
+| **其他与 Clash YAML** | `AnyTLS`、`Snell`（v1–v3）、`Hysteria`（v1）、`Juicity`、`WireGuard`（`wg://`）、`SSH`、`HTTP / HTTPS`、`SOCKS4 / SOCKS5`（支持 Base64 凭据与 TLS/SNI）；支持反向导出单节点分享链接与 **sing-box 1.11+ JSON**；导入 Clash YAML 原样保留 `mieru`、`masque`、`direct`、`dns`、`reject` 及未知扩展字段 |
 
-### 2. 独立分流模板与规则编排
+### 2. 独立分流模板、批量运维与内核校验
 - **独立模板编辑器**（**设置 → 模板**）：模板仅定义**策略组与分流规则结构（不含具体节点）**。可在模板页直接新建、复制内置预设（精简 / 标准 / 完整）或编辑自定义模板，勾选内置服务模块、增删自定义策略组（`手动选择 / 自动选择 / 故障转移 / 负载均衡`）、绑定自定义规则集链接与手写规则，不干扰当前生成页节点。
 - **多源规则目录**：集成 MetaCubeX、blackmatrix7、Loyalsoldier、ACL4SSR 常用规则目录，支持 `.mrs` / `.yaml` / `.txt` 正文预览与本地覆写。
-- **链式代理（Dialer Proxy）**：下拉选择入口/出口节点即可生成链式节点，支持一键互换两端，改名自动联动更新所有下游引用。
-- **完整 DNS 与测速配置**：表单与 YAML 双模式管理 Mihomo `dns`、`hosts` 与测速参数，保留未列出的扩展字段。
+- **批量节点运维与单节点分享**：生成页支持对当前筛选节点批量启用/停用/反转与批量重命名（自动联动策略组与规则引用）；悬停任意节点即可一键复制分享链接或弹出高清二维码；内置订阅流量进度/临近到期告警与刷新日志面板。
+- **链式代理、历史回滚与本地内核校验**：支持下拉组装链式代理、保存配置最近 20 个历史版本一键回滚（沿用原订阅地址），以及自动探测本机 Mihomo / Clash Verge 内核执行 `-t` 严格语法校验。
+- **完整 DNS、测速与网络抓取代理**：表单与 YAML 双模式管理 Mihomo `dns`、`hosts` 与测速参数；设置页支持配置全局抓取代理（跟随系统 / 直连 / 自定义 HTTP & SOCKS5 代理），统一接管订阅刷新、规则更新与版本检查。
 
 ### 3. 本机与局域网订阅分发
-- **独立持久化订阅**：每份保存的配置拥有固定 ID、独立 YAML 文件与订阅地址，支持 `ETag` / `If-None-Match`（HTTP 304）、`HEAD` 探测及拉取时间追踪。
-- **局域网智能网卡识别**：
-  - 开启「局域网导入」后监听 `0.0.0.0`，自动避开 Clash 常用端口冲突（默认回退至 `17899–17920`）。
-  - Windows 原生调用 `GetAdaptersAddresses` 对在线网卡智能评分：**自动剔除 Mihomo/Clash TUN 网段（`198.18.0.0/15`）、回环、APIPA 与 VMware / Hyper-V 虚拟网卡**，精准命中真实物理 Wi-Fi / 以太网 IP，并支持手动切换网卡（含 Tailscale 等虚拟组网）。
-- **本机一键导入**：通过 `clash://install-config`（兼容 `clash-verge://`）直接拉起 Clash Verge 导入并验证拉取结果。
-- **托盘保活 & 自动更新检查**：支持关闭主窗口最小化到系统托盘持续提供订阅；内置 GitHub Releases 更新检查接口，可在「设置 → 应用与更新」一键检查并跳转下载新版本。
+- **独立持久化订阅 & 高并发服务**：每份保存的配置拥有固定 ID、独立 YAML 文件与订阅地址，内置多线程 HTTP 订阅服务，支持 `ETag` / `If-None-Match`（HTTP 304）、`HEAD` 探测、拉取时间追踪与一键**重置订阅地址（轮换 Token）**。
+- **局域网智能网卡识别、二维码与私网安全**：
+  - 开启「局域网导入」后支持**自定义固定端口**或自动避让冲突端口（`17899–17920`），默认开启**仅允许私网访问**（RFC1918 / Tailscale，自动 `403` 拦截公网来源），并提供一键复制 Windows 防火墙放行命令与**手机扫码导入二维码（支持 SVG 导出）**。
+  - Windows 原生调用 `GetAdaptersAddresses` 异步探测并缓存物理网卡评分：**自动剔除 Mihomo/Clash TUN 网段（`198.18.0.0/15`）、回环、APIPA 与 VMware / Hyper-V 虚拟网卡**，精准命中真实物理 Wi-Fi / 以太网 IP，并支持手动切换网卡。
+- **单实例保护、开机静默自启与完整备份恢复**：按数据目录隔离的 Windows 单实例互斥锁（重复启动自动唤醒托盘窗口）；支持关闭到托盘保活、开机静默自启（`--background`）、跟随系统/浅色/深色三态外观，以及完整 SQLite 一致性备份导出与校验预览恢复。
 
 ---
 

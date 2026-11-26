@@ -148,6 +148,25 @@ impl SwiftSubApp {
                     })
                 })
                 .child(
+                    Button::new("saved-export-singbox")
+                        .outline()
+                        .label("sing-box")
+                        .tooltip("将当前配置节点导出为 sing-box JSON")
+                        .on_click(cx.listener(|this, _, _, cx| this.export_singbox_json_file(cx))),
+                )
+                .child(
+                    Button::new("saved-mihomo-check")
+                        .outline()
+                        .label(if self.p1.mihomo_checking {
+                            "校验中…"
+                        } else {
+                            "内核校验"
+                        })
+                        .disabled(self.p1.mihomo_checking)
+                        .tooltip("使用本机 Mihomo 内核执行严格语法校验 (-t)")
+                        .on_click(cx.listener(|this, _, _, cx| this.verify_saved_with_mihomo(cx))),
+                )
+                .child(
                     Button::new("save-generated-copy")
                         .outline()
                         .label("存为新配置")

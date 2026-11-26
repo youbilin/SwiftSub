@@ -67,6 +67,8 @@ pub struct Phase2State {
     pub refresh_logs: Vec<RefreshLog>,
     pub theme_mode: crate::ui::AppThemeMode,
     pub summary_cache: HashMap<String, ((i64, usize), workspace::ConfigSummary)>,
+    pub mihomo_binary_path: Option<PathBuf>,
+    pub mihomo_checking: bool,
 }
 
 impl Phase2State {
@@ -75,7 +77,7 @@ impl Phase2State {
         window: &mut Window,
         cx: &mut Context<SwiftSubApp>,
     ) -> Self {
-        let (fixed_port, lan_private_only, proxy_mode, proxy_url, theme_mode) = {
+        let (fixed_port, lan_private_only, proxy_mode, proxy_url, theme_mode, mihomo_binary_path) = {
             let guard = lock_store(store);
             let fixed = guard
                 .get_setting("server_fixed_port")
@@ -103,7 +105,14 @@ impl Phase2State {
             let theme = crate::ui::AppThemeMode::from_setting(
                 guard.get_setting("theme").ok().flatten().as_deref(),
             );
-            (fixed, private_only, mode, url, theme)
+            let mihomo = guard
+                .get_setting("mihomo_binary_path")
+                .ok()
+                .flatten()
+                .map(|p| PathBuf::from(p.trim()))
+                .filter(|p| p.is_file())
+                .or_else(crate::desktop::detect_mihomo_binary);
+            (fixed, private_only, mode, url, theme, mihomo)
         };
         let fixed_port_text = fixed_port.map(|p| p.to_string()).unwrap_or_default();
         let server_fixed_port_input = cx.new(|cx| {
@@ -144,6 +153,8 @@ impl Phase2State {
             refresh_logs: Vec::new(),
             theme_mode,
             summary_cache: HashMap::new(),
+            mihomo_binary_path,
+            mihomo_checking: false,
         }
     }
 
@@ -944,6 +955,113 @@ impl SwiftSubApp {
             WindowAppearance::Dark
         }));
         cx.notify();
+    }
+
+    /// Export active workspace nodes (or the currently opened saved config) to sing-box JSON.
+    pub fn export_singbox_json_file(&mut self, cx: &mut Context<Self>) {
+        let (nodes, suggested_name) =
+            if self.page == Page::SavedConfigs || self.workspace.saved_editor_open {
+                let yaml = self.saved_config_yaml.read(cx).value().to_string();
+                let parsed = match parse_content(&yaml) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        self.show_toast(format!("无法提取节点导出 sing-box：{error}"), cx);
+                        return;
+                    }
+                };
+                let name = self.saved_config_name.read(cx).value().trim().to_string();
+                (
+                    build_nodes(parsed.proxies, "saved", "saved"),
+                    if name.is_empty() {
+                        "sing-box".to_string()
+                    } else {
+                        name
+                    },
+                )
+            } else {
+                (self.nodes.clone(), "swiftsub-singbox".to_string())
+            };
+        let json = match swiftsub_core::generator::generate_singbox_json(&nodes, &self.options) {
+            Ok(json) => json,
+            Err(error) => {
+                self.show_toast(format!("导出 sing-box 失败：{error}"), cx);
+                return;
+            }
+        };
+        let safe_name = suggested_name.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(format!("{safe_name}.json"))
+            .add_filter("sing-box JSON", &["json"])
+            .save_file()
+        else {
+            return;
+        };
+        match std::fs::write(&path, json) {
+            Ok(()) => self.show_toast("sing-box JSON 配置已导出".into(), cx),
+            Err(error) => self.show_toast(format!("保存文件失败：{error}"), cx),
+        }
+    }
+
+    pub fn pick_mihomo_binary(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Mihomo Core", &["exe"])
+            .pick_file()
+        else {
+            return;
+        };
+        let path_str = path.display().to_string();
+        let _ = lock_store(&self.store).set_setting("mihomo_binary_path", &path_str);
+        self.p1.mihomo_binary_path = Some(path);
+        self.show_toast(format!("已配置本地 Mihomo 内核：{path_str}"), cx);
+        cx.notify();
+    }
+
+    pub fn verify_saved_with_mihomo(&mut self, cx: &mut Context<Self>) {
+        if self.p1.mihomo_checking {
+            return;
+        }
+        let binary = match &self.p1.mihomo_binary_path {
+            Some(path) if path.is_file() => path.clone(),
+            _ => match crate::desktop::detect_mihomo_binary() {
+                Some(path) => {
+                    self.p1.mihomo_binary_path = Some(path.clone());
+                    path
+                }
+                None => {
+                    self.show_toast(
+                        "未自动检测到本地 Mihomo / Clash Verge 内核，请在「设置 → 应用与数据」指定 mihomo.exe"
+                            .into(),
+                        cx,
+                    );
+                    return;
+                }
+            },
+        };
+        let yaml = self.saved_config_yaml.read(cx).value().to_string();
+        if yaml.trim().is_empty() {
+            self.show_toast("当前没有可校验的 YAML 内容".into(), cx);
+            return;
+        }
+        self.p1.mihomo_checking = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::desktop::run_mihomo_check(&binary, &yaml) })
+                .await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.p1.mihomo_checking = false;
+                match result {
+                    Ok(msg) => this.show_toast(format!("内核校验通过：{msg}"), cx),
+                    Err(err) => this.show_toast(err, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }
 

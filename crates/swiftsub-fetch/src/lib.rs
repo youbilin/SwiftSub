@@ -694,4 +694,40 @@ mod http_tests {
         assert!(matches!(error, FetchError::HttpStatus(500, _)));
         handle.join().unwrap();
     }
+
+    #[test]
+    fn rejects_empty_body_and_invalid_custom_proxy() {
+        let (url, _addr, handle) = start_server(200, "   \r\n  ", vec![]);
+        let err = fetch_subscription(
+            &url,
+            &FetchOptions {
+                proxy: ProxyMode::Direct,
+                ..Default::default()
+            },
+            &CacheValidators::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, FetchError::Empty));
+        handle.join().unwrap();
+
+        let proxy_err = fetch_subscription(
+            "http://127.0.0.1:1/sub",
+            &FetchOptions {
+                proxy: ProxyMode::Custom("://bad-proxy".into()),
+                ..Default::default()
+            },
+            &CacheValidators::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(proxy_err, FetchError::HttpStatus(0, _)));
+    }
+
+    #[test]
+    fn handles_malformed_github_release_json_and_prerelease_versions() {
+        assert!(parse_github_release_json("not-json", "0.2.0").is_err());
+        assert!(is_newer_version("v0.3.0-rc.1", "0.2.0"));
+        assert!(!is_newer_version("v0.2.0", "0.2.0"));
+        assert!(!is_newer_version("0.1.9", "0.2.0"));
+        assert!(check_github_release("invalid-repo", "0.2.0", &FetchOptions::default()).is_err());
+    }
 }

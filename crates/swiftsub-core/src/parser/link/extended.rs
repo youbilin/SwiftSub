@@ -323,3 +323,83 @@ pub(super) fn parse_simple_proxy(scheme: &str, rest: &str) -> Result<Proxy> {
 
     Ok(proxy)
 }
+
+pub(super) fn parse_hysteria_v1(rest: &str) -> Result<Proxy> {
+    let url = Url::parse(&format!("hysteria://{rest}"))?;
+    let server = url_host(&url)?;
+    let port = url
+        .port()
+        .filter(|&p| p > 0)
+        .ok_or(Error::MissingField("port"))?;
+    let name = fragment_name(&url).unwrap_or_else(|| format!("Hysteria-{server}:{port}"));
+    let query = query_map(&url);
+
+    let mut proxy = Proxy::new("hysteria", name, server, port);
+    if let Some(auth) = query_value(&query, &["auth"]) {
+        proxy.insert("auth-str", auth.to_string());
+    }
+    if let Some(up) = query_value(&query, &["upmbps", "up"]) {
+        proxy.insert("up", normalize_hy2_bandwidth(up));
+    }
+    if let Some(down) = query_value(&query, &["downmbps", "down"]) {
+        proxy.insert("down", normalize_hy2_bandwidth(down));
+    }
+    if let Some(protocol) = query_value(&query, &["protocol"]) {
+        proxy.insert("protocol", protocol.to_string());
+    }
+    if let Some(obfs) = query_value(&query, &["obfs"]).filter(|v| !v.eq_ignore_ascii_case("none")) {
+        proxy.insert("obfs", obfs.to_string());
+    }
+    if let Some(sni) = query_value(&query, &["peer", "sni", "servername"]) {
+        proxy.insert("sni", sni.to_string());
+    }
+    if let Some(alpn) = query_value(&query, &["alpn"]) {
+        insert_alpn(&mut proxy, alpn);
+    }
+    if query_bool(&query, &["insecure", "allowinsecure", "skip-cert-verify"]) {
+        proxy.insert("skip-cert-verify", true);
+    }
+    proxy.insert("udp", true);
+    apply_common_opts(&mut proxy, &query)?;
+    Ok(proxy)
+}
+
+pub(super) fn parse_juicity(rest: &str) -> Result<Proxy> {
+    let url = Url::parse(&format!("juicity://{rest}"))?;
+    let server = url_host(&url)?;
+    let port = url
+        .port()
+        .filter(|&p| p > 0)
+        .ok_or(Error::MissingField("port"))?;
+    let uuid = percent_decode(url.username());
+    let password = url.password().map(percent_decode).unwrap_or_default();
+    if uuid.is_empty() || password.is_empty() {
+        return Err(Error::InvalidLink(
+            "Juicity link requires uuid:password".into(),
+        ));
+    }
+    let name = fragment_name(&url).unwrap_or_else(|| format!("Juicity-{server}:{port}"));
+    let query = query_map(&url);
+
+    let mut proxy = Proxy::new("juicity", name, server, port);
+    proxy.insert("uuid", uuid);
+    proxy.insert("password", password);
+    proxy.insert("udp", true);
+    if let Some(sni) = query_value(&query, &["sni", "servername", "peer"]) {
+        proxy.insert("sni", sni.to_string());
+    }
+    if let Some(cc) = query_value(&query, &["congestion_control", "congestion-controller"]) {
+        proxy.insert("congestion-controller", cc.to_string());
+    }
+    if let Some(fp) = query_value(&query, &["pinned_certchain_sha256", "fingerprint"]) {
+        proxy.insert("fingerprint", fp.to_string());
+    }
+    if let Some(alpn) = query_value(&query, &["alpn"]) {
+        insert_alpn(&mut proxy, alpn);
+    }
+    if query_bool(&query, &["allow_insecure", "insecure", "skip-cert-verify"]) {
+        proxy.insert("skip-cert-verify", true);
+    }
+    apply_common_opts(&mut proxy, &query)?;
+    Ok(proxy)
+}

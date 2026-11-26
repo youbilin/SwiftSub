@@ -424,6 +424,84 @@ pub fn lan_firewall_command(port: u16) -> String {
     )
 }
 
+/// Auto-detect an installed Mihomo / Clash Verge core binary on the local machine.
+pub fn detect_mihomo_binary() -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            for name in ["mihomo.exe", "verge-mihomo.exe", "mihomo"] {
+                candidates.push(dir.join(name));
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        for env_key in ["ProgramFiles", "LOCALAPPDATA"] {
+            if let Ok(base) = std::env::var(env_key) {
+                let base = std::path::PathBuf::from(base);
+                for rel in [
+                    "Clash Verge/verge-mihomo.exe",
+                    "Clash Verge/verge-mihomo-alpha.exe",
+                    "Clash Verge/mihomo.exe",
+                    "Programs/Clash Verge/verge-mihomo.exe",
+                    "Mihomo Party/resources/sidecar/mihomo.exe",
+                ] {
+                    candidates.push(base.join(rel));
+                }
+            }
+        }
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+/// Validate a generated Clash/Mihomo YAML using a local `mihomo` binary (`mihomo -t`).
+pub fn run_mihomo_check(mihomo_path: &Path, yaml: &str) -> Result<String, String> {
+    if !mihomo_path.is_file() {
+        return Err(format!("找不到 Mihomo 内核文件：{}", mihomo_path.display()));
+    }
+    let work_dir = std::env::temp_dir().join(format!(
+        "swiftsub-mihomo-check-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&work_dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
+    let cfg_path = work_dir.join("config.yaml");
+    std::fs::write(&cfg_path, yaml).map_err(|e| format!("写入临时配置失败：{e}"))?;
+
+    let mut cmd = std::process::Command::new(mihomo_path);
+    cmd.args(["-t", "-d"])
+        .arg(&work_dir)
+        .arg("-f")
+        .arg(&cfg_path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let output = cmd
+        .output()
+        .map_err(|e| format!("无法执行 Mihomo 内核：{e}"));
+    let _ = std::fs::remove_dir_all(&work_dir);
+
+    let output = output?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let detail = if !stderr.is_empty() { stderr } else { stdout };
+    if output.status.success() {
+        Ok(if detail.is_empty() {
+            "Mihomo 内核语法校验通过".into()
+        } else {
+            detail
+                .lines()
+                .last()
+                .unwrap_or("Mihomo 内核校验通过")
+                .to_string()
+        })
+    } else {
+        let excerpt: String = detail.chars().take(280).collect();
+        Err(format!("Mihomo 内核校验未通过：{excerpt}"))
+    }
+}
+
 /// Open the registered Verge handler, with support for its legacy Clash scheme.
 pub fn open_clash_verge(uri: &str) -> Result<(), String> {
     #[cfg(windows)]
