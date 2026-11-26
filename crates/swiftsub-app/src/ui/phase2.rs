@@ -940,13 +940,30 @@ impl SwiftSubApp {
                                     }),
                             )
                             .child(
-                                Button::new(format!("sub-log-refresh-{sub_id}"))
-                                    .outline()
-                                    .disabled(refreshing)
-                                    .label(if refreshing { "刷新中…" } else { "刷新" })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.refresh_subscription(sub_id, cx)
-                                    })),
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        Button::new(format!("sub-log-refresh-{sub_id}"))
+                                            .outline()
+                                            .disabled(refreshing)
+                                            .label(if refreshing {
+                                                "刷新中…"
+                                            } else {
+                                                "刷新"
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.refresh_subscription(sub_id, cx)
+                                            })),
+                                    )
+                                    .child(danger_action(
+                                        format!("sub-log-delete-{sub_id}"),
+                                        delete_icon(),
+                                        "删除订阅",
+                                        cx,
+                                        move |this, _, cx| {
+                                            this.delete_subscription_source(sub_id, cx)
+                                        },
+                                    )),
                             ),
                     )
                     .when(total > 0, |card| {

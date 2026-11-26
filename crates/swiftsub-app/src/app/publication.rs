@@ -106,6 +106,13 @@ fn rebuild(revision: u64, job: PublishJob, shared_revision: &Mutex<u64>) -> Resu
                     }
                     values
                 };
+                let deleted_nodes: HashSet<String> = job
+                    .store
+                    .lock()
+                    .ok()
+                    .and_then(|store| store.get_setting("deleted_nodes").ok().flatten())
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or_default();
                 let mut nodes = Vec::new();
                 for sub in job.subscriptions.iter().filter(|s| {
                     s.enabled
@@ -121,6 +128,7 @@ fn rebuild(revision: u64, job: PublishJob, shared_revision: &Mutex<u64>) -> Resu
                     {
                         let mut imported =
                             build_nodes(parsed.proxies, sub.id.to_string(), sub.name.clone());
+                        imported.retain(|n| !deleted_nodes.contains(&n.source_key));
                         let overrides = &overrides_by_source[&sub.id];
                         for n in &mut imported {
                             if let Some(o) = overrides.get(&n.source_key) {
@@ -303,10 +311,38 @@ mod tests {
         );
         assert!(!parsed.proxies.iter().any(|proxy| proxy.name() == "Node-1"));
         assert_eq!(body(&server, "saved"), "saved-output");
+        // Deleted nodes recorded in settings must also be excluded from background published profiles.
+        let deleted_key = parse_content(
+            store.lock().unwrap().list_subscriptions().unwrap()[0]
+                .payload
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap()
+        .proxies[2]
+            .identity_key();
+        store
+            .lock()
+            .unwrap()
+            .set_setting(
+                "deleted_nodes",
+                &serde_json::to_string(&HashSet::from([deleted_key])).unwrap(),
+            )
+            .unwrap();
+        rebuild(3, job(), &Mutex::new(3)).unwrap();
+        let after_delete = parse_content(&body(&server, &profile.token)).unwrap();
+        assert_eq!(after_delete.proxies.len(), 98);
+        assert!(!after_delete.proxies.iter().any(|p| p.name() == "Node-2"));
         let mut invalid = job();
         invalid.subscriptions.clear();
-        rebuild(3, invalid, &Mutex::new(3)).unwrap();
-        assert_eq!(body(&server, &profile.token), generated);
+        rebuild(4, invalid, &Mutex::new(4)).unwrap();
+        assert_eq!(
+            parse_content(&body(&server, &profile.token))
+                .unwrap()
+                .proxies
+                .len(),
+            98
+        );
         assert_eq!(body(&server, "saved"), "saved-output");
     }
 }

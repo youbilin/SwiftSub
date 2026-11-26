@@ -916,6 +916,63 @@ impl SwiftSubApp {
         cx.notify();
     }
 
+    pub fn delete_subscription_source(&mut self, sub_id: i64, cx: &mut Context<Self>) {
+        let Some(sub) = self
+            .subscriptions
+            .iter()
+            .find(|item| item.id == sub_id)
+            .cloned()
+        else {
+            return;
+        };
+        let other_sub_keys: HashSet<String> = self
+            .subscriptions
+            .iter()
+            .filter(|other| other.id != sub_id)
+            .filter_map(|other| {
+                other
+                    .payload
+                    .as_deref()
+                    .and_then(|text| self.parsed_sources.parse(other.id, text).ok())
+            })
+            .flat_map(|other| other.proxies.into_iter().map(|p| p.identity_key()))
+            .collect();
+        let keys_to_clean: Vec<String> = sub
+            .payload
+            .as_deref()
+            .and_then(|payload| self.parsed_sources.parse(sub_id, payload).ok())
+            .map(|parsed| {
+                parsed
+                    .proxies
+                    .iter()
+                    .map(Proxy::identity_key)
+                    .filter(|key| !other_sub_keys.contains(key))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let delete_result = lock_store(&self.store)
+            .delete_subscription(sub_id)
+            .map_err(|error| error.to_string());
+        if let Err(error) = delete_result {
+            self.show_toast(format!("删除订阅失败：{error}"), cx);
+            return;
+        }
+        self.restore_deleted_node_keys(&keys_to_clean);
+        for key in &keys_to_clean {
+            self.disabled_nodes.remove(key);
+            self.node_order.retain(|item| item != key);
+        }
+        if let Some(ids) = &mut self.profile_membership {
+            ids.remove(&sub_id);
+        }
+        self.failure_counts.remove(&sub_id);
+        self.retry_after.remove(&sub_id);
+        self.refresh_versions.remove(&sub_id);
+        self.reload_subscriptions(cx);
+        self.show_toast(format!("已删除订阅「{}」", sub.name), cx);
+        cx.notify();
+    }
+
     pub fn open_sub_logs(&mut self, cx: &mut Context<Self>) {
         self.p1.refresh_logs = lock_store(&self.store)
             .recent_refresh_logs(40)

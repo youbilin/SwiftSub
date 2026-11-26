@@ -6318,7 +6318,7 @@ dependencies = [
 
 [[package]]
 name = "swiftsub-app"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -6341,7 +6341,7 @@ dependencies = [
 
 [[package]]
 name = "swiftsub-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -6359,7 +6359,7 @@ dependencies = [
 
 [[package]]
 name = "swiftsub-fetch"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "encoding_rs",
  "reqwest",
@@ -6371,7 +6371,7 @@ dependencies = [
 
 [[package]]
 name = "swiftsub-server"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "hex",
  "sha2 0.10.9",
@@ -6382,7 +6382,7 @@ dependencies = [
 
 [[package]]
 name = "swiftsub-store"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "rusqlite",
  "thiserror 2.0.21",

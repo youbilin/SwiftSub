@@ -1276,6 +1276,7 @@ impl SwiftSubApp {
         }
         let previous_nodes = self.nodes.clone();
         let previous_deleted = self.deleted_nodes.clone();
+        let previous_disabled = self.disabled_nodes.clone();
         let previous_order = self.node_order.clone();
         let previous_visibility = self.workspace.rule_visibility.clone();
         let result = (|| {
@@ -1300,7 +1301,75 @@ impl SwiftSubApp {
                     chain.disabled = true;
                 }
             }
-            self.deleted_nodes.insert(key.clone());
+            let manual_sub_id = node.source_id.parse::<i64>().ok().filter(|id| {
+                self.subscriptions
+                    .iter()
+                    .any(|sub| sub.id == *id && sub.url.is_none() && sub.name == "手动节点")
+            });
+            let mut manual_payload_update = None;
+            let mut empty_sub_to_delete = None;
+            if let Some(sub_id) = manual_sub_id {
+                let existing_payload = self
+                    .subscriptions
+                    .iter()
+                    .find(|sub| sub.id == sub_id)
+                    .and_then(|sub| sub.payload.as_deref());
+                manual_payload_update =
+                    remove_manual_proxy_from_payload(existing_payload, &key, &self.deleted_nodes)?
+                        .map(|(payload, count)| (sub_id, payload, count));
+                // If another subscription also carries a node with the same identity key,
+                // keep it suppressed so deleting the visible node doesn't immediately resurrect
+                // a duplicate from another subscription.
+                let duplicated_in_other_sub = self
+                    .subscriptions
+                    .iter()
+                    .filter(|other| other.id != sub_id)
+                    .filter_map(|other| {
+                        other
+                            .payload
+                            .as_deref()
+                            .and_then(|text| self.parsed_sources.parse(other.id, text).ok())
+                    })
+                    .any(|other| other.proxies.iter().any(|p| p.identity_key() == key));
+                if duplicated_in_other_sub {
+                    self.deleted_nodes.insert(key.clone());
+                }
+            } else {
+                self.deleted_nodes.insert(key.clone());
+                if let Ok(sub_id) = node.source_id.parse::<i64>()
+                    && let Some(sub) = self.subscriptions.iter().find(|sub| sub.id == sub_id)
+                    && let Some(payload) = sub.payload.as_deref()
+                    && let Ok(parsed) = self.parsed_sources.parse(sub.id, payload)
+                    && parsed
+                        .proxies
+                        .iter()
+                        .all(|proxy| self.deleted_nodes.contains(&proxy.identity_key()))
+                {
+                    let other_sub_keys: HashSet<String> = self
+                        .subscriptions
+                        .iter()
+                        .filter(|other| other.id != sub_id)
+                        .filter_map(|other| {
+                            other
+                                .payload
+                                .as_deref()
+                                .and_then(|text| self.parsed_sources.parse(other.id, text).ok())
+                        })
+                        .flat_map(|other| other.proxies.into_iter().map(|p| p.identity_key()))
+                        .collect();
+                    let keys: Vec<String> = parsed
+                        .proxies
+                        .iter()
+                        .map(Proxy::identity_key)
+                        .filter(|item| !other_sub_keys.contains(item))
+                        .collect();
+                    for item in &keys {
+                        self.deleted_nodes.remove(item);
+                    }
+                    empty_sub_to_delete = Some(sub_id);
+                }
+            }
+            self.disabled_nodes.remove(&key);
             self.node_order.retain(|item| item != &key);
             self.nodes.retain(|item| item.source_key != key);
             let mut overrides = Vec::new();
@@ -1321,12 +1390,43 @@ impl SwiftSubApp {
                 window,
                 cx,
             )?;
+            if let Some((sub_id, payload, count)) = manual_payload_update {
+                {
+                    let store = lock_store(&self.store);
+                    store
+                        .save_manual_payload(sub_id, &payload, count)
+                        .map_err(|error| error.to_string())?;
+                    let _ = store.delete_node_override(sub_id, &key);
+                }
+                if let Some(sub) = self.subscriptions.iter_mut().find(|sub| sub.id == sub_id) {
+                    sub.payload = Some(payload);
+                    sub.node_count = count;
+                }
+            } else if let Some(sub_id) = empty_sub_to_delete {
+                {
+                    let store = lock_store(&self.store);
+                    store
+                        .delete_subscription(sub_id)
+                        .map_err(|error| error.to_string())?;
+                }
+                self.subscriptions.retain(|sub| sub.id != sub_id);
+                if let Some(ids) = &mut self.profile_membership {
+                    ids.remove(&sub_id);
+                }
+                self.parsed_sources.retain(&self.subscriptions);
+                self.failure_counts.remove(&sub_id);
+                self.retry_after.remove(&sub_id);
+                self.refresh_versions.remove(&sub_id);
+            } else if let Ok(sub_id) = node.source_id.parse::<i64>() {
+                let _ = lock_store(&self.store).delete_node_override(sub_id, &key);
+            }
             self.sync_workspace_snapshot(snapshot, window, cx);
             Ok::<_, String>(())
         })();
         if let Err(error) = result {
             self.nodes = previous_nodes;
             self.deleted_nodes = previous_deleted;
+            self.disabled_nodes = previous_disabled;
             self.node_order = previous_order;
             self.workspace.rule_visibility = previous_visibility;
             self.template_error = Some(error);

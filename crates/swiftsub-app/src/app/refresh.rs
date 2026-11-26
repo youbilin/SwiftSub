@@ -1,5 +1,14 @@
 use super::*;
 
+pub(super) struct FetchRequest {
+    pub(super) id: i64,
+    pub(super) url: String,
+    pub(super) name: String,
+    pub(super) cache: CacheValidators,
+    pub(super) options: FetchOptions,
+    pub(super) restore_deleted: bool,
+}
+
 pub(super) struct FetchJob {
     pub(super) id: i64,
     url: String,
@@ -7,6 +16,7 @@ pub(super) struct FetchJob {
     cache: CacheValidators,
     options: FetchOptions,
     generation: u64,
+    restore_deleted: bool,
 }
 
 fn next_job(queue: &mut VecDeque<FetchJob>, active: &HashSet<i64>) -> Option<FetchJob> {
@@ -149,7 +159,17 @@ impl SwiftSubApp {
         if let Some(user_agent) = subscription.user_agent {
             options.user_agent = user_agent;
         }
-        self.fetch_in_background(id, url, subscription.name, cache, options, cx);
+        self.fetch_in_background(
+            FetchRequest {
+                id,
+                url,
+                name: subscription.name,
+                cache,
+                options,
+                restore_deleted: false,
+            },
+            cx,
+        );
     }
 
     pub fn refresh_all(&mut self, cx: &mut Context<Self>) {
@@ -168,26 +188,19 @@ impl SwiftSubApp {
         }
     }
 
-    pub(super) fn fetch_in_background(
-        &mut self,
-        id: i64,
-        url: String,
-        name: String,
-        cache: CacheValidators,
-        options: FetchOptions,
-        cx: &mut Context<Self>,
-    ) {
-        let generation = self.refresh_versions.entry(id).or_default();
+    pub(super) fn fetch_in_background(&mut self, request: FetchRequest, cx: &mut Context<Self>) {
+        let generation = self.refresh_versions.entry(request.id).or_default();
         *generation += 1;
         let job = FetchJob {
-            id,
-            url,
-            name,
-            cache,
-            options,
+            id: request.id,
+            url: request.url,
+            name: request.name,
+            cache: request.cache,
+            options: request.options,
             generation: *generation,
+            restore_deleted: request.restore_deleted,
         };
-        self.refresh_queue.retain(|pending| pending.id != id);
+        self.refresh_queue.retain(|pending| pending.id != job.id);
         self.refresh_queue.push_back(job);
         self.pump_refresh_queue(cx);
     }
@@ -207,6 +220,7 @@ impl SwiftSubApp {
             cache,
             options,
             generation,
+            restore_deleted,
         } = job;
         self.refreshing.insert(id);
         cx.notify();
@@ -286,6 +300,13 @@ impl SwiftSubApp {
                         }
                         this.failure_counts.remove(&id);
                         this.retry_after.remove(&id);
+                        if restore_deleted
+                            && let Ok(parsed) = this.parsed_sources.parse(id, &result.content)
+                        {
+                            let keys: Vec<String> =
+                                parsed.proxies.iter().map(Proxy::identity_key).collect();
+                            this.restore_deleted_node_keys(&keys);
+                        }
                         this.show_toast(format!("{name} 已更新，共 {node_count} 个节点"), cx);
                     }
                     Ok(FetchOutcome::NotModified {
@@ -511,6 +532,7 @@ mod tests {
             cache: CacheValidators::default(),
             options: FetchOptions::default(),
             generation: 1,
+            restore_deleted: false,
         }
     }
 
@@ -567,5 +589,16 @@ mod tests {
             Some(&1),
             Some(&subscription)
         ));
+    }
+
+    #[test]
+    fn readding_subscription_job_marks_restore_deleted_flag() {
+        let regular = job(1);
+        assert!(!regular.restore_deleted);
+        let readd = FetchJob {
+            restore_deleted: true,
+            ..job(2)
+        };
+        assert!(readd.restore_deleted);
     }
 }

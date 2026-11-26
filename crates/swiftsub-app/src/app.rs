@@ -30,7 +30,7 @@ use swiftsub_core::generator::RuleSetBinding;
 use swiftsub_core::model::{
     ChainSpec, CustomGroupSpec, GroupKind, Node, NodeFilter, PolicyGroupSpec, Proxy, Rule,
 };
-use swiftsub_core::normalize::{build_nodes, merge_manual_proxies_yaml};
+use swiftsub_core::normalize::{build_nodes, dedupe_proxies, proxies_to_clash_yaml};
 use swiftsub_core::parser::{looks_like_clash_yaml, parse_content};
 use swiftsub_core::region::{Region, detect_region};
 use swiftsub_core::{GenerateOptions, ProfileStats, generate_profile};
@@ -1197,7 +1197,10 @@ impl SwiftSubApp {
         cx.notify();
     }
 
-    fn append_manual_proxies(&mut self, proxies: Vec<Proxy>) -> Result<usize, String> {
+    fn append_manual_proxies(
+        &mut self,
+        proxies: Vec<Proxy>,
+    ) -> Result<(usize, usize, usize), String> {
         let store = lock_store(&self.store);
 
         let existing_id = store
@@ -1235,15 +1238,29 @@ impl SwiftSubApp {
             .get_subscription(id)
             .map_err(|error| error.to_string())?;
         let existing_payload = existing.as_ref().and_then(|value| value.payload.as_deref());
-        let (payload, total) = merge_manual_proxies_yaml(existing_payload, proxies)
-            .map_err(|error| error.to_string())?;
+        let visible_keys: HashSet<String> = self
+            .nodes
+            .iter()
+            .map(|node| node.source_key.clone())
+            .collect();
+        let (payload, added, duplicates, total) = merge_manual_proxies_restoring_deleted(
+            existing_payload,
+            proxies,
+            &mut self.deleted_nodes,
+            &visible_keys,
+        )?;
         store
             .save_manual_payload(id, &payload, total)
+            .map_err(|error| error.to_string())?;
+        let deleted_json =
+            serde_json::to_string(&self.deleted_nodes).map_err(|error| error.to_string())?;
+        store
+            .set_setting("deleted_nodes", &deleted_json)
             .map_err(|error| error.to_string())?;
         if let Some(ids) = &mut self.profile_membership {
             ids.insert(id);
         }
-        Ok(total)
+        Ok((added, duplicates, total))
     }
 
     pub fn open_custom_dialog(&mut self, dialog: CustomDialog, cx: &mut Context<Self>) {
@@ -1359,17 +1376,31 @@ impl SwiftSubApp {
             if let Some(ids) = &mut self.profile_membership {
                 ids.insert(existing.id);
             }
+            if !existing.enabled {
+                let _ = lock_store(&self.store).set_subscription_enabled(existing.id, true);
+            }
+            let restored = self.restore_deleted_nodes_for_subscription(&existing);
             self.close_add_dialog(window, cx);
             self.reload_subscriptions(cx);
             self.fetch_in_background(
-                existing.id,
-                url,
-                existing.name,
-                CacheValidators::default(),
-                self.fetch_options(),
+                refresh::FetchRequest {
+                    id: existing.id,
+                    url,
+                    name: existing.name,
+                    cache: CacheValidators::default(),
+                    options: self.fetch_options(),
+                    restore_deleted: true,
+                },
                 cx,
             );
-            self.show_toast("订阅已存在，正在刷新原订阅".into(), cx);
+            self.show_toast(
+                if restored > 0 {
+                    format!("订阅已存在，已恢复 {restored} 个已删节点并正在刷新")
+                } else {
+                    "订阅已存在，正在刷新原订阅".into()
+                },
+                cx,
+            );
             return;
         }
 
@@ -1397,11 +1428,14 @@ impl SwiftSubApp {
                     .update(cx, |state, cx| state.set_value("", window, cx));
                 self.reload_subscriptions(cx);
                 self.fetch_in_background(
-                    id,
-                    url,
-                    name,
-                    CacheValidators::default(),
-                    self.fetch_options(),
+                    refresh::FetchRequest {
+                        id,
+                        url,
+                        name,
+                        cache: CacheValidators::default(),
+                        options: self.fetch_options(),
+                        restore_deleted: true,
+                    },
                     cx,
                 );
             }
@@ -1454,20 +1488,13 @@ impl SwiftSubApp {
         if parsed.proxies.len() == 1 && !typed_name.is_empty() {
             parsed.proxies[0].set_name(typed_name);
         }
-        let imported = parsed.proxies.len();
-        let previous_count = self
-            .subscriptions
-            .iter()
-            .find(|sub| sub.name == "手动节点" && sub.url.is_none())
-            .map(|sub| sub.node_count)
-            .unwrap_or(0);
         let previous_keys: HashSet<_> = self
             .nodes
             .iter()
             .map(|node| node.source_key.clone())
             .collect();
         match self.append_manual_proxies(parsed.proxies) {
-            Ok(total) => {
+            Ok((added, duplicates, total)) => {
                 self.close_add_dialog(window, cx);
                 self.reload_subscriptions(cx);
                 self.workspace.node_source.clear();
@@ -1484,9 +1511,7 @@ impl SwiftSubApp {
                 }
                 self.show_toast(
                     format!(
-                        "新增 {} 个节点，{} 个已存在或重复，手动节点共 {total} 个",
-                        total.saturating_sub(previous_count),
-                        imported.saturating_sub(total.saturating_sub(previous_count))
+                        "新增 {added} 个节点，{duplicates} 个已存在或重复，手动节点共 {total} 个"
                     ),
                     cx,
                 );
@@ -1496,6 +1521,35 @@ impl SwiftSubApp {
                 cx.notify();
             }
         }
+    }
+
+    fn restore_deleted_nodes_for_subscription(
+        &mut self,
+        subscription: &StoredSubscription,
+    ) -> usize {
+        let Some(payload) = subscription.payload.as_deref() else {
+            return 0;
+        };
+        let Ok(parsed) = self.parsed_sources.parse(subscription.id, payload) else {
+            return 0;
+        };
+        let keys: Vec<String> = parsed.proxies.iter().map(Proxy::identity_key).collect();
+        self.restore_deleted_node_keys(&keys)
+    }
+
+    pub(super) fn restore_deleted_node_keys(&mut self, keys: &[String]) -> usize {
+        let mut restored = 0;
+        for key in keys {
+            if self.deleted_nodes.remove(key) {
+                restored += 1;
+            }
+        }
+        if restored > 0
+            && let Ok(json) = serde_json::to_string(&self.deleted_nodes)
+        {
+            let _ = lock_store(&self.store).set_setting("deleted_nodes", &json);
+        }
+        restored
     }
 
     pub fn paste_add_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1508,19 +1562,37 @@ impl SwiftSubApp {
     }
 
     pub fn load_demo(&mut self, cx: &mut Context<Self>) {
-        if self
+        if let Some(existing) = self
             .subscriptions
             .iter()
-            .any(|subscription| subscription.name == "示例订阅（可删除）")
+            .find(|subscription| subscription.name == "示例订阅（可删除）")
+            .cloned()
         {
+            let restored = self.restore_deleted_nodes_for_subscription(&existing);
+            if restored > 0 {
+                self.reload_subscriptions(cx);
+            }
             self.page = Page::Generator;
-            self.show_toast("示例订阅已存在".to_string(), cx);
+            self.show_toast(
+                if restored > 0 {
+                    format!("示例订阅已恢复 {restored} 个节点")
+                } else {
+                    "示例订阅已存在".to_string()
+                },
+                cx,
+            );
             return;
         }
         const DEMO: &str = include_str!("../assets/demo.yaml");
-        let node_count = parse_content(DEMO)
+        let parsed_demo = parse_content(DEMO).ok();
+        let node_count = parsed_demo
+            .as_ref()
             .map(|parsed| parsed.proxies.len())
             .unwrap_or_default();
+        if let Some(parsed) = &parsed_demo {
+            let keys: Vec<String> = parsed.proxies.iter().map(Proxy::identity_key).collect();
+            self.restore_deleted_node_keys(&keys);
+        }
         let result = {
             let store = lock_store(&self.store);
             store
@@ -1579,6 +1651,9 @@ impl SwiftSubApp {
                 };
                 match result {
                     Ok(id) => {
+                        let keys: Vec<String> =
+                            parsed.proxies.iter().map(Proxy::identity_key).collect();
+                        self.restore_deleted_node_keys(&keys);
                         let count = parsed.proxies.len();
                         {
                             let store = lock_store(&self.store);
@@ -3150,6 +3225,68 @@ fn is_node_link(text: &str) -> bool {
         .is_some_and(|(scheme, _)| !matches!(scheme.to_lowercase().as_str(), "http" | "https"))
 }
 
+fn merge_manual_proxies_restoring_deleted(
+    existing_payload: Option<&str>,
+    new_proxies: Vec<Proxy>,
+    deleted_nodes: &mut HashSet<String>,
+    visible_keys: &HashSet<String>,
+) -> Result<(String, usize, usize, usize), String> {
+    let mut existing = Vec::new();
+    if let Some(payload) = existing_payload.filter(|payload| !payload.trim().is_empty()) {
+        existing.extend(
+            parse_content(payload)
+                .map_err(|error| error.to_string())?
+                .proxies,
+        );
+    }
+    // Filter out previously deleted entries from the manual subscription payload so they
+    // no longer cause false "already exists" collisions or inflate manual node counts.
+    existing.retain(|proxy| !deleted_nodes.contains(&proxy.identity_key()));
+    let (mut kept, _) = dedupe_proxies(existing);
+    let mut active_keys: HashSet<String> = kept
+        .iter()
+        .map(Proxy::identity_key)
+        .chain(visible_keys.iter().cloned())
+        .collect();
+    let mut added = 0usize;
+    let mut duplicates = 0usize;
+    for proxy in new_proxies {
+        let key = proxy.identity_key();
+        deleted_nodes.remove(&key);
+        if active_keys.insert(key) {
+            kept.push(proxy);
+            added += 1;
+        } else {
+            duplicates += 1;
+        }
+    }
+    let payload = proxies_to_clash_yaml(&kept).map_err(|error| error.to_string())?;
+    Ok((payload, added, duplicates, kept.len()))
+}
+
+fn remove_manual_proxy_from_payload(
+    existing_payload: Option<&str>,
+    key: &str,
+    deleted_nodes: &HashSet<String>,
+) -> Result<Option<(String, usize)>, String> {
+    let Some(payload) = existing_payload.filter(|payload| !payload.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let mut proxies = parse_content(payload)
+        .map_err(|error| error.to_string())?
+        .proxies;
+    let before = proxies.len();
+    proxies.retain(|proxy| {
+        let id = proxy.identity_key();
+        id != key && !deleted_nodes.contains(&id)
+    });
+    if proxies.len() == before {
+        return Ok(None);
+    }
+    let updated = proxies_to_clash_yaml(&proxies).map_err(|error| error.to_string())?;
+    Ok(Some((updated, proxies.len())))
+}
+
 pub fn default_subscription_name(url: &str) -> String {
     let host = url
         .split_once("://")
@@ -3289,5 +3426,76 @@ mod routing_template_tests {
         invalid["format"] = json!("other");
         assert!(TemplateFile::decode(&invalid.to_string()).is_err());
         assert!(TemplateFile::decode("{}").is_err());
+    }
+
+    #[test]
+    fn manual_node_delete_and_readd_does_not_report_duplicate_or_stay_hidden() {
+        let link = "trojan://pass@node-a.example.org:443#HK-01";
+        let first_proxies = parse_content(link).unwrap().proxies;
+        let key = first_proxies[0].identity_key();
+        let mut deleted = HashSet::new();
+        let visible = HashSet::new();
+
+        // First add: 1 added, 0 duplicates, total 1.
+        let (payload, added, duplicates, total) = merge_manual_proxies_restoring_deleted(
+            None,
+            first_proxies.clone(),
+            &mut deleted,
+            &visible,
+        )
+        .unwrap();
+        assert_eq!((added, duplicates, total), (1, 0, 1));
+
+        // Re-adding while still active reports duplicate.
+        let (_, added_dup, dup_count, total_dup) = merge_manual_proxies_restoring_deleted(
+            Some(&payload),
+            first_proxies.clone(),
+            &mut deleted,
+            &HashSet::from([key.clone()]),
+        )
+        .unwrap();
+        assert_eq!((added_dup, dup_count, total_dup), (0, 1, 1));
+
+        // Delete the manual node from the manual payload.
+        let (after_delete, remaining) =
+            remove_manual_proxy_from_payload(Some(&payload), &key, &deleted)
+                .unwrap()
+                .unwrap();
+        assert_eq!(remaining, 0);
+
+        // Re-adding the same node succeeds as 1 added, 0 duplicates.
+        let (readded_payload, added_again, dup_again, total_again) =
+            merge_manual_proxies_restoring_deleted(
+                Some(&after_delete),
+                first_proxies.clone(),
+                &mut deleted,
+                &HashSet::new(),
+            )
+            .unwrap();
+        assert_eq!((added_again, dup_again, total_again), (1, 0, 1));
+        assert_eq!(parse_content(&readded_payload).unwrap().proxies.len(), 1);
+        assert!(!deleted.contains(&key));
+    }
+
+    #[test]
+    fn legacy_deleted_manual_node_in_deleted_set_can_be_readded_cleanly() {
+        // Simulate state produced before this fix: node still present in manual payload
+        // AND recorded in deleted_nodes.
+        let link = "trojan://pass@legacy.example.org:443#Legacy-01";
+        let proxies = parse_content(link).unwrap().proxies;
+        let key = proxies[0].identity_key();
+        let payload = proxies_to_clash_yaml(&proxies).unwrap();
+        let mut deleted = HashSet::from([key.clone()]);
+
+        let (merged, added, duplicates, total) = merge_manual_proxies_restoring_deleted(
+            Some(&payload),
+            proxies,
+            &mut deleted,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!((added, duplicates, total), (1, 0, 1));
+        assert!(!deleted.contains(&key));
+        assert_eq!(parse_content(&merged).unwrap().proxies.len(), 1);
     }
 }
