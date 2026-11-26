@@ -972,6 +972,12 @@ impl SwiftSubApp {
         let dialog_override = args
             .iter()
             .find_map(|arg| arg.strip_prefix("--dialog=").map(str::to_string));
+        let settings_tab_override = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("--settings-tab=").map(str::to_string));
+        let open_template_override = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("--open-template=").map(str::to_string));
 
         app.load_custom_config();
         let recovered = lock_store(&app.store)
@@ -1005,6 +1011,15 @@ impl SwiftSubApp {
                 app.page = Page::Generator;
             }
         }
+        app.recount_manual_nodes();
+        app.start_server();
+        app.start_scheduler(cx);
+        app.start_desktop_lifecycle(window, cx);
+        app.refresh_lan_interfaces(cx);
+        if let Some(notice) = restore_notice {
+            app.show_toast(notice, cx);
+        }
+        app.restore_draft(window, cx);
         if let Some(page) = page_override {
             app.page = match page.as_str() {
                 "generator" => Page::Generator,
@@ -1036,21 +1051,31 @@ impl SwiftSubApp {
                 _ => {}
             }
         }
-        app.recount_manual_nodes();
-        app.start_server();
-        app.start_scheduler(cx);
+        if let Some(tab) = settings_tab_override {
+            app.page = Page::Settings;
+            app.settings_tab = match tab.as_str() {
+                "rules" => SettingsTab::RuleSources,
+                "templates" => SettingsTab::Templates,
+                "data" => SettingsTab::Data,
+                _ => SettingsTab::Generation,
+            };
+        }
+        if let Some(target_tpl) = open_template_override
+            && let Some(template) = app.custom_templates.first().cloned()
+        {
+            app.page = Page::Settings;
+            app.settings_tab = SettingsTab::Templates;
+            app.open_edit_custom_template(template.id, window, cx);
+            if !target_tpl.is_empty() && target_tpl != "0" {
+                app.workspace.template_editor.expanded_group = Some(target_tpl);
+            }
+        }
         if app.page == Page::SavedConfigs
             && app.saved_config_id.is_none()
             && let Some(config) = app.saved_configs.first()
         {
             app.open_saved_config(config.id.clone(), window, cx);
         }
-        app.start_desktop_lifecycle(window, cx);
-        app.refresh_lan_interfaces(cx);
-        if let Some(notice) = restore_notice {
-            app.show_toast(notice, cx);
-        }
-        app.restore_draft(window, cx);
         if app.page == Page::Generator {
             app.open_template_dialog(window, cx);
         }
@@ -3089,6 +3114,9 @@ pub fn data_dir() -> PathBuf {
 
 fn portable_data_dir() -> Option<PathBuf> {
     let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    if exe_dir.join(".installed").exists() {
+        return None;
+    }
     let candidate = exe_dir.join("data");
     if std::fs::create_dir_all(&candidate).is_ok() {
         let probe = candidate.join(".write-probe");
