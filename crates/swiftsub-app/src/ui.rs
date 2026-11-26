@@ -104,6 +104,12 @@ impl Render for SwiftSubApp {
                         Page::SavedConfigs if this.workspace.saved_editor_open => {
                             this.save_yaml_editor(false, window, cx);
                         }
+                        Page::Settings
+                            if this.settings_tab == SettingsTab::Templates
+                                && this.workspace.template_editor.open =>
+                        {
+                            this.save_template_editor(cx);
+                        }
                         _ => return,
                     }
                     cx.stop_propagation();
@@ -277,6 +283,13 @@ impl Render for SwiftSubApp {
                         this.workspace.group_settings_open = false;
                         cx.notify();
                         cx.stop_propagation();
+                    } else if this.page == Page::Settings
+                        && this.settings_tab == SettingsTab::Templates
+                        && this.workspace.template_editor.open
+                    {
+                        if this.template_editor_handle_escape(cx) {
+                            cx.stop_propagation();
+                        }
                     } else if this.page == Page::Generator && !this.workspace.saved_editor_open {
                         if this.finish_workspace_fields(window, cx) {
                             this.template_policy_edit = None;

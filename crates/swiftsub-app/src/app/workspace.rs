@@ -3,7 +3,10 @@ pub mod dns;
 mod drafts;
 pub(crate) mod rule_updates;
 pub(super) mod rules;
+pub(crate) mod template_editor;
 mod undo;
+
+pub use template_editor::TemplateEditor;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct GenerationDefaults {
@@ -109,52 +112,6 @@ impl ConfigSummary {
                 "{} 个节点 · {} 个策略组 · {} 条规则",
                 self.proxies, self.groups, self.rules
             )
-        }
-    }
-}
-
-pub struct TemplateEditor {
-    pub open: bool,
-    pub edit_id: Option<i64>,
-    pub name: Entity<InputState>,
-    pub base_preset: Preset,
-    pub enabled_modules: HashSet<String>,
-    pub policy_groups: Vec<PolicyGroupSpec>,
-    pub new_group_name: Entity<InputState>,
-    pub new_group_kind: GroupKind,
-    pub custom_rule_sets: Vec<RuleSetBinding>,
-    pub new_rule_set_url: Entity<InputState>,
-    pub new_rule_set_target: String,
-    pub custom_rules: Entity<TextareaState>,
-    pub error: Option<String>,
-    pub(crate) base_snapshot: Option<TemplateSnapshot>,
-}
-
-impl TemplateEditor {
-    fn new(window: &mut Window, cx: &mut Context<SwiftSubApp>) -> Self {
-        Self {
-            open: false,
-            edit_id: None,
-            name: cx.new(|cx| InputState::new(window, cx).placeholder("模板名称，例如：日常分流")),
-            base_preset: Preset::Minimal,
-            enabled_modules: HashSet::new(),
-            policy_groups: Vec::new(),
-            new_group_name: cx
-                .new(|cx| InputState::new(window, cx).placeholder("新策略组名称，例如：AI 专线")),
-            new_group_kind: GroupKind::Select,
-            custom_rule_sets: Vec::new(),
-            new_rule_set_url: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("规则集链接（.mrs / .yaml / .txt）")
-            }),
-            new_rule_set_target: rule_catalog::SELECT_GROUP.to_string(),
-            custom_rules: cx.new(|cx| {
-                TextareaState::new(window, cx).placeholder(
-                    "每行一条规则，例如：\nDOMAIN-SUFFIX,openai.com,节点选择\nIP-CIDR,1.1.1.0/24,DIRECT,no-resolve",
-                )
-            }),
-            error: None,
-            base_snapshot: None,
         }
     }
 }
@@ -1388,7 +1345,7 @@ impl SwiftSubApp {
     }
 }
 
-fn contextual_rule(text: &str, target: &str) -> String {
+pub(super) fn contextual_rule(text: &str, target: &str) -> String {
     if let Ok(mut rule) = Rule::parse_body(text) {
         rule.target = target.into();
         return rule.to_line();

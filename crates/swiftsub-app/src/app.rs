@@ -292,21 +292,53 @@ pub(crate) fn template_summary_counts(config_json: &str) -> (usize, usize, usize
         .iter()
         .map(String::as_str)
         .collect();
-    let rule_sets = snapshot
+    let custom_ids: HashSet<&str> = snapshot
+        .custom_rule_sets
+        .iter()
+        .map(|b| b.id.as_str())
+        .collect();
+    let builtin_rule_sets = snapshot
         .enabled_modules
         .iter()
         .filter_map(|id| catalog::module(id))
+        .filter(|m| !matches!(m.kind, catalog::ModuleKind::Region(_)))
         .flat_map(|module| module.rule_sets.iter())
-        .filter(|spec| !disabled.contains(spec.id))
-        .count()
-        + snapshot.custom_rule_sets.len();
+        .filter(|spec| !disabled.contains(spec.id) && !custom_ids.contains(spec.id))
+        .count();
+    let custom_rule_sets = snapshot
+        .custom_rule_sets
+        .iter()
+        .filter(|b| !disabled.contains(b.id.as_str()))
+        .count();
+    let active_modules = snapshot
+        .enabled_modules
+        .iter()
+        .filter_map(|id| catalog::module(id))
+        .filter(|m| !matches!(m.kind, catalog::ModuleKind::Region(_)))
+        .count();
+    let custom_policy_groups = snapshot
+        .policy_groups
+        .iter()
+        .filter(|g| !g.builtin && !g.removed && !g.disabled)
+        .count();
+    let custom_groups = snapshot
+        .custom_groups
+        .iter()
+        .filter(|g| !g.disabled)
+        .count();
+    let chains = snapshot.chains.iter().filter(|c| !c.disabled).count();
+    let manual = snapshot
+        .custom_rule_lines
+        .iter()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        })
+        .count();
     (
-        snapshot.enabled_modules.len()
-            + snapshot.custom_groups.len()
-            + snapshot.policy_groups.len()
-            + snapshot.chains.len(),
-        rule_sets,
-        snapshot.custom_rule_lines.len(),
+        active_modules + custom_policy_groups + custom_groups + chains,
+        builtin_rule_sets + custom_rule_sets,
+        manual,
     )
 }
 
@@ -2738,348 +2770,6 @@ impl SwiftSubApp {
         self.reset_advanced_draft(window, cx);
         self.page = Page::Generator;
         cx.notify();
-    }
-
-    pub fn open_template_editor_from_preset(
-        &mut self,
-        preset: Preset,
-        suggested_name: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let modules: HashSet<String> = catalog::modules_for_preset(preset)
-            .into_iter()
-            .map(|module| module.id.to_string())
-            .collect();
-        let snapshot = TemplateSnapshot {
-            preset,
-            enabled_modules: modules.iter().cloned().collect(),
-            disabled_rule_sets: Vec::new(),
-            custom_rule_sets: Vec::new(),
-            custom_rule_lines: Vec::new(),
-            rule_order: Vec::new(),
-            dns: self.options.dns.clone(),
-            dns_override: self.options.dns_override,
-            rule_set_overrides: HashMap::new(),
-            listeners: Vec::new(),
-            extra_yaml: String::new(),
-            rule_provider_base_url: self.options.rule_provider_base_url.clone(),
-            policy_groups: Vec::new(),
-            group_order: Vec::new(),
-            rule_set_targets: HashMap::new(),
-            custom_groups: Vec::new(),
-            chains: Vec::new(),
-            test_url: self.options.test_url.clone(),
-            test_interval: self.options.test_interval,
-            test_tolerance: self.options.test_tolerance,
-            mixed_port: self.options.mixed_port,
-            allow_lan: self.options.allow_lan,
-        };
-        self.populate_template_editor(None, suggested_name, snapshot, window, cx);
-    }
-
-    pub fn open_template_editor_from_current(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let snapshot = self
-            .draft_template_snapshot(cx)
-            .unwrap_or_else(|_| self.active_template_snapshot());
-        self.populate_template_editor(None, "", snapshot, window, cx);
-    }
-
-    pub fn open_edit_custom_template(
-        &mut self,
-        id: i64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(template) = self.custom_templates.iter().find(|t| t.id == id).cloned() else {
-            return;
-        };
-        let snapshot: TemplateSnapshot = match serde_json::from_str(&template.config_json) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                self.show_toast(format!("模板解析失败：{error}"), cx);
-                return;
-            }
-        };
-        self.populate_template_editor(Some(id), &template.name, snapshot, window, cx);
-    }
-
-    fn populate_template_editor(
-        &mut self,
-        edit_id: Option<i64>,
-        name: &str,
-        mut snapshot: TemplateSnapshot,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        snapshot.remove_legacy_regions();
-        let editor = &mut self.workspace.template_editor;
-        editor.open = true;
-        editor.edit_id = edit_id;
-        editor.base_preset = snapshot.preset;
-        editor.enabled_modules = snapshot.enabled_modules.iter().cloned().collect();
-        editor.policy_groups = snapshot
-            .policy_groups
-            .iter()
-            .filter(|g| !g.builtin && !g.removed)
-            .cloned()
-            .collect();
-        editor.custom_rule_sets = snapshot.custom_rule_sets.clone();
-        editor.new_group_kind = GroupKind::Select;
-        editor.new_rule_set_target = rule_catalog::SELECT_GROUP.to_string();
-        editor.error = None;
-        let rules_text = snapshot.custom_rule_lines.join("\n");
-        editor.base_snapshot = Some(snapshot);
-        editor.name.update(cx, |input, cx| {
-            input.set_value(name.to_string(), window, cx)
-        });
-        editor
-            .new_group_name
-            .update(cx, |input, cx| input.set_value("", window, cx));
-        editor
-            .new_rule_set_url
-            .update(cx, |input, cx| input.set_value("", window, cx));
-        editor
-            .custom_rules
-            .update(cx, |input, cx| input.set_value(rules_text, window, cx));
-        cx.notify();
-    }
-
-    pub fn close_template_editor(&mut self, cx: &mut Context<Self>) {
-        self.workspace.template_editor.open = false;
-        self.workspace.template_editor.error = None;
-        cx.notify();
-    }
-
-    pub fn template_editor_targets(&self) -> Vec<String> {
-        let editor = &self.workspace.template_editor;
-        let mut targets = Vec::new();
-        for module in catalog::MODULES {
-            if !matches!(module.kind, catalog::ModuleKind::Region(_))
-                && (matches!(module.id, "select" | "auto" | "final")
-                    || editor.enabled_modules.contains(module.id))
-                && !targets.iter().any(|t| t == module.name)
-            {
-                targets.push(module.name.to_string());
-            }
-        }
-        for group in &editor.policy_groups {
-            if !targets.iter().any(|t| t == &group.name) {
-                targets.push(group.name.clone());
-            }
-        }
-        for builtin in ["DIRECT", "REJECT"] {
-            if !targets.iter().any(|t| t == builtin) {
-                targets.push(builtin.to_string());
-            }
-        }
-        targets
-    }
-
-    pub fn template_editor_add_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let name = self
-            .workspace
-            .template_editor
-            .new_group_name
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        if name.is_empty() || name.contains([',', '\n', '\r']) {
-            self.workspace.template_editor.error = Some("请输入有效的策略组名称".into());
-            cx.notify();
-            return;
-        }
-        if self.template_editor_targets().iter().any(|t| t == &name) {
-            self.workspace.template_editor.error = Some("该策略组名称已存在".into());
-            cx.notify();
-            return;
-        }
-        let kind = self.workspace.template_editor.new_group_kind;
-        let mut spec = PolicyGroupSpec {
-            id: uuid::Uuid::new_v4().to_string(),
-            name,
-            kind,
-            include_all_nodes: true,
-            ..Default::default()
-        };
-        if kind == GroupKind::Select {
-            spec.members.push("自动选择".into());
-            spec.members.push("DIRECT".into());
-        }
-        self.workspace.template_editor.policy_groups.push(spec);
-        self.workspace.template_editor.error = None;
-        self.workspace
-            .template_editor
-            .new_group_name
-            .update(cx, |input, cx| input.set_value("", window, cx));
-        cx.notify();
-    }
-
-    pub fn template_editor_add_rule_set(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let url = self
-            .workspace
-            .template_editor
-            .new_rule_set_url
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        match rule_set_binding_from_url(&url) {
-            Ok(mut binding) => {
-                let target = self.workspace.template_editor.new_rule_set_target.clone();
-                if !target.is_empty() {
-                    binding.target = target;
-                }
-                if self
-                    .workspace
-                    .template_editor
-                    .custom_rule_sets
-                    .iter()
-                    .any(|item| item.url == binding.url)
-                {
-                    self.workspace.template_editor.error = Some("该规则集链接已添加".into());
-                    cx.notify();
-                    return;
-                }
-                self.workspace
-                    .template_editor
-                    .custom_rule_sets
-                    .push(binding);
-                self.workspace.template_editor.error = None;
-                self.workspace
-                    .template_editor
-                    .new_rule_set_url
-                    .update(cx, |input, cx| input.set_value("", window, cx));
-                cx.notify();
-            }
-            Err(error) => {
-                self.workspace.template_editor.error = Some(error);
-                cx.notify();
-            }
-        }
-    }
-
-    pub fn save_template_editor(&mut self, cx: &mut Context<Self>) {
-        let name = self
-            .workspace
-            .template_editor
-            .name
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        let edit_id = self.workspace.template_editor.edit_id;
-        if name.is_empty() {
-            self.workspace.template_editor.error = Some("请输入模板名称".into());
-            cx.notify();
-            return;
-        }
-        if self
-            .custom_templates
-            .iter()
-            .any(|t| t.name == name && Some(t.id) != edit_id)
-        {
-            self.workspace.template_editor.error = Some("已有同名模板，请换一个名称".into());
-            cx.notify();
-            return;
-        }
-        let raw_rules = self
-            .workspace
-            .template_editor
-            .custom_rules
-            .read(cx)
-            .value()
-            .to_string();
-        let parsed_rules = match parse_custom_rule_lines(&raw_rules) {
-            Ok(rules) => rules,
-            Err(error) => {
-                self.workspace.template_editor.error = Some(error);
-                cx.notify();
-                return;
-            }
-        };
-        let valid_targets = self.template_editor_targets();
-        for rule in &parsed_rules {
-            if !valid_targets.iter().any(|t| t == &rule.target) {
-                self.workspace.template_editor.error = Some(format!(
-                    "手写规则目标「{}」不在当前模板的策略组中",
-                    rule.target
-                ));
-                cx.notify();
-                return;
-            }
-        }
-
-        let mut snapshot = self
-            .workspace
-            .template_editor
-            .base_snapshot
-            .clone()
-            .unwrap_or_else(|| self.active_template_snapshot());
-        snapshot.preset = self.workspace.template_editor.base_preset;
-        let mut enabled: HashSet<String> = self.workspace.template_editor.enabled_modules.clone();
-        for required in ["select", "auto", "final"] {
-            enabled.insert(required.to_string());
-        }
-        snapshot.enabled_modules = enabled.into_iter().collect();
-        snapshot.enabled_modules.sort();
-        let mut policy_groups: Vec<PolicyGroupSpec> = snapshot
-            .policy_groups
-            .into_iter()
-            .filter(|g| g.builtin)
-            .collect();
-        policy_groups.extend(self.workspace.template_editor.policy_groups.clone());
-        snapshot.policy_groups = policy_groups;
-        snapshot.custom_rule_sets = self.workspace.template_editor.custom_rule_sets.clone();
-        snapshot.custom_rule_lines = parsed_rules.iter().map(Rule::to_line).collect();
-        snapshot.chains.clear();
-
-        if let Err(error) = self.validate_template_snapshot(&snapshot) {
-            self.workspace.template_editor.error = Some(error);
-            cx.notify();
-            return;
-        }
-        let json = match serde_json::to_string(&snapshot) {
-            Ok(json) => json,
-            Err(error) => {
-                self.workspace.template_editor.error = Some(error.to_string());
-                cx.notify();
-                return;
-            }
-        };
-        let result = {
-            let store = lock_store(&self.store);
-            if let Some(id) = edit_id {
-                store.update_custom_template(id, &name, &json)
-            } else {
-                store.add_custom_template(&name, &json).map(|_| ())
-            }
-        };
-        match result {
-            Ok(()) => {
-                self.load_templates();
-                self.workspace.template_editor.open = false;
-                self.workspace.template_editor.error = None;
-                self.show_toast(
-                    if edit_id.is_some() {
-                        format!("模板「{name}」已保存")
-                    } else {
-                        format!("已创建模板「{name}」")
-                    },
-                    cx,
-                );
-                cx.notify();
-            }
-            Err(error) => {
-                self.workspace.template_editor.error = Some(format!("保存模板失败：{error}"));
-                cx.notify();
-            }
-        }
     }
 
     pub fn delete_custom_template(&mut self, id: i64, cx: &mut Context<Self>) {

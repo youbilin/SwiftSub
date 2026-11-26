@@ -1,6 +1,7 @@
 use super::*;
 mod inline_rules;
 mod settings;
+mod template_editor;
 
 impl SwiftSubApp {
     pub(super) fn workspace_routing_panel(&self, cx: &mut Context<Self>) -> AnyElement {
